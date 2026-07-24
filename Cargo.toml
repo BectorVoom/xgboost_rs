@@ -1,0 +1,16 @@
+[package]
+name = "xgboost_rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+bytemuck = "1"
+# `vulkan` (wgpu + SPIR-V passthrough) is required: the kernels use i64/f64,
+# which the WGSL compiler cannot express.
+cubecl = { version = "0.10.0", features = ["vulkan"] }
+thiserror = "2.0.19"
+
+[features]
+default = []
+cuda = ["cubecl/cuda"]
