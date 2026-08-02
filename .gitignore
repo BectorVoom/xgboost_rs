@@ -22,5 +22,9 @@ target
 
 # Reference repository and local archive build
 xgboost/
+xgboost-master/
 xgboost_rs_kaggle.tar.gz
+
+# CodeGraph index (local, regenerable)
+.codegraph/
 
