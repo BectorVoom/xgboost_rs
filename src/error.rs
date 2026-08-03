@@ -31,6 +31,25 @@ pub enum Error {
     /// A string could not be parsed into a typed parameter value.
     #[error("cannot parse `{value}` as {name}: {reason}")]
     ParseParameter { name: &'static str, value: String, reason: String },
+
+    #[error("data shape mismatch: expected {expected} values, got {got}")]
+    DataShape { expected: usize, got: usize },
+
+    #[error("feature index {index} is out of range for a matrix with {num_col} columns")]
+    FeatureIndex { index: usize, num_col: usize },
+
+    #[error("malformed LIBSVM input at line {line}: `{token}`")]
+    LibsvmParse { line: usize, token: String },
+
+    #[error("cannot read `{path}`: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("model JSON is not a valid XGBoost model: {0}")]
+    ModelFormat(String),
 }
 
 impl Error {

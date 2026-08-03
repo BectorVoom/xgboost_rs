@@ -28,3 +28,6 @@ xgboost_rs_kaggle.tar.gz
 # CodeGraph index (local, regenerable)
 .codegraph/
 
+
+# Oracle fixture generator virtualenv (recreate with tools/gen_fixtures.py header)
+.venv-oracle/
