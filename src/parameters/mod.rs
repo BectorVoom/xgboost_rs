@@ -1,8 +1,11 @@
-//! The XGBoost fit ("training") parameter surface, for CPU and GPU.
+//! The XGBoost fit ("training") and prediction parameter surface, for CPU and
+//! GPU.
 //!
 //! Everything XGBoost's `Learner::Configure` accepts is represented here as a
 //! typed value with a consuming builder, validated up front, and convertible
-//! back to the `(name, value)` strings XGBoost itself consumes.
+//! back to the `(name, value)` strings XGBoost itself consumes. The prediction
+//! arguments are covered too, in the JSON form the C API's predict entry points
+//! take rather than as `Learner` parameters.
 //!
 //! # Layout
 //!
@@ -17,23 +20,31 @@
 //! | Linear booster | [`LinearBoosterParameters`] | `LinearTrainParam`, `GBLinearTrainParam`, `CoordinateParam` |
 //! | Learning task | [`LearningTaskParameters`] | `LearnerTrainParam`, `LearnerModelParamLegacy`, per-objective params |
 //! | Training loop | [`TrainingParameters`] | `xgboost.train` arguments |
+//! | Prediction | [`PredictParameters`], [`InplacePredictParameters`] | `Booster.predict` / `Booster.inplace_predict` arguments |
 //!
 //! [`BoosterParameters`] composes the first five; [`TrainingParameters`] wraps
-//! that with the loop controls.
+//! that with the loop controls. Prediction stands apart: it configures a call
+//! against an already-trained model, not the `Learner`, so it is emitted as
+//! JSON by [`PredictParameters::to_predict_config`] instead of through
+//! [`ToConfig`].
 //!
 //! # CPU and GPU
 //!
 //! The device is one parameter, [`Device`], and it changes what the rest mean.
-//! Two methods make that explicit rather than leaving it to a later surprise:
+//! Three methods make that explicit rather than leaving it to a later surprise:
 //!
 //! * [`TreeBoosterParameters::resolved_updaters`] reproduces
 //!   `MapTreeMethodToUpdaters`, so `hist` becomes `grow_quantile_histmaker` on
 //!   CPU and `grow_gpu_hist` on CUDA, and `exact` is rejected outright on GPU.
 //! * [`TreeBoosterParameters::max_cached_hist_nodes`] resolves the histogram
 //!   cache size to its device-dependent default (65536 on CPU, 4096 on CUDA).
+//! * [`PredictionType::supports_device`] reports that approximated SHAP values
+//!   and interactions exist only in the CPU predictor.
 //!
-//! [`BoosterParameters::validate`] runs every device-dependent check, so an
-//! invalid CPU/GPU combination fails at build time rather than mid-fit.
+//! [`BoosterParameters::validate`] runs every device-dependent fit check and
+//! [`PredictParameters::validate_with`] every device-dependent prediction
+//! check, so an invalid CPU/GPU combination fails at build time rather than
+//! mid-fit or mid-prediction.
 //!
 //! # Example
 //!
@@ -81,6 +92,7 @@ mod device;
 mod general;
 mod learning;
 mod linear;
+mod predict;
 mod str_enum;
 mod training;
 mod tree;
@@ -97,6 +109,10 @@ pub use learning::{
 };
 pub use linear::{
     FeatureSelector, LinearBoosterParameters, LinearBoosterParametersBuilder, LinearUpdater,
+};
+pub use predict::{
+    InplacePredictParameters, InplacePredictParametersBuilder, IterationRange, PredictParameters,
+    PredictParametersBuilder, PredictionType,
 };
 pub use training::{TrainingParameters, TrainingParametersBuilder, VerboseEval};
 pub use tree::{

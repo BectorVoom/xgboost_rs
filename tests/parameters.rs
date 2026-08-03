@@ -1,13 +1,14 @@
-//! End-to-end tests for the fit parameter surface: the public API as a caller
-//! sees it, serde round-trips, and the XGBoost-compatible config emission that
-//! makes the oracle harness possible.
+//! End-to-end tests for the fit and prediction parameter surfaces: the public
+//! API as a caller sees it, serde round-trips, and the XGBoost-compatible
+//! config emission that makes the oracle harness possible.
 
 use std::collections::BTreeMap;
 
 use xgboost_rs::parameters::{
     BoosterParameters, BoosterType, DartParameters, DartSampleType, Device, EvalMetric,
-    GeneralParameters, GrowPolicy, LearningTaskParameters, LinearBoosterParameters, LinearUpdater,
-    MonotoneConstraint, Objective, SamplingMethod, ToConfig, TrainingParameters,
+    GeneralParameters, GrowPolicy, InplacePredictParameters, IterationRange,
+    LearningTaskParameters, LinearBoosterParameters, LinearUpdater, MonotoneConstraint, Objective,
+    PredictParameters, PredictionType, SamplingMethod, ToConfig, TrainingParameters,
     TreeBoosterParameters, TreeMethod, TreeUpdaterName, VerboseEval, Verbosity,
 };
 
@@ -219,6 +220,87 @@ fn training_parameters_wrap_the_model_parameters() {
 }
 
 #[test]
+fn prediction_parameters_round_trip_through_serde() {
+    for params in [
+        InplacePredictParameters::default(),
+        InplacePredictParameters::builder()
+            .predict_type(PredictionType::Margin)
+            .iteration_range(IterationRange::new(0, 42).unwrap())
+            .strict_shape(true)
+            .missing(-999.0)
+            .build()
+            .unwrap(),
+    ] {
+        let json = serde_json::to_string(&params).unwrap();
+        let restored: InplacePredictParameters = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, params);
+        restored.validate().unwrap();
+    }
+
+    let predict = PredictParameters::builder()
+        .predict_type(PredictionType::Interaction)
+        .training(true)
+        .validate_features(false)
+        .build()
+        .unwrap();
+    let json = serde_json::to_string(&predict).unwrap();
+    assert_eq!(serde_json::from_str::<PredictParameters>(&json).unwrap(), predict);
+}
+
+#[test]
+fn prediction_config_is_the_json_the_c_api_reads() {
+    // Real JSON types, not the strings `Learner::SetParam` takes: the C API's
+    // `RequiredArg<Integer>` / `RequiredArg<Boolean>` reject anything else.
+    let config = PredictParameters::builder()
+        .predict_type(PredictionType::Leaf)
+        .iteration_range(IterationRange::new(0, 30).unwrap())
+        .strict_shape(true)
+        .build()
+        .unwrap()
+        .to_predict_config();
+
+    let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
+    assert_eq!(parsed["type"], serde_json::json!(6));
+    assert_eq!(parsed["training"], serde_json::json!(false));
+    assert_eq!(parsed["iteration_begin"], serde_json::json!(0));
+    assert_eq!(parsed["iteration_end"], serde_json::json!(30));
+    assert_eq!(parsed["strict_shape"], serde_json::json!(true));
+
+    // `missing` defaults to NaN, which strict JSON cannot spell; XGBoost's own
+    // reader accepts the bare `NaN` literal and serde_json does not, so this
+    // one field is checked as text.
+    let inplace = InplacePredictParameters::default().to_inplace_config();
+    assert!(inplace.contains(r#""missing":NaN"#), "{inplace}");
+    assert!(serde_json::from_str::<serde_json::Value>(&inplace).is_err());
+}
+
+#[test]
+fn prediction_respects_the_device_it_will_run_on() {
+    let gpu = BoosterParameters::builder()
+        .general(GeneralParameters::builder().device(Device::cuda(0)).build().unwrap())
+        .build()
+        .unwrap();
+    let cpu = BoosterParameters::default();
+
+    let exact = PredictParameters::builder()
+        .predict_type(PredictionType::Contribution)
+        .build()
+        .unwrap();
+    exact.validate_with(&cpu).unwrap();
+    exact.validate_with(&gpu).unwrap();
+
+    // The approximated SHAP paths exist only in the CPU predictor.
+    let approx = PredictParameters::builder()
+        .predict_type(PredictionType::ApproxContribution)
+        .build()
+        .unwrap();
+    approx.validate_with(&cpu).unwrap();
+    assert!(approx.validate_with(&gpu).is_err());
+    assert!(!PredictionType::ApproxContribution.supports_device(Device::cuda(0)));
+    assert!(PredictionType::ApproxContribution.supports_device(Device::Cpu));
+}
+
+#[test]
 fn validation_errors_name_the_offending_parameter() {
     let cases: Vec<(&str, xgboost_rs::Error)> = vec![
         ("eta", TreeBoosterParameters::builder().eta(-1.0).build().unwrap_err()),
@@ -239,6 +321,22 @@ fn validation_errors_name_the_offending_parameter() {
                 .unwrap_err(),
         ),
         ("num_boost_round", TrainingParameters::builder().num_boost_round(0).build().unwrap_err()),
+        (
+            "iteration_range",
+            PredictParameters::builder()
+                .predict_type(PredictionType::Leaf)
+                .iteration_range(IterationRange::new(3, 9).unwrap())
+                .build()
+                .unwrap_err(),
+        ),
+        (
+            "predict_type",
+            InplacePredictParameters::builder()
+                .predict_type(PredictionType::Contribution)
+                .build()
+                .unwrap_err(),
+        ),
+        ("missing", InplacePredictParameters::builder().missing(f32::NAN).build().unwrap_err()),
     ];
     for (name, err) in cases {
         let message = err.to_string();
