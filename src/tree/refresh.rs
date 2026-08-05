@@ -62,23 +62,8 @@ pub fn refresh(
                 let mut nid = 0usize;
                 acc[nid].add(gd, hd);
                 while !tree.nodes[nid].is_leaf() {
-                    let node = tree.nodes[nid];
-                    nid = match feature_value(dmat, r, node.split_index) {
-                        Some(v) => {
-                            if v < node.value {
-                                node.left as usize
-                            } else {
-                                node.right as usize
-                            }
-                        }
-                        None => {
-                            if node.default_left {
-                                node.left as usize
-                            } else {
-                                node.right as usize
-                            }
-                        }
-                    };
+                    let split_index = tree.nodes[nid].split_index;
+                    nid = tree.next_node(nid, feature_value(dmat, r, split_index));
                     acc[nid].add(gd, hd);
                 }
             }

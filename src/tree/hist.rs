@@ -49,10 +49,11 @@
 //! or worse: chunking the split-evaluation task list into fatter rayon jobs,
 //! and spreading a single node's histogram zeroing across threads.
 
+use super::cat;
 use super::column_sampler::{ColumnSampler, FeatureSet};
 use super::evaluator::{InteractionConstraints, SplitEvaluator};
 use super::model::RegTree;
-use super::param::{GradStats, GrowPolicy, RT_EPS, SplitEntry, TrainParam};
+use super::param::{GradStats, GrowPolicy, RT_EPS, SplitEntry, TrainParam, calc_weight};
 use crate::context::Context;
 use crate::data::gradient_index::{GHistIndex, dispatch_bins};
 use crate::data::DMatrix;
@@ -104,6 +105,10 @@ struct ExpandEntry {
     nid: usize,
     depth: i32,
     split: SplitEntry,
+    /// The categories this split sends right, when `split.is_cat`. Kept beside
+    /// the split rather than inside it because it is variable-length and
+    /// [`SplitEntry`] is copied by the thousand during the search.
+    cat_bits: Vec<u32>,
 }
 
 impl ExpandEntry {
@@ -149,9 +154,12 @@ struct SplitTask {
     left: usize,
     right: usize,
     fidx: u32,
-    /// Feature-local bin threshold; rows at or below it go left.
+    /// Feature-local bin threshold; rows at or below it go left. Unused by a
+    /// categorical split, which tests [`Self::cat_bits`] instead.
     local_cond: i64,
     default_left: bool,
+    /// The categories that go right, when this is a categorical split.
+    cat_bits: Vec<u32>,
 }
 
 impl Partitioner {
@@ -337,11 +345,14 @@ fn partition_block(
 /// Which side of the split row `rid` belongs to.
 ///
 /// Reads the transposed index: consecutive rows of one feature are adjacent, so
-/// a whole node is scanned sequentially.
+/// a whole node is scanned sequentially. A categorical feature's local bin *is*
+/// its category code, so membership is tested against the bin directly and no
+/// value has to be recovered.
 #[inline]
 fn goes_left(rid: u32, task: &SplitTask, gi: &GHistIndex) -> bool {
     match gi.columns.get(task.fidx, rid as usize) {
-        Some(bin) => (bin as i64) <= task.local_cond,
+        Some(bin) if task.cat_bits.is_empty() => (bin as i64) <= task.local_cond,
+        Some(bin) => !cat::check_bit(&task.cat_bits, bin),
         None => task.default_left,
     }
 }
@@ -579,8 +590,8 @@ impl<'a> HistGrower<'a> {
             let features = self.feature_sets(&depths, rng);
             let mut best_splits = Vec::with_capacity(built.len());
             let splits = self.evaluate_splits(&built, &features);
-            for ((nid, split), depth) in built.iter().zip(splits).zip(depths) {
-                best_splits.push(ExpandEntry { nid: *nid, depth, split });
+            for ((nid, (split, cat_bits)), depth) in built.iter().zip(splits).zip(depths) {
+                best_splits.push(ExpandEntry { nid: *nid, depth, split, cat_bits });
             }
 
             // Parent histograms are dead once both children exist.
@@ -660,8 +671,8 @@ impl<'a> HistGrower<'a> {
         tree.set_leaf(0, self.param.learning_rate * weight);
 
         let features = self.feature_sets(&[0], rng);
-        let split = self.evaluate_splits(&[0], &features).pop().unwrap_or_default();
-        ExpandEntry { nid: 0, depth: 0, split }
+        let (split, cat_bits) = self.evaluate_splits(&[0], &features).pop().unwrap_or_default();
+        ExpandEntry { nid: 0, depth: 0, split, cat_bits }
     }
 
     /// The candidate features for each node in an expansion batch, in the same
@@ -758,19 +769,35 @@ impl<'a> HistGrower<'a> {
         let right_weight = self.evaluator.calc_weight(nid, self.param, &split.right_sum);
         let lr = self.param.learning_rate;
 
-        tree.expand_node(
-            candidate.nid,
-            split.split_index(),
-            split.split_value,
-            split.default_left(),
-            base_weight,
-            left_weight * lr,
-            right_weight * lr,
-            split.loss_chg,
-            parent_sum.sum_hess as f32,
-            split.left_sum.sum_hess as f32,
-            split.right_sum.sum_hess as f32,
-        );
+        if split.is_cat {
+            tree.expand_categorical(
+                candidate.nid,
+                split.split_index(),
+                &candidate.cat_bits,
+                split.default_left(),
+                base_weight,
+                left_weight * lr,
+                right_weight * lr,
+                split.loss_chg,
+                parent_sum.sum_hess as f32,
+                split.left_sum.sum_hess as f32,
+                split.right_sum.sum_hess as f32,
+            );
+        } else {
+            tree.expand_node(
+                candidate.nid,
+                split.split_index(),
+                split.split_value,
+                split.default_left(),
+                base_weight,
+                left_weight * lr,
+                right_weight * lr,
+                split.loss_chg,
+                parent_sum.sum_hess as f32,
+                split.left_sum.sum_hess as f32,
+                split.right_sum.sum_hess as f32,
+            );
+        }
 
         let node = tree.nodes[candidate.nid];
         let (left, right) = (node.left as usize, node.right as usize);
@@ -796,6 +823,17 @@ impl<'a> HistGrower<'a> {
     fn split_task(&self, candidate: &ExpandEntry, tree: &RegTree) -> SplitTask {
         let node = tree.nodes[candidate.nid];
         let fidx = node.split_index;
+        if candidate.split.is_cat {
+            return SplitTask {
+                nid: candidate.nid,
+                left: node.left as usize,
+                right: node.right as usize,
+                fidx,
+                local_cond: -1,
+                default_left: node.default_left,
+                cat_bits: candidate.cat_bits.clone(),
+            };
+        }
         let global_cond = self.find_split_condition(fidx, node.value);
         // Feature-local threshold for the dense path. `-1` (no matching cut)
         // stays negative so every present row goes right.
@@ -811,6 +849,7 @@ impl<'a> HistGrower<'a> {
             fidx,
             local_cond,
             default_left: node.default_left,
+            cat_bits: Vec::new(),
         }
     }
 
@@ -999,7 +1038,11 @@ impl<'a> HistGrower<'a> {
     /// Chunking the task list into fatter jobs was measured and made no
     /// difference: rayon's adaptive splitting already stops well short of
     /// costing more than it saves, on both growth policies.
-    fn evaluate_splits(&self, nodes: &[usize], features: &[FeatureSet]) -> Vec<SplitEntry> {
+    fn evaluate_splits(
+        &self,
+        nodes: &[usize],
+        features: &[FeatureSet],
+    ) -> Vec<(SplitEntry, Vec<u32>)> {
         debug_assert_eq!(nodes.len(), features.len());
         // Flat task list: one entry per (node, candidate feature) pair.
         let tasks: Vec<(usize, u32)> = features
@@ -1008,27 +1051,47 @@ impl<'a> HistGrower<'a> {
             .flat_map(|(node_idx, set)| set.iter().map(move |&fidx| (node_idx, fidx)))
             .collect();
 
-        let per_task: Vec<SplitEntry> = tasks
+        let per_task: Vec<(SplitEntry, Vec<u32>)> = tasks
             .par_iter()
             .map(|&(node_idx, fidx)| self.evaluate_one(nodes[node_idx], fidx))
             .collect();
 
-        let mut out = vec![SplitEntry::default(); nodes.len()];
-        for ((node_idx, _), candidate) in tasks.iter().zip(&per_task) {
-            out[*node_idx].update_entry(candidate);
+        let mut out = vec![(SplitEntry::default(), Vec::new()); nodes.len()];
+        for ((node_idx, _), (candidate, bits)) in tasks.iter().zip(&per_task) {
+            let slot = &mut out[*node_idx];
+            if slot.0.update_entry(candidate) {
+                // The categories belong to the split that just won; a numeric
+                // winner clears whatever a categorical feature had proposed.
+                slot.1.clear();
+                slot.1.extend_from_slice(bits);
+            }
         }
         out
     }
 
-    /// The best split of one node on one feature.
+    /// The best split of one node on one feature, with the categories it sends
+    /// right when that split is categorical.
     #[inline]
-    fn evaluate_one(&self, nid: usize, fidx: u32) -> SplitEntry {
+    fn evaluate_one(&self, nid: usize, fidx: u32) -> (SplitEntry, Vec<u32>) {
         let mut best = SplitEntry::default();
         if !self.constraints.query(nid, fidx) {
-            return best;
+            return (best, Vec::new());
         }
         let hist = self.hist.get(nid);
         let parent = self.snode[nid];
+
+        if self.gi.cuts.is_cat(fidx as usize) {
+            let n_bins = self.gi.cuts.feature_bins(fidx as usize);
+            // `common::UseOneHot`: few enough categories that testing each one
+            // on its own beats partitioning them.
+            let bits = if (n_bins as u32) < self.param.max_cat_to_onehot {
+                self.enumerate_one_hot(nid, fidx, hist, &parent, &mut best)
+            } else {
+                self.enumerate_partition(nid, fidx, hist, &parent, &mut best)
+            };
+            return (best, bits);
+        }
+
         let non_missing = self.enumerate_forward(nid, fidx, hist, &parent, &mut best);
         // A feature has missing values in this node exactly when its bins do
         // not account for the node's whole gradient sum.
@@ -1037,7 +1100,151 @@ impl<'a> HistGrower<'a> {
         {
             self.enumerate_backward(nid, fidx, hist, &parent, &mut best);
         }
-        best
+        (best, Vec::new())
+    }
+
+    /// `EnumerateOneHot` — try each category on its own against all the others.
+    ///
+    /// Each category is scanned twice, once with the feature's missing rows
+    /// grouped with the other categories and once with the chosen one, which is
+    /// how the default direction is learned without a dedicated missing bin.
+    fn enumerate_one_hot(
+        &self,
+        nid: usize,
+        fidx: u32,
+        hist: &[GradStats],
+        parent: &NodeEntry,
+        p_best: &mut SplitEntry,
+    ) -> Vec<u32> {
+        let cuts = &self.gi.cuts;
+        let f = fidx as usize;
+        let (ibegin, iend) = (cuts.cut_ptrs[f] as usize, cuts.cut_ptrs[f + 1] as usize);
+
+        // Rows whose value is missing: whatever the feature's bins do not hold.
+        let mut feature_sum = GradStats::default();
+        for cell in &hist[ibegin..iend] {
+            feature_sum.add(cell.sum_grad, cell.sum_hess);
+        }
+        let mut missing = GradStats::default();
+        missing.set_subtract(&parent.stats, &feature_sum);
+
+        let mut best = SplitEntry::default();
+        for i in ibegin..iend {
+            let split_pt = cuts.cut_values[i];
+
+            // Missing on the left: the chosen category alone goes right.
+            let mut right_sum = GradStats::new(hist[i].sum_grad, hist[i].sum_hess);
+            let mut left_sum = GradStats::default();
+            left_sum.set_subtract(&parent.stats, &right_sum);
+            let gain = self.evaluator.calc_split_gain(nid, fidx, self.param, &left_sum, &right_sum);
+            if gain.is_finite() {
+                best.update_cat(gain - parent.root_gain, fidx, split_pt, true, left_sum, right_sum);
+            }
+
+            // Missing on the right: grouped with the chosen category.
+            right_sum.add_stats(&missing);
+            left_sum.set_subtract(&parent.stats, &right_sum);
+            let gain = self.evaluator.calc_split_gain(nid, fidx, self.param, &left_sum, &right_sum);
+            if gain.is_finite() {
+                best.update_cat(gain - parent.root_gain, fidx, split_pt, false, left_sum, right_sum);
+            }
+        }
+
+        let mut bits = Vec::new();
+        if best.is_cat {
+            bits = vec![0u32; cat::storage_size(iend - ibegin + 1)];
+            cat::set_bit(&mut bits, cat::as_cat(best.split_value));
+        }
+        p_best.update_entry(&best);
+        bits
+    }
+
+    /// `EnumeratePart` — partition the categories by the weight their gradients
+    /// imply, then split that order like an ordinary numeric feature.
+    ///
+    /// Sorting by weight is what makes a contiguous run of the sorted order an
+    /// optimal category subset. Both scan directions are tried, because they
+    /// differ in which side the feature's missing rows land on.
+    fn enumerate_partition(
+        &self,
+        nid: usize,
+        fidx: u32,
+        hist: &[GradStats],
+        parent: &NodeEntry,
+        p_best: &mut SplitEntry,
+    ) -> Vec<u32> {
+        let cuts = &self.gi.cuts;
+        let f = fidx as usize;
+        let (f_begin, f_end) = (cuts.cut_ptrs[f] as usize, cuts.cut_ptrs[f + 1] as usize);
+        let n_bins_feature = f_end - f_begin;
+        // `max_cat_threshold` caps how many categories one side may name.
+        let n_bins = (self.param.max_cat_threshold as usize).min(n_bins_feature);
+        if n_bins < 2 {
+            return Vec::new();
+        }
+
+        // `CalcWeightCat`: the unconstrained weight. Categories carry no
+        // monotonicity, so the node's weight box is deliberately not applied.
+        let mut sorted_idx: Vec<usize> = (0..n_bins_feature).collect();
+        sorted_idx.sort_by(|&l, &r| {
+            let wl = calc_weight(self.param, &hist[f_begin + l]);
+            let wr = calc_weight(self.param, &hist[f_begin + r]);
+            wl.total_cmp(&wr).then_with(|| l.cmp(&r))
+        });
+
+        let mut best = SplitEntry::default();
+        // How many of the sorted categories the winning split sends right.
+        let mut best_partition: Option<usize> = None;
+
+        for forward in [true, false] {
+            let mut left_sum = GradStats::default();
+            let mut right_sum = GradStats::default();
+            for step in 0..n_bins - 1 {
+                let j = if forward { step } else { n_bins_feature - 1 - step };
+                let cell = hist[f_begin + sorted_idx[j]];
+                if forward {
+                    // Scanning up the order, the accumulated head goes right
+                    // and the feature's missing rows stay left.
+                    right_sum.add(cell.sum_grad, cell.sum_hess);
+                    left_sum.set_subtract(&parent.stats, &right_sum);
+                } else {
+                    left_sum.add(cell.sum_grad, cell.sum_hess);
+                    right_sum.set_subtract(&parent.stats, &left_sum);
+                }
+                let gain =
+                    self.evaluator.calc_split_gain(nid, fidx, self.param, &left_sum, &right_sum);
+                if gain.is_finite()
+                    && best.update_cat(
+                        gain - parent.root_gain,
+                        fidx,
+                        f32::NAN,
+                        forward,
+                        left_sum,
+                        right_sum,
+                    )
+                {
+                    // Forward: the first `step + 1` of the order go right.
+                    // Backward: everything from `n_bins_feature - 1 - step`
+                    // upwards is the left side, so the right side is the head.
+                    best_partition =
+                        Some(if forward { step + 1 } else { n_bins_feature - 1 - step });
+                }
+            }
+        }
+
+        let mut bits = Vec::new();
+        if let Some(partition) = best_partition {
+            debug_assert!(partition > 0 && partition <= n_bins_feature);
+            bits = vec![0u32; cat::storage_size(n_bins_feature)];
+            // The head of the order is the right-hand side either way: a
+            // forward scan accumulates it into `right_sum` directly, and a
+            // backward scan leaves it as whatever the left side did not absorb.
+            for &c in &sorted_idx[..partition] {
+                cat::set_bit(&mut bits, cat::as_cat(cuts.cut_values[f_begin + c]));
+            }
+        }
+        p_best.update_entry(&best);
+        bits
     }
 
     fn enumerate_forward(

@@ -399,16 +399,34 @@ impl QuantileSketch {
 /// `cut_values[cut_ptrs[f]..cut_ptrs[f + 1]]` are feature `f`'s upper bin
 /// bounds; `min_values[f]` is a value below every observed one, used as the
 /// split point when the backward scan splits on the first bin.
+///
+/// A categorical feature is binned differently: its cut values are the category
+/// codes `0, 1, .., max_category` themselves, one bin per code, so a bin index
+/// *is* a category. `is_categorical` records which features those are, because
+/// nothing else about the layout distinguishes them.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct HistogramCuts {
     pub cut_ptrs: Vec<u32>,
     pub cut_values: Vec<f32>,
     pub min_values: Vec<f32>,
+    /// One flag per feature; empty when no feature is categorical.
+    pub is_categorical: Vec<bool>,
 }
 
 impl HistogramCuts {
     pub fn num_features(&self) -> usize {
         self.cut_ptrs.len().saturating_sub(1)
+    }
+
+    /// Whether feature `fidx` is binned by category code rather than quantile.
+    #[inline]
+    pub fn is_cat(&self, fidx: usize) -> bool {
+        self.is_categorical.get(fidx).copied().unwrap_or(false)
+    }
+
+    /// Whether any feature is categorical.
+    pub fn has_categorical(&self) -> bool {
+        self.is_categorical.iter().any(|c| *c)
     }
 
     /// Total bins across all features.
@@ -447,6 +465,39 @@ impl HistogramCuts {
         let idx = beg + lo;
         // A value above every cut belongs to the last bin.
         (if idx == end { idx - 1 } else { idx }) as u32
+    }
+
+    /// Global bin index for a categorical `value` in feature `fidx`, or `None`
+    /// when the category was never seen.
+    ///
+    /// `search_bin`'s binary search would also find it — the cut values are
+    /// sorted — but for a categorical feature they are exactly `0..=max_cat`,
+    /// so the code indexes its own bin and the search is a subtraction.
+    /// Upstream reaches the same conclusion by a different route, doing an
+    /// `equal_range` over the same values in `HistogramCuts::SearchCatBin`.
+    #[inline]
+    pub fn search_cat_bin(&self, value: f32, fidx: usize) -> Option<u32> {
+        if crate::tree::cat::invalid_cat(value) {
+            return None;
+        }
+        let code = crate::tree::cat::as_cat(value) as usize;
+        if code >= self.feature_bins(fidx) {
+            return None;
+        }
+        Some(self.cut_ptrs[fidx] + code as u32)
+    }
+
+    /// Global bin of `value` in feature `fidx`, whichever kind of feature it is.
+    ///
+    /// Returns `None` only for an unseen category; a numerical value always has
+    /// a bin.
+    #[inline]
+    pub fn bin_of(&self, value: f32, fidx: usize) -> Option<u32> {
+        if self.is_cat(fidx) {
+            self.search_cat_bin(value, fidx)
+        } else {
+            Some(self.search_bin(value, fidx))
+        }
     }
 
     /// Split point used by the backward scan when splitting at global bin
@@ -492,6 +543,41 @@ pub fn build_cuts_weighted(
     build_cuts_impl(dmat, max_bin, row_weights)
 }
 
+/// The observed value range of one categorical column, which is all the cut
+/// builder needs from it: the bins are `0..=max`, and `min` only has to prove
+/// no value was negative.
+#[derive(Clone, Copy, Debug)]
+struct CatRange {
+    min: f32,
+    max: f32,
+}
+
+impl Default for CatRange {
+    fn default() -> Self {
+        Self { min: f32::INFINITY, max: f32::NEG_INFINITY }
+    }
+}
+
+impl CatRange {
+    #[inline]
+    fn push(&mut self, v: f32) {
+        // NaN must not be folded away silently: it is not a category, and
+        // `min`/`max` would drop it. Recording it as a violation of both bounds
+        // makes the validation below reject it.
+        if v.is_nan() {
+            self.min = f32::NAN;
+            self.max = f32::NAN;
+            return;
+        }
+        self.min = self.min.min(v);
+        self.max = self.max.max(v);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.max < self.min
+    }
+}
+
 fn build_cuts_impl(
     dmat: &DMatrix,
     max_bin: u32,
@@ -501,10 +587,15 @@ fn build_cuts_impl(
     let column_sizes = dmat.column_sizes();
     let max_bins = max_bin as usize;
 
+    let is_cat: Vec<bool> = (0..n_features).map(|f| dmat.info.is_categorical(f)).collect();
+    let any_cat = is_cat.iter().any(|c| *c);
+
     let mut sketches: Vec<QuantileSketch> = (0..n_features)
         .map(|f| {
             let mut s = QuantileSketch::default();
-            if column_sizes[f] > 0 {
+            // A categorical column is not sketched at all, so it needs no
+            // staging buffers.
+            if column_sizes[f] > 0 && !is_cat[f] {
                 let n_bins = max_bins.min(column_sizes[f]).max(1);
                 let eps = 1.0f64 / ((n_bins as f32 * K_FACTOR) as f64);
                 s.init(column_sizes[f], eps);
@@ -512,29 +603,56 @@ fn build_cuts_impl(
             s
         })
         .collect();
+    let mut cat_ranges = vec![CatRange::default(); n_features];
 
     // Group features so each task makes one pass over the rows; a task per
     // feature would re-read the whole matrix once per column.
     let chunk = n_features.div_ceil(crate::threading::num_threads() * 2).max(1);
     crate::threading::install(|| {
-        sketches.par_chunks_mut(chunk).enumerate().for_each(|(c, group)| {
-            let first = c * chunk;
-            let last = first + group.len();
-            for r in 0..dmat.num_row() {
-                let w = match row_weights {
-                    Some(weights) => weights[r],
-                    None => dmat.info.weight(r),
-                };
-                let (idx, val) = dmat.row(r);
-                for (&col, &v) in idx.iter().zip(val) {
-                    let col = col as usize;
-                    if col >= first && col < last {
-                        group[col - first].push(v, w);
+        sketches
+            .par_chunks_mut(chunk)
+            .zip(cat_ranges.par_chunks_mut(chunk))
+            .enumerate()
+            .for_each(|(c, (group, cats))| {
+                let first = c * chunk;
+                let last = first + group.len();
+                for r in 0..dmat.num_row() {
+                    let w = match row_weights {
+                        Some(weights) => weights[r],
+                        None => dmat.info.weight(r),
+                    };
+                    let (idx, val) = dmat.row(r);
+                    for (&col, &v) in idx.iter().zip(val) {
+                        let col = col as usize;
+                        if col >= first && col < last {
+                            if is_cat[col] {
+                                cats[col - first].push(v);
+                            } else {
+                                group[col - first].push(v, w);
+                            }
+                        }
                     }
                 }
-            }
-        });
+            });
     });
+
+    // `AddCategories` refuses a column it could not encode, rather than
+    // rounding a value into the wrong category.
+    for (f, range) in cat_ranges.iter().enumerate() {
+        if !is_cat[f] || range.is_empty() {
+            continue;
+        }
+        if crate::tree::cat::invalid_cat(range.min) || crate::tree::cat::invalid_cat(range.max) {
+            return Err(crate::Error::invalid(
+                "feature_types",
+                format!(
+                    "column {f} is marked categorical but holds values outside \
+                     [0, {}); category codes must be non-negative whole numbers",
+                    crate::tree::cat::OUT_OF_RANGE_CAT
+                ),
+            ));
+        }
+    }
 
     // `AllReduce`: prune each sketch to the intermediate cut count.
     let mut reduced: Vec<Vec<Entry>> = vec![Vec::new(); n_features];
@@ -546,7 +664,7 @@ fn build_cuts_impl(
             .zip(num_cuts.par_iter_mut())
             .enumerate()
             .for_each(|(f, ((sketch, reduced), num_cuts))| {
-                if column_sizes[f] == 0 {
+                if column_sizes[f] == 0 || is_cat[f] {
                     return;
                 }
                 let intermediate = column_sizes[f].min(max_bins * K_FACTOR as usize);
@@ -562,11 +680,16 @@ fn build_cuts_impl(
         cut_ptrs: vec![0u32],
         cut_values: Vec::new(),
         min_values: vec![0.0f32; n_features],
+        is_categorical: if any_cat { is_cat.clone() } else { Vec::new() },
     };
     let mut final_summaries: Vec<Vec<Entry>> = vec![Vec::new(); n_features];
     for f in 0..n_features {
         let max_num_bins = num_cuts[f].min(max_bins);
-        if num_cuts[f] != 0 {
+        if is_cat[f] {
+            // Bins are the category codes; there is no value below the first
+            // one to split against, and the backward scan never runs.
+            cuts.min_values[f] = 0.0;
+        } else if num_cuts[f] != 0 {
             set_prune(&reduced[f], max_num_bins + 1, &mut final_summaries[f]);
             let mval = final_summaries[f][0].value;
             cuts.min_values[f] = mval - mval.abs() - 1e-5;
@@ -576,6 +699,24 @@ fn build_cuts_impl(
     }
 
     for f in 0..n_features {
+        if is_cat[f] {
+            // `AddCategories`: one bin per category code from 0 to the largest
+            // one observed, so a bin index is the category itself. Codes in
+            // that range that never occur still get a bin, which is what lets
+            // the index skip a search entirely.
+            let n_cats = if cat_ranges[f].is_empty() {
+                // A column with no stored values still needs one bin, matching
+                // what an all-missing numerical column gets.
+                1
+            } else {
+                crate::tree::cat::as_cat(cat_ranges[f].max) as usize + 1
+            };
+            for code in 0..n_cats {
+                cuts.cut_values.push(code as f32);
+            }
+            cuts.cut_ptrs.push(cuts.cut_values.len() as u32);
+            continue;
+        }
         let max_num_bins = num_cuts[f].min(max_bins);
         let a = &final_summaries[f];
         // `AddCutPoint`: element 0 is represented by `min_values`, so start at 1.

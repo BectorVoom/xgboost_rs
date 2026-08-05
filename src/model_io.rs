@@ -146,12 +146,37 @@ fn tree_to_json(id: usize, tree: &RegTree) -> Value {
         sum_hessian.push(tree.stats[nid].sum_hess);
     }
 
+    // `SaveCategoricalSplit`: the bit sets are written out as the category
+    // codes they contain, node by node in ascending node order, so the file
+    // does not depend on the width of the in-memory bit field.
+    let mut categories: Vec<i64> = Vec::new();
+    let mut categories_nodes: Vec<i64> = Vec::new();
+    let mut categories_segments: Vec<i64> = Vec::new();
+    let mut categories_sizes: Vec<i64> = Vec::new();
+    let mut split_type = vec![0u8; n];
+    for nid in 0..n {
+        if !tree.is_categorical_split(nid) {
+            continue;
+        }
+        split_type[nid] = 1;
+        let bits = tree.node_categories(nid);
+        let begin = categories.len() as i64;
+        categories_nodes.push(nid as i64);
+        categories_segments.push(begin);
+        for code in 0..(bits.len() * 32) as u32 {
+            if crate::tree::cat::check_bit(bits, code) {
+                categories.push(code as i64);
+            }
+        }
+        categories_sizes.push(categories.len() as i64 - begin);
+    }
+
     json!({
         "base_weights": base_weights,
-        "categories": [],
-        "categories_nodes": [],
-        "categories_segments": [],
-        "categories_sizes": [],
+        "categories": categories,
+        "categories_nodes": categories_nodes,
+        "categories_segments": categories_segments,
+        "categories_sizes": categories_sizes,
         "default_left": default_left,
         "id": id,
         "left_children": left,
@@ -160,7 +185,7 @@ fn tree_to_json(id: usize, tree: &RegTree) -> Value {
         "right_children": right,
         "split_conditions": split_conditions,
         "split_indices": split_indices,
-        "split_type": vec![0u8; n],
+        "split_type": split_type,
         "sum_hessian": sum_hessian,
         "tree_param": {
             "num_deleted": tree.num_deleted().to_string(),
@@ -384,7 +409,83 @@ fn tree_from_json(t: &Value, num_feature: usize) -> Result<RegTree> {
     // recovered from the links, since nothing unreachable from the root is
     // part of the tree.
     tree.recompute_deleted();
+    load_categorical_split(&mut tree, t, n)?;
     Ok(tree)
+}
+
+/// `RegTree::LoadCategoricalSplit` — rebuild the per-node category bit sets
+/// from the flat code lists the file carries.
+///
+/// A model with no categorical split omits or empties these arrays, which is
+/// what every tree written before this existed looks like, so their absence is
+/// not an error.
+fn load_categorical_split(tree: &mut RegTree, t: &Value, n: usize) -> Result<()> {
+    let split_type = int_array(t, "split_type").unwrap_or_default();
+    let nodes = int_array(t, "categories_nodes").unwrap_or_default();
+    let segments = int_array(t, "categories_segments").unwrap_or_default();
+    let sizes = int_array(t, "categories_sizes").unwrap_or_default();
+    let categories = int_array(t, "categories").unwrap_or_default();
+
+    if nodes.is_empty() {
+        return Ok(());
+    }
+    if segments.len() != nodes.len() || sizes.len() != nodes.len() {
+        return Err(Error::ModelFormat(format!(
+            "categorical arrays disagree: {} nodes, {} segments, {} sizes",
+            nodes.len(),
+            segments.len(),
+            sizes.len()
+        )));
+    }
+
+    let mut categorical = vec![false; n];
+    let mut node_segments = vec![(0u32, 0u32); n];
+    let mut storage: Vec<u32> = Vec::new();
+
+    for (i, &nid) in nodes.iter().enumerate() {
+        let nid = nid as usize;
+        if nid >= n {
+            return Err(Error::ModelFormat(format!(
+                "categorical split names node {nid} in a tree of {n} nodes"
+            )));
+        }
+        let begin = segments[i] as usize;
+        let end = begin + sizes[i] as usize;
+        if end > categories.len() {
+            return Err(Error::ModelFormat(format!(
+                "node {nid} names categories {begin}..{end} of {}",
+                categories.len()
+            )));
+        }
+        let codes = &categories[begin..end];
+        // The bit field is sized to the largest category it has to hold, which
+        // is what upstream reconstructs too — the width is not recorded.
+        let max_cat = codes.iter().copied().max().ok_or_else(|| {
+            Error::ModelFormat(format!("node {nid} is a categorical split with no categories"))
+        })?;
+        let base = storage.len() as u32;
+        let words = crate::tree::cat::storage_size(max_cat as usize + 1);
+        storage.resize(storage.len() + words, 0);
+        for &code in codes {
+            crate::tree::cat::set_bit(&mut storage[base as usize..], code as u32);
+        }
+        categorical[nid] = true;
+        node_segments[nid] = (base, words as u32);
+    }
+
+    // `split_type` is the authority on which nodes are categorical; a
+    // disagreement with `categories_nodes` means the file is inconsistent.
+    for (nid, &kind) in split_type.iter().enumerate().take(n) {
+        if (kind != 0) != categorical[nid] {
+            return Err(Error::ModelFormat(format!(
+                "node {nid} has split_type {kind} but {} category list",
+                if categorical[nid] { "a" } else { "no" }
+            )));
+        }
+    }
+
+    tree.set_categories(categorical, node_segments, storage);
+    Ok(())
 }
 
 fn format_f32(v: f32) -> String {

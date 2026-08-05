@@ -8,6 +8,14 @@
 /// Marker for "no child", as upstream's `kInvalidNodeId`.
 pub const INVALID_NODE: i32 = -1;
 
+/// The split threshold stored on a categorical node, upstream's
+/// `tree::DftBadValue()`.
+///
+/// A categorical node has no threshold, but the field is written for every node
+/// alike. `f32::denorm_min()` — not `NaN` — is what upstream stores, because
+/// the value has to survive a JSON round trip, and JSON has no `NaN`.
+pub const NO_SPLIT_VALUE: f32 = f32::from_bits(1);
+
 /// `kDeletedNodeMarker`: the split index a pruned-away node is stamped with.
 ///
 /// Upstream writes `UINT32_MAX` into the packed `(default_left, split_index)`
@@ -145,6 +153,15 @@ pub struct RegTree {
     /// Whether a node has been pruned away. A deleted node keeps its slot so
     /// the ids around it never move.
     deleted: Vec<bool>,
+    /// Whether each node splits on category membership rather than a threshold.
+    /// Mirrors upstream's `split_types_`.
+    split_categorical: Vec<bool>,
+    /// `(begin, len)` into [`Self::split_categories`] for each categorical
+    /// node; `(0, 0)` for every other node. Upstream's
+    /// `split_categories_segments_`.
+    split_categories_segments: Vec<(u32, u32)>,
+    /// Concatenated category bit sets, upstream's `split_categories_`.
+    split_categories: Vec<u32>,
     num_feature: usize,
 }
 
@@ -156,8 +173,43 @@ impl RegTree {
             stats: vec![NodeStat::default()],
             depths: vec![0],
             deleted: vec![false],
+            split_categorical: vec![false],
+            split_categories_segments: vec![(0, 0)],
+            split_categories: Vec::new(),
             num_feature,
         }
+    }
+
+    /// Whether node `nid` splits on category membership.
+    #[inline]
+    pub fn is_categorical_split(&self, nid: usize) -> bool {
+        self.split_categorical.get(nid).copied().unwrap_or(false)
+    }
+
+    /// The categories node `nid` sends right, as a bit set.
+    #[inline]
+    pub fn node_categories(&self, nid: usize) -> &[u32] {
+        let (beg, len) = self.split_categories_segments[nid];
+        &self.split_categories[beg as usize..(beg + len) as usize]
+    }
+
+    /// Whether any node splits on a category set.
+    pub fn has_categorical_split(&self) -> bool {
+        self.split_categorical.iter().any(|c| *c)
+    }
+
+    /// Restore the categorical split tables of a loaded model.
+    pub(crate) fn set_categories(
+        &mut self,
+        categorical: Vec<bool>,
+        segments: Vec<(u32, u32)>,
+        storage: Vec<u32>,
+    ) {
+        self.split_categorical = categorical;
+        self.split_categories_segments = segments;
+        self.split_categories = storage;
+        self.split_categorical.resize(self.nodes.len(), false);
+        self.split_categories_segments.resize(self.nodes.len(), (0, 0));
     }
 
     pub fn num_nodes(&self) -> usize {
@@ -224,6 +276,60 @@ impl RegTree {
             NodeStat { loss_chg: 0.0, sum_hess: left_sum, base_weight: left_leaf_weight };
         self.stats[pright] =
             NodeStat { loss_chg: 0.0, sum_hess: right_sum, base_weight: right_leaf_weight };
+    }
+
+    /// Split leaf `nid` on membership of a category set, appending its two
+    /// children.
+    ///
+    /// `categories` is the bit set of codes that go *right*; every other value,
+    /// including one the split never saw, goes left. Mirrors upstream's
+    /// `RegTree::ExpandCategorical`, which likewise routes through
+    /// [`expand_node`](Self::expand_node) and parks the unused threshold at
+    /// [`NO_SPLIT_VALUE`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn expand_categorical(
+        &mut self,
+        nid: usize,
+        split_index: u32,
+        categories: &[u32],
+        default_left: bool,
+        base_weight: f32,
+        left_leaf_weight: f32,
+        right_leaf_weight: f32,
+        loss_change: f32,
+        sum_hess: f32,
+        left_sum: f32,
+        right_sum: f32,
+    ) {
+        self.expand_node(
+            nid,
+            split_index,
+            NO_SPLIT_VALUE,
+            default_left,
+            base_weight,
+            left_leaf_weight,
+            right_leaf_weight,
+            loss_change,
+            sum_hess,
+            left_sum,
+            right_sum,
+        );
+        let beg = self.split_categories.len() as u32;
+        self.split_categories.extend_from_slice(categories);
+        self.split_categorical[nid] = true;
+        self.split_categories_segments[nid] = (beg, categories.len() as u32);
+    }
+
+    /// Which child a row with value `value` moves to from internal node `nid`.
+    ///
+    /// The one place the two kinds of split differ at prediction time.
+    #[inline]
+    fn goes_left(&self, nid: usize, value: f32) -> bool {
+        if self.is_categorical_split(nid) {
+            super::cat::goes_left(self.node_categories(nid), value)
+        } else {
+            value < self.nodes[nid].value
+        }
     }
 
     /// `TreePruner::DoPrune`: collapse every split whose loss reduction is
@@ -329,6 +435,8 @@ impl RegTree {
     /// Recompute node depths from the parent links, after loading a model.
     pub(crate) fn recompute_depths(&mut self) {
         self.deleted.resize(self.nodes.len(), false);
+        self.split_categorical.resize(self.nodes.len(), false);
+        self.split_categories_segments.resize(self.nodes.len(), (0, 0));
         self.depths = vec![0; self.nodes.len()];
         for nid in 0..self.nodes.len() {
             let parent = self.nodes[nid].parent;
@@ -343,6 +451,8 @@ impl RegTree {
         self.nodes.push(Node { parent, ..Default::default() });
         self.stats.push(NodeStat::default());
         self.deleted.push(false);
+        self.split_categorical.push(false);
+        self.split_categories_segments.push((0, 0));
         let depth = if parent >= 0 { self.depths[parent as usize] + 1 } else { 0 };
         self.depths.push(depth);
         nid
@@ -426,26 +536,19 @@ impl RegTree {
         self.depths.iter().copied().max().unwrap_or(0) as usize
     }
 
-    /// The child a row moves to from `nid`.
+    /// The child a row moves to from internal node `nid`, given its value for
+    /// that node's split feature (`None` when the value is missing).
+    ///
+    /// The single place routing is decided, so every traversal — prediction,
+    /// SHAP, the `refresh` updater — agrees about categorical splits.
     #[inline]
-    fn next_node(&self, nid: usize, value: Option<f32>) -> usize {
+    pub fn next_node(&self, nid: usize, value: Option<f32>) -> usize {
         let node = self.nodes[nid];
-        match value {
-            Some(v) => {
-                if v < node.value {
-                    node.left as usize
-                } else {
-                    node.right as usize
-                }
-            }
-            None => {
-                if node.default_left {
-                    node.left as usize
-                } else {
-                    node.right as usize
-                }
-            }
-        }
+        let left = match value {
+            Some(v) => self.goes_left(nid, v),
+            None => node.default_left,
+        };
+        if left { node.left as usize } else { node.right as usize }
     }
 
     /// The TreeSHAP recursion. `unique_depth` counts the distinct features
@@ -554,26 +657,10 @@ impl RegTree {
     {
         let mut nid = 0usize;
         loop {
-            let node = &self.nodes[nid];
-            if node.is_leaf() {
+            if self.nodes[nid].is_leaf() {
                 return nid;
             }
-            nid = match get(node.split_index) {
-                Some(v) => {
-                    if v < node.value {
-                        node.left as usize
-                    } else {
-                        node.right as usize
-                    }
-                }
-                None => {
-                    if node.default_left {
-                        node.left as usize
-                    } else {
-                        node.right as usize
-                    }
-                }
-            };
+            nid = self.next_node(nid, get(self.nodes[nid].split_index));
         }
     }
 }

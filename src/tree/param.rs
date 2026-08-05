@@ -55,6 +55,12 @@ pub struct TrainParam {
     /// deep or wide tree holds; it changes speed, never the model.
     pub max_cached_hist_node: u64,
 
+    /// Category count below which a categorical feature is split one-hot —
+    /// "equals this category" — instead of by partitioning the categories.
+    pub max_cat_to_onehot: u32,
+    /// Largest number of categories a partition-based split may send right.
+    pub max_cat_threshold: u32,
+
     /// Where the `exact` updater sends rows whose split feature is missing.
     pub default_direction: DefaultDirection,
     /// Density above which the `exact` updater skips a column's forward scan.
@@ -93,6 +99,8 @@ impl Default for TrainParam {
             interaction_constraints: None,
             // `HistMakerTrainParam::CpuDefaultNodes`.
             max_cached_hist_node: 1 << 16,
+            max_cat_to_onehot: 4,
+            max_cat_threshold: 64,
             default_direction: DefaultDirection::Learn,
             opt_dense_col: 1.0,
             updaters: vec![TreeUpdaterName::GrowQuantileHistMaker],
@@ -201,6 +209,10 @@ pub struct SplitEntry {
     pub split_value: f32,
     pub left_sum: GradStats,
     pub right_sum: GradStats,
+    /// Whether this split tests category membership rather than
+    /// `value < split_value`. The chosen categories are not stored here: they
+    /// are a variable-length bit set, and this type is deliberately `Copy`.
+    pub is_cat: bool,
 }
 
 impl SplitEntry {
@@ -241,6 +253,38 @@ impl SplitEntry {
         left_sum: GradStats,
         right_sum: GradStats,
     ) -> bool {
+        self.update_impl(new_loss_chg, split_index, new_split_value, default_left, left_sum, right_sum, false)
+    }
+
+    /// [`update`](Self::update) for a split on category membership.
+    ///
+    /// `new_split_value` carries no threshold — a categorical split has none —
+    /// but a one-hot split still passes its category through it, which is how
+    /// upstream's `EnumerateOneHot` recovers the single bit to set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_cat(
+        &mut self,
+        new_loss_chg: f32,
+        split_index: u32,
+        new_split_value: f32,
+        default_left: bool,
+        left_sum: GradStats,
+        right_sum: GradStats,
+    ) -> bool {
+        self.update_impl(new_loss_chg, split_index, new_split_value, default_left, left_sum, right_sum, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_impl(
+        &mut self,
+        new_loss_chg: f32,
+        split_index: u32,
+        new_split_value: f32,
+        default_left: bool,
+        left_sum: GradStats,
+        right_sum: GradStats,
+        is_cat: bool,
+    ) -> bool {
         if !self.need_replace(new_loss_chg, split_index) {
             return false;
         }
@@ -249,6 +293,7 @@ impl SplitEntry {
         self.split_value = new_split_value;
         self.left_sum = left_sum;
         self.right_sum = right_sum;
+        self.is_cat = is_cat;
         true
     }
 

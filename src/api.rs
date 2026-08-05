@@ -420,7 +420,7 @@ pub fn train_from(
     };
     if let Some(tree) = tree {
         check_supported_updater(tree, general.device)?;
-        check_supported_tree_options(tree, dtrain)?;
+        check_supported_tree_options(tree, dtrain, general.device)?;
         check_feature_constraints(tree, dtrain.num_col())?;
     }
 
@@ -455,7 +455,7 @@ pub fn train_from(
             eprintln!("[xgboost_rs] WARNING: {warning}");
         }
         if general.validate_parameters {
-            for name in unused_parameters(params, tree) {
+            for name in unused_parameters(params, tree, dtrain.info().has_categorical()) {
                 eprintln!(
                     "[xgboost_rs] WARNING: parameter `{name}` was set but nothing in this \
                      fit consumed it"
@@ -700,7 +700,11 @@ fn check_supported_updater(tree: &TreeBoosterParameters, device: Device) -> Resu
 
 /// Reject the tree-booster options this build cannot act on, so none of them is
 /// accepted and then silently ignored.
-fn check_supported_tree_options(tree: &TreeBoosterParameters, dtrain: &DMatrix) -> Result<()> {
+fn check_supported_tree_options(
+    tree: &TreeBoosterParameters,
+    dtrain: &DMatrix,
+    device: Device,
+) -> Result<()> {
     if tree.multi_strategy != MultiStrategy::OneOutputPerTree {
         return Err(Error::invalid(
             "multi_strategy",
@@ -711,11 +715,17 @@ fn check_supported_tree_options(tree: &TreeBoosterParameters, dtrain: &DMatrix) 
             ),
         ));
     }
-    if dtrain.info().has_categorical() {
+    // Only the histogram updaters bin by category. `exact` enumerates a
+    // column's values in ascending order, which would read the category codes
+    // as an ordering they do not have, so it is refused rather than quietly
+    // fitting something else.
+    if dtrain.info().has_categorical()
+        && tree.resolved_updaters(device)?.contains(&TreeUpdaterName::GrowColMaker)
+    {
         return Err(Error::invalid(
-            "feature_types",
-            "categorical splits are not implemented; mark every column numerical, or \
-             one-hot encode the categories yourself",
+            "tree_method",
+            "the `exact` tree method has no categorical split; use `hist` or `approx`, \
+             or one-hot encode the categories yourself",
         ));
     }
     Ok(())
@@ -729,6 +739,7 @@ fn check_supported_tree_options(tree: &TreeBoosterParameters, dtrain: &DMatrix) 
 fn unused_parameters(
     params: &TrainingParameters,
     tree: Option<&TreeBoosterParameters>,
+    has_categorical: bool,
 ) -> Vec<String> {
     let mut unused = Vec::new();
     let default = TreeBoosterParameters::default();
@@ -754,12 +765,15 @@ fn unused_parameters(
         if !uses(TreeUpdaterName::Refresh) && tree.refresh_leaf != default.refresh_leaf {
             unused.push("refresh_leaf".to_owned());
         }
-        // Categorical splits are rejected outright, so their knobs never apply.
-        if tree.max_cat_to_onehot != default.max_cat_to_onehot {
-            unused.push("max_cat_to_onehot".to_owned());
-        }
-        if tree.max_cat_threshold != default.max_cat_threshold {
-            unused.push("max_cat_threshold".to_owned());
+        // Both categorical knobs only mean something once some column is
+        // marked categorical.
+        if !has_categorical {
+            if tree.max_cat_to_onehot != default.max_cat_to_onehot {
+                unused.push("max_cat_to_onehot".to_owned());
+            }
+            if tree.max_cat_threshold != default.max_cat_threshold {
+                unused.push("max_cat_threshold".to_owned());
+            }
         }
         // A single-process fit has no workers to synchronise.
         if tree.debug_synchronize {
@@ -807,6 +821,8 @@ fn train_param(tree: &TreeBoosterParameters, device: Device) -> Result<TrainPara
         monotone_constraints: tree.monotone_constraints.clone(),
         interaction_constraints: tree.interaction_constraints.clone(),
         max_cached_hist_node: tree.max_cached_hist_nodes(Device::Cpu),
+        max_cat_to_onehot: tree.max_cat_to_onehot,
+        max_cat_threshold: tree.max_cat_threshold,
         default_direction: tree.default_direction,
         opt_dense_col: tree.opt_dense_col,
         updaters: tree.resolved_updaters(device)?,

@@ -171,6 +171,32 @@ impl GHistIndex {
 
 }
 
+/// Feature-local bin of one stored value.
+///
+/// The cuts were built from the very matrix being binned, so every value has a
+/// bin: a numerical one always falls in some quantile bucket, and a category
+/// code is at most the largest one the cut builder saw. An unseen category
+/// could only come from cuts built elsewhere, and it maps to the last bin
+/// rather than out of the histogram.
+#[inline]
+fn local_bin(cuts: &HistogramCuts, value: f32, fidx: usize) -> u32 {
+    if cuts.is_cat(fidx) {
+        let n_bins = cuts.feature_bins(fidx) as u32;
+        debug_assert!(
+            cuts.search_cat_bin(value, fidx).is_some(),
+            "category {value} of feature {fidx} has no bin in cuts built from this matrix"
+        );
+        let code = if crate::tree::cat::invalid_cat(value) {
+            0
+        } else {
+            crate::tree::cat::as_cat(value)
+        };
+        code.min(n_bins.saturating_sub(1))
+    } else {
+        cuts.search_bin(value, fidx) - cuts.cut_ptrs[fidx]
+    }
+}
+
 /// Bin every entry of `dmat` against `cuts`.
 ///
 /// Rows are independent, so the work is split across threads by row block. The
@@ -199,7 +225,7 @@ pub fn build_gradient_index(dmat: &DMatrix, cuts: &HistogramCuts) -> Result<GHis
                     let first_row = block * ROW_BLOCK;
                     for (i, slot) in out.iter_mut().enumerate() {
                         let (r, c) = (first_row + i / num_col, i % num_col);
-                        *slot = cuts.search_bin(dmat.value[r * num_col + c], c) - offsets[c];
+                        *slot = local_bin(cuts, dmat.value[r * num_col + c], c);
                     }
                 });
         } else {
@@ -221,7 +247,7 @@ pub fn build_gradient_index(dmat: &DMatrix, cuts: &HistogramCuts) -> Result<GHis
                     let (idx, val) = dmat.row(r);
                     let offset = dmat.row_ptr[r] - base;
                     for (k, (&c, &v)) in idx.iter().zip(val).enumerate() {
-                        out[offset + k] = cuts.search_bin(v, c as usize) - offsets[c as usize];
+                        out[offset + k] = local_bin(cuts, v, c as usize);
                     }
                 }
             });
