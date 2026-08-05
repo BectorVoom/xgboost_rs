@@ -27,7 +27,7 @@ impl Objective for LogitRaw {
         "binary:logitraw"
     }
 
-    fn get_gradient(&self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
+    fn get_gradient(&mut self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
         let n_targets = info.n_targets();
         out.clear();
         out.reserve(preds.len());
@@ -48,7 +48,7 @@ impl Objective for LogitRaw {
     /// No transform: the margin *is* the prediction.
     fn pred_transform(&self, _preds: &mut Vec<f32>) {}
 
-    fn init_estimation(&self, info: &MetaInfo) -> Vec<f32> {
+    fn init_estimation(&mut self, info: &MetaInfo) -> Vec<f32> {
         fit_intercept(self, info)
     }
 
@@ -78,7 +78,7 @@ impl Objective for BinaryHinge {
         "binary:hinge"
     }
 
-    fn get_gradient(&self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
+    fn get_gradient(&mut self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
         let n_targets = info.n_targets();
         out.clear();
         out.reserve(preds.len());
@@ -102,7 +102,7 @@ impl Objective for BinaryHinge {
         }
     }
 
-    fn init_estimation(&self, info: &MetaInfo) -> Vec<f32> {
+    fn init_estimation(&mut self, info: &MetaInfo) -> Vec<f32> {
         fit_intercept(self, info)
     }
 
@@ -159,7 +159,7 @@ impl Objective for SoftmaxMultiClass {
         self.num_class
     }
 
-    fn get_gradient(&self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
+    fn get_gradient(&mut self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
         let k = self.num_class;
         out.clear();
         out.resize(preds.len(), GradientPair::default());
@@ -206,7 +206,7 @@ impl Objective for SoftmaxMultiClass {
         }
     }
 
-    fn init_estimation(&self, info: &MetaInfo) -> Vec<f32> {
+    fn init_estimation(&mut self, info: &MetaInfo) -> Vec<f32> {
         // `SoftmaxMultiClassObj::InitEstimation`: the class frequencies,
         // centred in log space so the margins sum to zero.
         let k = self.num_class;
@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn logitraw_reports_the_margin_but_learns_the_probability() {
-        let obj = LogitRaw::new(1.0);
+        let mut obj = LogitRaw::new(1.0);
         let mut preds = vec![2.5f32];
         obj.pred_transform(&mut preds);
         assert_eq!(preds, vec![2.5], "logitraw does not transform");
@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn softmax_gradient_pushes_the_true_class_up() {
-        let obj = SoftmaxMultiClass::new(3, true);
+        let mut obj = SoftmaxMultiClass::new(3, true);
         let mut out = Vec::new();
         obj.get_gradient(&[0.0, 0.0, 0.0], &info(&[2.0]), 0, &mut out);
         assert!(out[2].grad < 0.0, "the true class gets a negative gradient");
@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn softmax_intercept_is_the_centred_log_frequency() {
-        let obj = SoftmaxMultiClass::new(2, true);
+        let mut obj = SoftmaxMultiClass::new(2, true);
         // Balanced classes give equal, zero-centred margins.
         let intercept = obj.init_estimation(&info(&[0.0, 1.0]));
         assert_eq!(intercept.len(), 2);

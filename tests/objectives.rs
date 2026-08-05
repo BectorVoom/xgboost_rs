@@ -465,6 +465,103 @@ fn the_lambdarank_pair_method_changes_the_fit() {
     assert_eq!(mean.save_model(), train(&p, &d).save_model(), "sampling must be reproducible");
 }
 
+/// `lambdarank_unbiased` re-weights pairs by an estimated examination
+/// propensity, so it must reach the fit — and `lambdarank_bias_norm` must
+/// change how far that estimate moves.
+#[test]
+fn unbiased_lambdamart_and_its_bias_norm_reach_the_fit() {
+    let (queries, docs) = (30usize, 8usize);
+    let rows = queries * docs;
+    let mut rng = Rng::new();
+    let mut x = Vec::with_capacity(rows * 2);
+    let mut y = Vec::with_capacity(rows);
+    for _ in 0..queries {
+        for k in 0..docs {
+            // Documents arrive in relevance order, which is the position the
+            // debiasing attributes examination to.
+            let relevance = (docs - 1 - k) as f32;
+            x.push(relevance / docs as f32 + rng.next() * 0.1);
+            x.push(rng.next());
+            y.push(relevance);
+        }
+    }
+    let mut d = DMatrix::from_dense(&x, rows, 2, f32::NAN).unwrap();
+    d.set_labels(&y).unwrap();
+    d.set_group(&vec![docs; queries]).unwrap();
+
+    let fit = |param: LambdaRankParameters| {
+        train(&params(Objective::RankNdcg(param), 12), &d).save_model()
+    };
+
+    let biased = fit(LambdaRankParameters::default());
+    let unbiased =
+        fit(LambdaRankParameters { unbiased: true, ..LambdaRankParameters::default() });
+    assert_ne!(biased, unbiased, "`lambdarank_unbiased` must change the model");
+
+    // The propensity update raises its ratio to `1 / (1 + bias_norm)`, so two
+    // different norms give two different re-weightings.
+    let sharp = fit(LambdaRankParameters {
+        unbiased: true,
+        bias_norm: 0.0,
+        ..LambdaRankParameters::default()
+    });
+    let soft = fit(LambdaRankParameters {
+        unbiased: true,
+        bias_norm: 8.0,
+        ..LambdaRankParameters::default()
+    });
+    assert_ne!(sharp, soft, "`lambdarank_bias_norm` must change the model");
+
+    // And the parameter is not merely perturbing the fit: it still ranks.
+    let booster = train(
+        &params(
+            Objective::RankNdcg(LambdaRankParameters {
+                unbiased: true,
+                ..LambdaRankParameters::default()
+            }),
+            30,
+        ),
+        &d,
+    );
+    let preds = booster.predict(&d);
+    let mut correct = 0;
+    for q in 0..queries {
+        let slice = &preds[q * docs..(q + 1) * docs];
+        let best = slice
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::MIN), |acc, (i, &v)| if v > acc.1 { (i, v) } else { acc })
+            .0;
+        if best == 0 {
+            correct += 1;
+        }
+    }
+    assert!(correct > queries * 3 / 4, "an unbiased fit ordered only {correct}/{queries} queries");
+}
+
+/// `lambdarank_unbiased` is state that evolves across rounds, so the same
+/// configuration must still reproduce exactly.
+#[test]
+fn an_unbiased_ranking_fit_is_reproducible() {
+    let (queries, docs) = (20usize, 6usize);
+    let rows = queries * docs;
+    let mut rng = Rng::new();
+    let x: Vec<f32> = (0..rows * 2).map(|_| rng.next()).collect();
+    let y: Vec<f32> = (0..rows).map(|i| (i % docs) as f32).collect();
+    let mut d = DMatrix::from_dense(&x, rows, 2, f32::NAN).unwrap();
+    d.set_labels(&y).unwrap();
+    d.set_group(&vec![docs; queries]).unwrap();
+
+    let p = params(
+        Objective::RankNdcg(LambdaRankParameters {
+            unbiased: true,
+            ..LambdaRankParameters::default()
+        }),
+        10,
+    );
+    assert_eq!(train(&p, &d).save_model(), train(&p, &d).save_model());
+}
+
 /// A ranking fit reports the truncation level in its default metric name.
 #[test]
 fn the_ranking_default_metric_carries_the_truncation_level() {

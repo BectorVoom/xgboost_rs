@@ -30,7 +30,7 @@ impl Objective for CoxRegression {
         1
     }
 
-    fn get_gradient(&self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
+    fn get_gradient(&mut self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
         out.clear();
         out.resize(preds.len(), GradientPair::default());
         if preds.is_empty() {
@@ -91,7 +91,7 @@ impl Objective for CoxRegression {
         Ok(())
     }
 
-    fn init_estimation(&self, info: &MetaInfo) -> Vec<f32> {
+    fn init_estimation(&mut self, info: &MetaInfo) -> Vec<f32> {
         // Cox has no closed-form intercept upstream: the hazard ratio is
         // relative, so the fit starts from the neutral ratio of 1.
         let _ = info;
@@ -382,7 +382,7 @@ impl Objective for AftSurvival {
         1
     }
 
-    fn get_gradient(&self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
+    fn get_gradient(&mut self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
         out.clear();
         out.reserve(preds.len());
         let sigma = self.sigma as f64;
@@ -425,7 +425,7 @@ impl Objective for AftSurvival {
         Ok(())
     }
 
-    fn init_estimation(&self, info: &MetaInfo) -> Vec<f32> {
+    fn init_estimation(&mut self, info: &MetaInfo) -> Vec<f32> {
         // The label mean, on the time scale the intercept is stored in. A
         // censored row contributes its finite bound.
         let mut num = 0.0f64;
@@ -524,7 +524,7 @@ mod tests {
     #[test]
     fn aft_pushes_an_underestimate_up_for_every_distribution() {
         for dist in [AftDistribution::Normal, AftDistribution::Logistic, AftDistribution::Extreme] {
-            let obj = AftSurvival::new(dist, 1.0);
+            let mut obj = AftSurvival::new(dist, 1.0);
             let mut out = Vec::new();
             // True time 100, predicted margin 0 (time 1): far too low.
             obj.get_gradient(&[0.0], &survival_info(&[100.0], &[100.0]), 0, &mut out);
@@ -535,7 +535,7 @@ mod tests {
 
     #[test]
     fn a_right_censored_row_only_pushes_upwards() {
-        let obj = AftSurvival::new(AftDistribution::Normal, 1.0);
+        let mut obj = AftSurvival::new(AftDistribution::Normal, 1.0);
         let mut out = Vec::new();
         // Survived past 100: predictions below it are penalised, above are not.
         let info = survival_info(&[100.0], &[f32::INFINITY]);
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn cox_separates_events_from_censored_rows() {
-        let obj = CoxRegression;
+        let mut obj = CoxRegression;
         // Positive label: an observed event. Negative: censored at |label|.
         let info = MetaInfo {
             num_row: 4,

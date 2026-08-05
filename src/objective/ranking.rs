@@ -76,16 +76,96 @@ struct GroupRank {
     begin: usize,
 }
 
+/// Positions tracked when the truncation level does not bound them.
+///
+/// `RankingCache::MaxPositionSize` caps an untruncated fit here: the bias
+/// decays exponentially down the list, so estimating it past this depth buys
+/// nothing.
+const MAX_TRACKED_POSITIONS: usize = 32;
+
+/// The position-bias state of an unbiased fit, upstream's `ti_plus_`/`tj_minus_`
+/// and the per-round `li`/`lj` accumulators.
+///
+/// This is the "Unbiased LambdaMART" estimator: examination propensity is
+/// re-estimated from every round's own pairs, and the pair gradients are
+/// divided by it, so a document that was rarely examined counts for more.
+#[derive(Clone, Debug)]
+struct PositionBias {
+    /// `t_i^+`: propensity that the higher-ranked document was examined.
+    ti_plus: Vec<f64>,
+    /// `t_j^-`: propensity that the lower-ranked one was.
+    tj_minus: Vec<f64>,
+    /// Per-position cost accumulated over this round, aggregated across groups.
+    li: Vec<f64>,
+    lj: Vec<f64>,
+    /// `1 / (1 + lambdarank_bias_norm)`, the exponent of the update.
+    regularizer: f64,
+}
+
+impl PositionBias {
+    fn new(size: usize, bias_norm: f64) -> Self {
+        Self {
+            // A fit starts believing every position was examined equally.
+            ti_plus: vec![1.0; size],
+            tj_minus: vec![1.0; size],
+            li: vec![0.0; size],
+            lj: vec![0.0; size],
+            regularizer: 1.0 / (1.0 + bias_norm),
+        }
+    }
+
+    fn size(&self) -> usize {
+        self.ti_plus.len()
+    }
+
+    /// `LambdaRankUpdatePositionBias` — re-estimate the propensities from the
+    /// costs this round accumulated, then clear them for the next one.
+    ///
+    /// The update normalises position 0 to 1, which costs the values their
+    /// meaning as probabilities. That is what the authors specify and what
+    /// upstream does, so it is reproduced rather than corrected.
+    fn update(&mut self) {
+        let (li0, lj0) = (self.li[0], self.lj[0]);
+        for i in 0..self.size() {
+            if li0 >= EPS64 {
+                self.ti_plus[i] = (self.li[i] / li0).powf(self.regularizer);
+            }
+            if lj0 >= EPS64 {
+                self.tj_minus[i] = (self.lj[i] / lj0).powf(self.regularizer);
+            }
+            debug_assert!(self.ti_plus[i].is_finite(), "propensity diverged at position {i}");
+            debug_assert!(self.tj_minus[i].is_finite(), "propensity diverged at position {i}");
+        }
+        self.li.fill(0.0);
+        self.lj.fill(0.0);
+    }
+}
+
 /// `rank:pairwise`, `rank:ndcg` and `rank:map`.
 pub struct LambdaRank {
     loss: RankLoss,
     param: LambdaRankParameters,
+    /// Present only for `lambdarank_unbiased`; sized on the first round, when
+    /// the group sizes are known.
+    bias: Option<PositionBias>,
 }
 
 impl LambdaRank {
     pub fn new(loss: RankLoss, param: LambdaRankParameters) -> Self {
-        Self { loss, param }
+        Self { loss, param, bias: None }
     }
+
+    /// `RankingCache::MaxPositionSize` — how many positions the bias is
+    /// estimated for.
+    fn max_position_size(&self, info: &MetaInfo) -> usize {
+        if self.has_truncation() {
+            return self.num_pair();
+        }
+        let max_group =
+            info.groups().into_iter().map(|(b, e)| e - b).max().unwrap_or(0);
+        max_group.min(MAX_TRACKED_POSITIONS)
+    }
+
 
     /// Pairs per sample, resolving the method-dependent default.
     fn num_pair(&self) -> usize {
@@ -197,7 +277,7 @@ impl Objective for LambdaRank {
         1
     }
 
-    fn get_gradient(&self, preds: &[f32], info: &MetaInfo, iter: i32, out: &mut Vec<GradientPair>) {
+    fn get_gradient(&mut self, preds: &[f32], info: &MetaInfo, iter: i32, out: &mut Vec<GradientPair>) {
         out.clear();
         out.resize(preds.len(), GradientPair::default());
         if preds.is_empty() {
@@ -205,6 +285,15 @@ impl Objective for LambdaRank {
         }
         let groups = self.rank_groups(preds, info);
         let n_groups = groups.len();
+
+        // The propensities are read by the pair loop and rewritten after it, so
+        // they are moved out of `self` for the duration: the loop borrows
+        // `self` immutably for the loss and its parameters.
+        if self.param.unbiased && self.bias.is_none() {
+            self.bias =
+                Some(PositionBias::new(self.max_position_size(info), self.param.bias_norm));
+        }
+        let mut bias = self.bias.take();
         // `RankingCache::InitOnCPU`: weights are per query and normalised so
         // an unweighted fit and an all-ones-weighted fit agree.
         let group_weight = |g: usize| -> f32 {
@@ -238,7 +327,11 @@ impl Objective for LambdaRank {
             let worst_score = g_preds[group.rank[cnt - 1]];
             let mut sum_lambda = 0.0f64;
 
-            let pair = |rank_i: usize, rank_j: usize, g_out: &mut [GradientPair], sum_lambda: &mut f64| {
+            let pair = |rank_i: usize,
+                        rank_j: usize,
+                        g_out: &mut [GradientPair],
+                        sum_lambda: &mut f64,
+                        bias: Option<&mut PositionBias>| {
                 let (mut rank_high, mut rank_low) = (rank_i, rank_j);
                 let (idx_i, idx_j) = (group.rank[rank_high], group.rank[rank_low]);
                 if labels[idx_i] == labels[idx_j] {
@@ -277,8 +370,37 @@ impl Objective for LambdaRank {
                 }
 
                 let sig = sigmoid(s_high - s_low) as f64;
-                let lambda = (sig - 1.0) * delta_metric;
-                let hessian = (sig * (1.0 - sig)).max(EPS64) * delta_metric * 2.0;
+                let mut lambda = (sig - 1.0) * delta_metric;
+                let mut hessian = (sig * (1.0 - sig)).max(EPS64) * delta_metric * 2.0;
+
+                // `lambdarank_unbiased`: divide the pair out by how likely each
+                // of its two documents was to be examined at its position, so
+                // a pair from deep in the list — where a click is rarer for
+                // reasons that have nothing to do with relevance — counts for
+                // more. The positions are the ones on the *input* list, which
+                // is assumed ordered by relevance, so the row index is the
+                // position.
+                if let Some(bias) = bias {
+                    let k = bias.size();
+                    let cost = (1.0 / (1.0 - sig)).ln() * delta_metric;
+                    if idx_high < k && idx_low < k {
+                        let (t_plus, t_minus) = (bias.ti_plus[idx_high], bias.tj_minus[idx_low]);
+                        if t_minus >= EPS64 && t_plus >= EPS64 {
+                            lambda /= t_plus * t_minus;
+                            hessian /= t_plus * t_minus;
+                        }
+                        // Each side's cost is attributed net of the *other*
+                        // side's propensity, which is what makes the next
+                        // round's estimate an improvement rather than a
+                        // restatement.
+                        if t_minus >= EPS64 {
+                            bias.li[idx_high] += cost / t_minus;
+                        }
+                        if t_plus >= EPS64 {
+                            bias.lj[idx_low] += cost / t_plus;
+                        }
+                    }
+                }
 
                 let pg = GradientPair { grad: lambda as f32, hess: hessian as f32 };
                 g_out[idx_high].grad += pg.grad;
@@ -294,7 +416,7 @@ impl Objective for LambdaRank {
                 let n = cnt.min(self.num_pair());
                 for i in 0..n {
                     for j in i + 1..cnt {
-                        pair(i, j, g_out, &mut sum_lambda);
+                        pair(i, j, g_out, &mut sum_lambda, bias.as_mut());
                     }
                 }
             } else {
@@ -329,7 +451,13 @@ impl Objective for LambdaRank {
                             if ridx >= n_lefts {
                                 ridx = ridx - i + j;
                             }
-                            pair(y_sorted[pair_idx], y_sorted[ridx], g_out, &mut sum_lambda);
+                            pair(
+                                y_sorted[pair_idx],
+                                y_sorted[ridx],
+                                g_out,
+                                &mut sum_lambda,
+                                bias.as_mut(),
+                            );
                         }
                     }
                     i = j;
@@ -353,9 +481,16 @@ impl Objective for LambdaRank {
                 }
             }
         }
+
+        // Every group has contributed its costs; re-estimate the propensities
+        // the *next* round will divide by.
+        if let Some(bias) = bias.as_mut() {
+            bias.update();
+        }
+        self.bias = bias;
     }
 
-    fn init_estimation(&self, _info: &MetaInfo) -> Vec<f32> {
+    fn init_estimation(&mut self, _info: &MetaInfo) -> Vec<f32> {
         // Ranking scores are relative, so upstream's intercept has no effect on
         // the induced order and stays at the default.
         vec![0.5]
@@ -423,7 +558,7 @@ mod tests {
         }
     }
 
-    fn gradient(obj: &LambdaRank, preds: &[f32], info: &MetaInfo) -> Vec<GradientPair> {
+    fn gradient(obj: &mut LambdaRank, preds: &[f32], info: &MetaInfo) -> Vec<GradientPair> {
         let mut out = Vec::new();
         obj.get_gradient(preds, info, 0, &mut out);
         out
@@ -432,10 +567,10 @@ mod tests {
     #[test]
     fn a_mis_ordered_pair_is_pushed_apart() {
         for loss in [RankLoss::Pairwise, RankLoss::Ndcg, RankLoss::Map] {
-            let obj = LambdaRank::new(loss, LambdaRankParameters::default());
+            let mut obj = LambdaRank::new(loss, LambdaRankParameters::default());
             // Row 0 is more relevant but scored lower.
             let info = ranked(&[1.0, 0.0], &[2]);
-            let g = gradient(&obj, &[0.0, 1.0], &info);
+            let g = gradient(&mut obj, &[0.0, 1.0], &info);
             assert!(g[0].grad < 0.0, "{loss:?}: the relevant row should rise, got {g:?}");
             assert!(g[1].grad > 0.0, "{loss:?}: {g:?}");
             assert!(g.iter().all(|p| p.hess > 0.0), "{loss:?}");
@@ -444,10 +579,10 @@ mod tests {
 
     #[test]
     fn a_correctly_ordered_pair_is_barely_touched() {
-        let obj = LambdaRank::new(RankLoss::Ndcg, LambdaRankParameters::default());
+        let mut obj = LambdaRank::new(RankLoss::Ndcg, LambdaRankParameters::default());
         let info = ranked(&[1.0, 0.0], &[2]);
-        let right = gradient(&obj, &[8.0, -8.0], &info);
-        let wrong = gradient(&obj, &[-8.0, 8.0], &info);
+        let right = gradient(&mut obj, &[8.0, -8.0], &info);
+        let wrong = gradient(&mut obj, &[-8.0, 8.0], &info);
         assert!(
             right[0].grad.abs() < wrong[0].grad.abs(),
             "a well-separated pair has a smaller gradient: {right:?} vs {wrong:?}"
@@ -456,18 +591,18 @@ mod tests {
 
     #[test]
     fn equal_labels_produce_no_gradient() {
-        let obj = LambdaRank::new(RankLoss::Pairwise, LambdaRankParameters::default());
+        let mut obj = LambdaRank::new(RankLoss::Pairwise, LambdaRankParameters::default());
         let info = ranked(&[1.0, 1.0, 1.0], &[3]);
-        let g = gradient(&obj, &[0.3, 0.1, 0.2], &info);
+        let g = gradient(&mut obj, &[0.3, 0.1, 0.2], &info);
         assert!(g.iter().all(|p| p.grad == 0.0 && p.hess == 0.0), "{g:?}");
     }
 
     #[test]
     fn groups_are_independent() {
-        let obj = LambdaRank::new(RankLoss::Ndcg, LambdaRankParameters::default());
+        let mut obj = LambdaRank::new(RankLoss::Ndcg, LambdaRankParameters::default());
         // Two groups, the second already perfectly ordered.
         let info = ranked(&[1.0, 0.0, 1.0, 0.0], &[2, 2]);
-        let g = gradient(&obj, &[0.0, 1.0, 9.0, -9.0], &info);
+        let g = gradient(&mut obj, &[0.0, 1.0, 9.0, -9.0], &info);
         assert!(g[0].grad < 0.0, "the mis-ordered group moves");
         assert!(g[2].grad.abs() < g[0].grad.abs(), "the ordered group barely moves: {g:?}");
     }
@@ -478,10 +613,10 @@ mod tests {
             pair_method: LambdaRankPairMethod::Mean,
             ..LambdaRankParameters::default()
         };
-        let obj = LambdaRank::new(RankLoss::Ndcg, param);
+        let mut obj = LambdaRank::new(RankLoss::Ndcg, param);
         let info = ranked(&[2.0, 1.0, 0.0, 1.0, 2.0, 0.0], &[6]);
         let preds = [0.1f32, 0.5, 0.2, 0.9, 0.3, 0.4];
-        assert_eq!(gradient(&obj, &preds, &info), gradient(&obj, &preds, &info));
+        assert_eq!(gradient(&mut obj, &preds, &info), gradient(&mut obj, &preds, &info));
     }
 
     #[test]
@@ -501,14 +636,156 @@ mod tests {
 
     #[test]
     fn group_weights_scale_a_query() {
-        let obj = LambdaRank::new(RankLoss::Pairwise, LambdaRankParameters::default());
+        let mut obj = LambdaRank::new(RankLoss::Pairwise, LambdaRankParameters::default());
         let mut info = ranked(&[1.0, 0.0, 1.0, 0.0], &[2, 2]);
-        let plain = gradient(&obj, &[0.0, 1.0, 0.0, 1.0], &info);
+        let plain = gradient(&mut obj, &[0.0, 1.0, 0.0, 1.0], &info);
         info.weights = Some(vec![3.0, 1.0]);
-        let weighted = gradient(&obj, &[0.0, 1.0, 0.0, 1.0], &info);
+        let weighted = gradient(&mut obj, &[0.0, 1.0, 0.0, 1.0], &info);
         assert!(
             weighted[0].grad.abs() > plain[0].grad.abs(),
             "the heavier query counts for more: {plain:?} vs {weighted:?}"
+        );
+    }
+
+    fn unbiased_params(bias_norm: f64) -> LambdaRankParameters {
+        LambdaRankParameters {
+            unbiased: true,
+            bias_norm,
+            // Keep the pair set deterministic and the gradients unscaled, so
+            // the debiasing is the only thing moving.
+            normalization: false,
+            score_normalization: false,
+            ..LambdaRankParameters::default()
+        }
+    }
+
+    /// A biased fit carries no propensity state at all; an unbiased one builds
+    /// it on the first round.
+    #[test]
+    fn position_bias_is_only_tracked_when_asked_for() {
+        let info = ranked(&[3.0, 2.0, 1.0, 0.0], &[4]);
+        let preds = [0.1f32, 0.2, 0.3, 0.4];
+
+        let mut biased = LambdaRank::new(RankLoss::Ndcg, LambdaRankParameters::default());
+        gradient(&mut biased, &preds, &info);
+        assert!(biased.bias.is_none(), "an ordinary fit tracks no position bias");
+
+        let mut unbiased = LambdaRank::new(RankLoss::Ndcg, unbiased_params(1.0));
+        gradient(&mut unbiased, &preds, &info);
+        let bias = unbiased.bias.as_ref().expect("an unbiased fit tracks position bias");
+        assert_eq!(bias.size(), unbiased.num_pair(), "topk bounds the tracked positions");
+        assert_eq!(bias.ti_plus[0], 1.0, "position 0 is the normalisation point");
+    }
+
+    /// The propensities start uniform, so the first round's gradients match a
+    /// biased fit exactly; they diverge once the first estimate lands.
+    #[test]
+    fn debiasing_starts_neutral_and_then_changes_the_gradients() {
+        let info = ranked(&[3.0, 2.0, 1.0, 0.0], &[4]);
+        let preds = [0.4f32, 0.1, 0.3, 0.2];
+
+        let mut biased = LambdaRank::new(RankLoss::Ndcg, {
+            LambdaRankParameters { normalization: false, score_normalization: false, ..Default::default() }
+        });
+        let mut unbiased = LambdaRank::new(RankLoss::Ndcg, unbiased_params(1.0));
+
+        let first_biased = gradient(&mut biased, &preds, &info);
+        let first_unbiased = gradient(&mut unbiased, &preds, &info);
+        assert_eq!(
+            first_biased, first_unbiased,
+            "round 0 divides by propensities that are all still 1"
+        );
+
+        let second_biased = gradient(&mut biased, &preds, &info);
+        let second_unbiased = gradient(&mut unbiased, &preds, &info);
+        assert_ne!(
+            second_biased, second_unbiased,
+            "round 1 must use the propensities round 0 estimated"
+        );
+    }
+
+    /// Positions further down the list are examined less, so their estimated
+    /// propensity falls below the normalised first position.
+    #[test]
+    fn later_positions_get_a_smaller_propensity() {
+        // A long, clearly ordered list: the deeper a document sits, the less
+        // its pairs contribute.
+        let labels: Vec<f32> = (0..16).map(|i| (15 - i) as f32).collect();
+        let info = ranked(&labels, &[16]);
+        let preds: Vec<f32> = (0..16).map(|i| i as f32 * 0.1).collect();
+
+        let mut obj = LambdaRank::new(RankLoss::Ndcg, unbiased_params(1.0));
+        for _ in 0..5 {
+            gradient(&mut obj, &preds, &info);
+        }
+        let bias = obj.bias.as_ref().unwrap();
+        assert_eq!(bias.ti_plus[0], 1.0);
+        assert!(
+            bias.ti_plus[..16].iter().all(|t| t.is_finite() && *t >= 0.0),
+            "propensities stay finite and non-negative: {:?}",
+            &bias.ti_plus[..16]
+        );
+        assert!(
+            bias.ti_plus[8] < bias.ti_plus[0],
+            "position 8 should be examined less than position 0: {} vs {}",
+            bias.ti_plus[8],
+            bias.ti_plus[0]
+        );
+    }
+
+    /// `lambdarank_bias_norm` is the exponent of the propensity update, so it
+    /// changes how sharply the estimate moves away from uniform.
+    #[test]
+    fn bias_norm_controls_how_far_the_estimate_moves() {
+        let labels: Vec<f32> = (0..16).map(|i| (15 - i) as f32).collect();
+        let info = ranked(&labels, &[16]);
+        let preds: Vec<f32> = (0..16).map(|i| i as f32 * 0.1).collect();
+
+        let estimate = |bias_norm: f64| {
+            let mut obj = LambdaRank::new(RankLoss::Ndcg, unbiased_params(bias_norm));
+            for _ in 0..5 {
+                gradient(&mut obj, &preds, &info);
+            }
+            obj.bias.as_ref().unwrap().ti_plus[8]
+        };
+
+        // A larger `bias_norm` means a smaller exponent, which pulls the ratio
+        // back towards 1.
+        let sharp = estimate(0.0);
+        let soft = estimate(9.0);
+        assert!(sharp < soft, "bias_norm=0 should move further than 9: {sharp} vs {soft}");
+        assert!(soft <= 1.0, "the estimate never exceeds the normalised first position");
+    }
+
+    /// An untruncated fit bounds the tracked positions by the longest group and
+    /// a hard cap, rather than by the pair count.
+    #[test]
+    fn the_mean_pair_method_bounds_tracked_positions_by_group_size() {
+        let short = ranked(&[3.0, 2.0, 1.0], &[3]);
+        let mut obj = LambdaRank::new(
+            RankLoss::Ndcg,
+            LambdaRankParameters {
+                pair_method: LambdaRankPairMethod::Mean,
+                ..unbiased_params(1.0)
+            },
+        );
+        gradient(&mut obj, &[0.1, 0.2, 0.3], &short);
+        assert_eq!(obj.bias.as_ref().unwrap().size(), 3, "bounded by the group");
+
+        let labels: Vec<f32> = (0..100).map(|i| (i % 5) as f32).collect();
+        let long = ranked(&labels, &[100]);
+        let mut obj = LambdaRank::new(
+            RankLoss::Ndcg,
+            LambdaRankParameters {
+                pair_method: LambdaRankPairMethod::Mean,
+                ..unbiased_params(1.0)
+            },
+        );
+        gradient(&mut obj, &vec![0.5f32; 100], &long);
+        assert_eq!(
+            obj.bias.as_ref().unwrap().size(),
+            MAX_TRACKED_POSITIONS,
+            "a long group is capped, because the bias decays anyway"
         );
     }
 }

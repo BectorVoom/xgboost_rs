@@ -165,7 +165,7 @@ impl Objective for RegLossObj {
         self.loss == Loss::SquaredError
     }
 
-    fn get_gradient(&self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
+    fn get_gradient(&mut self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
         let n_targets = info.n_targets();
         out.clear();
         out.reserve(preds.len());
@@ -193,7 +193,7 @@ impl Objective for RegLossObj {
         Ok(())
     }
 
-    fn init_estimation(&self, info: &MetaInfo) -> Vec<f32> {
+    fn init_estimation(&mut self, info: &MetaInfo) -> Vec<f32> {
         // `RegLossObj::InitEstimation`: the weighted label mean is only the
         // right answer while `scale_pos_weight` is 1, because the mean cannot
         // see the extra weight on the positives.
@@ -232,7 +232,7 @@ impl Objective for PseudoHuber {
         "reg:pseudohubererror"
     }
 
-    fn get_gradient(&self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
+    fn get_gradient(&mut self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
         let n_targets = info.n_targets();
         let slope_sq = self.slope * self.slope;
         out.clear();
@@ -249,7 +249,7 @@ impl Objective for PseudoHuber {
         }
     }
 
-    fn init_estimation(&self, info: &MetaInfo) -> Vec<f32> {
+    fn init_estimation(&mut self, info: &MetaInfo) -> Vec<f32> {
         fit_intercept(self, info)
     }
 
@@ -302,7 +302,7 @@ impl Objective for MeanAbsoluteError {
         "reg:absoluteerror"
     }
 
-    fn get_gradient(&self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
+    fn get_gradient(&mut self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
         let n_groups = self.num_output_group(info);
         let scale = smoothing_scale(preds, info, n_groups, usize::MAX);
         out.clear();
@@ -320,7 +320,7 @@ impl Objective for MeanAbsoluteError {
         }
     }
 
-    fn init_estimation(&self, info: &MetaInfo) -> Vec<f32> {
+    fn init_estimation(&mut self, info: &MetaInfo) -> Vec<f32> {
         // `MeanAbsoluteError::InitEstimation`: a Newton step taken *from the
         // label mean* rather than from zero, then added back to the mean.
         let n_groups = self.num_output_group(info);
@@ -390,7 +390,7 @@ impl Objective for QuantileRegression {
         self.alpha.len()
     }
 
-    fn get_gradient(&self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
+    fn get_gradient(&mut self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
         let n_groups = self.alpha.len();
         let scale = smoothing_scale(preds, info, n_groups, 0);
         out.clear();
@@ -427,7 +427,7 @@ impl Objective for QuantileRegression {
         }
     }
 
-    fn init_estimation(&self, info: &MetaInfo) -> Vec<f32> {
+    fn init_estimation(&mut self, info: &MetaInfo) -> Vec<f32> {
         self.alpha
             .iter()
             .map(|&a| weighted_quantile(a, &info.labels, info.weights.as_deref()))
@@ -498,7 +498,7 @@ impl Objective for ExpectileRegression {
         self.alpha.len()
     }
 
-    fn get_gradient(&self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
+    fn get_gradient(&mut self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
         let n = self.alpha.len();
         out.clear();
         out.resize(preds.len(), GradientPair::default());
@@ -549,7 +549,7 @@ impl Objective for ExpectileRegression {
         Ok(())
     }
 
-    fn init_estimation(&self, info: &MetaInfo) -> Vec<f32> {
+    fn init_estimation(&mut self, info: &MetaInfo) -> Vec<f32> {
         let n = self.alpha.len();
         let mean = fit_intercept_glm_like(info, 1)[0];
         let mut out = vec![mean; n];
@@ -607,7 +607,7 @@ impl Objective for GammaRegression {
         "reg:gamma"
     }
 
-    fn get_gradient(&self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
+    fn get_gradient(&mut self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
         let n_targets = info.n_targets();
         out.clear();
         out.reserve(preds.len());
@@ -629,7 +629,7 @@ impl Objective for GammaRegression {
         log_link_margin("reg:gamma", base_score)
     }
 
-    fn init_estimation(&self, info: &MetaInfo) -> Vec<f32> {
+    fn init_estimation(&mut self, info: &MetaInfo) -> Vec<f32> {
         fit_intercept_glm_like(info, self.num_output_group(info))
     }
 
@@ -663,7 +663,7 @@ impl Objective for PoissonRegression {
         "count:poisson"
     }
 
-    fn get_gradient(&self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
+    fn get_gradient(&mut self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
         let n_targets = info.n_targets();
         out.clear();
         out.reserve(preds.len());
@@ -688,7 +688,7 @@ impl Objective for PoissonRegression {
         log_link_margin("count:poisson", base_score)
     }
 
-    fn init_estimation(&self, info: &MetaInfo) -> Vec<f32> {
+    fn init_estimation(&mut self, info: &MetaInfo) -> Vec<f32> {
         fit_intercept_glm_like(info, self.num_output_group(info))
     }
 
@@ -723,7 +723,7 @@ impl Objective for TweedieRegression {
         "reg:tweedie"
     }
 
-    fn get_gradient(&self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
+    fn get_gradient(&mut self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
         let n_targets = info.n_targets();
         let rho = self.rho;
         out.clear();
@@ -749,7 +749,7 @@ impl Objective for TweedieRegression {
         log_link_margin("reg:tweedie", base_score)
     }
 
-    fn init_estimation(&self, info: &MetaInfo) -> Vec<f32> {
+    fn init_estimation(&mut self, info: &MetaInfo) -> Vec<f32> {
         fit_intercept_glm_like(info, self.num_output_group(info))
     }
 
@@ -798,7 +798,7 @@ mod tests {
         }
     }
 
-    fn gradient(obj: &dyn Objective, preds: &[f32], info: &MetaInfo) -> Vec<GradientPair> {
+    fn gradient(obj: &mut dyn Objective, preds: &[f32], info: &MetaInfo) -> Vec<GradientPair> {
         let mut out = Vec::new();
         obj.get_gradient(preds, info, 0, &mut out);
         out
@@ -806,8 +806,8 @@ mod tests {
 
     #[test]
     fn squared_error_gradient_is_the_residual() {
-        let obj = RegLossObj::default();
-        let g = gradient(&obj, &[1.0, 2.0], &info(&[0.5, 3.0], None));
+        let mut obj = RegLossObj::default();
+        let g = gradient(&mut obj, &[1.0, 2.0], &info(&[0.5, 3.0], None));
         assert_eq!(g, vec![
             GradientPair { grad: 0.5, hess: 1.0 },
             GradientPair { grad: -1.0, hess: 1.0 },
@@ -816,8 +816,8 @@ mod tests {
 
     #[test]
     fn scale_pos_weight_only_touches_rows_labelled_one() {
-        let obj = RegLossObj::new(Loss::SquaredError, 3.0);
-        let g = gradient(&obj, &[0.0, 0.0], &info(&[1.0, 2.0], None));
+        let mut obj = RegLossObj::new(Loss::SquaredError, 3.0);
+        let g = gradient(&mut obj, &[0.0, 0.0], &info(&[1.0, 2.0], None));
         assert_eq!(g, vec![
             GradientPair { grad: -3.0, hess: 3.0 },
             GradientPair { grad: -2.0, hess: 1.0 },
@@ -826,7 +826,7 @@ mod tests {
 
     #[test]
     fn logistic_transforms_the_margin_and_the_intercept() {
-        let obj = RegLossObj::new(Loss::BinaryLogistic, 1.0);
+        let mut obj = RegLossObj::new(Loss::BinaryLogistic, 1.0);
         let mut preds = vec![0.0f32];
         obj.pred_transform(&mut preds);
         assert_eq!(preds, vec![0.5]);
@@ -874,18 +874,18 @@ mod tests {
 
     #[test]
     fn pseudo_huber_gradient_saturates_at_the_slope() {
-        let obj = PseudoHuber::new(1.0);
+        let mut obj = PseudoHuber::new(1.0);
         // A huge residual: the gradient tends to +-1 rather than growing.
-        let g = gradient(&obj, &[1000.0], &info(&[0.0], None));
+        let g = gradient(&mut obj, &[1000.0], &info(&[0.0], None));
         assert!((g[0].grad - 1.0).abs() < 1e-3, "{:?}", g[0]);
         assert!(g[0].hess > 0.0 && g[0].hess < 1e-5);
     }
 
     #[test]
     fn absolute_error_gradient_tracks_the_sign_of_the_residual() {
-        let obj = MeanAbsoluteError;
+        let mut obj = MeanAbsoluteError;
         let d = info(&[0.0, 0.0, 0.0, 0.0], None);
-        let g = gradient(&obj, &[-2.0, -1.0, 1.0, 2.0], &d);
+        let g = gradient(&mut obj, &[-2.0, -1.0, 1.0, 2.0], &d);
         assert!(g[0].grad < 0.0 && g[1].grad < 0.0);
         assert!(g[2].grad > 0.0 && g[3].grad > 0.0);
         assert!(g.iter().all(|p| p.hess > 0.0), "the majorisation curvature is positive");
@@ -893,7 +893,7 @@ mod tests {
 
     #[test]
     fn quantile_regression_has_one_output_per_alpha() {
-        let obj = QuantileRegression::new(vec![0.1, 0.5, 0.9]).unwrap();
+        let mut obj = QuantileRegression::new(vec![0.1, 0.5, 0.9]).unwrap();
         let d = info(&[1.0, 2.0, 3.0, 4.0], None);
         assert_eq!(obj.num_output_group(&d), 3);
         // The intercept is the label quantile at each alpha, ascending.
@@ -913,10 +913,10 @@ mod tests {
         let d = info(&[0.0; 8], None);
         let preds: Vec<f32> = (0..8).map(|i| i as f32 - 4.0).collect();
 
-        let low = QuantileRegression::new(vec![0.1]).unwrap();
-        let high = QuantileRegression::new(vec![0.9]).unwrap();
-        let gl: f32 = gradient(&low, &preds, &d).iter().map(|p| p.grad).sum();
-        let gh: f32 = gradient(&high, &preds, &d).iter().map(|p| p.grad).sum();
+        let mut low = QuantileRegression::new(vec![0.1]).unwrap();
+        let mut high = QuantileRegression::new(vec![0.9]).unwrap();
+        let gl: f32 = gradient(&mut low, &preds, &d).iter().map(|p| p.grad).sum();
+        let gh: f32 = gradient(&mut high, &preds, &d).iter().map(|p| p.grad).sum();
         assert!(gl > gh, "a low quantile pushes predictions down harder: {gl} vs {gh}");
     }
 

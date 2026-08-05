@@ -62,7 +62,18 @@ pub trait Objective {
     }
 
     /// Fill `out` with per-`(row, output)` gradients for the current margins.
-    fn get_gradient(&self, preds: &[f32], info: &MetaInfo, iter: i32, out: &mut Vec<GradientPair>);
+    ///
+    /// Takes `&mut self` because an objective may carry state that a round
+    /// updates: unbiased LambdaMART re-estimates its position propensities from
+    /// every round's pairs, and upstream keeps that state on the objective too,
+    /// down to saving it in the model.
+    fn get_gradient(
+        &mut self,
+        preds: &[f32],
+        info: &MetaInfo,
+        iter: i32,
+        out: &mut Vec<GradientPair>,
+    );
 
     /// Map raw margins to the reported prediction scale.
     ///
@@ -90,7 +101,7 @@ pub trait Objective {
 
     /// Estimate the intercept boosting starts from, in *prediction* space, one
     /// value per output.
-    fn init_estimation(&self, info: &MetaInfo) -> Vec<f32>;
+    fn init_estimation(&mut self, info: &MetaInfo) -> Vec<f32>;
 
     /// Whether every row's hessian is the same in every round, which is
     /// `ObjInfo::const_hess` upstream.
@@ -132,7 +143,7 @@ pub trait Objective {
 /// The step is `-sum(grad) / sum(hess)` per output — the weight a single-leaf
 /// tree would take — mapped back to prediction space so the value round-trips
 /// through [`Objective::prob_to_margin`].
-pub fn fit_intercept<O: Objective + ?Sized>(obj: &O, info: &MetaInfo) -> Vec<f32> {
+pub fn fit_intercept<O: Objective + ?Sized>(obj: &mut O, info: &MetaInfo) -> Vec<f32> {
     let n_groups = obj.num_output_group(info);
     if info.num_row == 0 || n_groups == 0 {
         return vec![0.0; n_groups.max(1)];
@@ -350,7 +361,7 @@ mod tests {
     #[test]
     fn the_generic_intercept_is_the_newton_step() {
         // Squared error at a zero margin: -sum(grad)/sum(hess) is the mean.
-        let obj = create(&Spec::RegSquaredError, 1.0).unwrap();
+        let mut obj = create(&Spec::RegSquaredError, 1.0).unwrap();
         assert_eq!(obj.init_estimation(&info(&[1.0, 2.0, 3.0])), vec![2.0]);
     }
 
