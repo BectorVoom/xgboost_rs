@@ -162,12 +162,29 @@ pub struct RegTree {
     split_categories_segments: Vec<(u32, u32)>,
     /// Concatenated category bit sets, upstream's `split_categories_`.
     split_categories: Vec<u32>,
+    /// Outputs each leaf carries, upstream's `size_leaf_vector`. `1` for an
+    /// ordinary tree; `n_targets` for a vector-leaf tree, the shape
+    /// `multi_strategy=multi_output_tree` produces.
+    leaf_size: usize,
+    /// `num_nodes * leaf_size` leaf outputs. Empty when `leaf_size == 1`, where
+    /// [`Node::value`] already holds the single output.
+    leaf_vectors: Vec<f32>,
     num_feature: usize,
 }
 
 impl RegTree {
     /// A tree consisting of a single leaf with value `0.0`.
     pub fn new(num_feature: usize) -> Self {
+        Self::new_multi(num_feature, 1)
+    }
+
+    /// A tree whose leaves each carry `leaf_size` outputs.
+    ///
+    /// `leaf_size > 1` is a vector-leaf tree: one tree covers every target at
+    /// once, rather than one tree per target. That is what
+    /// `multi_strategy=multi_output_tree` asks for.
+    pub fn new_multi(num_feature: usize, leaf_size: usize) -> Self {
+        let leaf_size = leaf_size.max(1);
         Self {
             nodes: vec![Node::default()],
             stats: vec![NodeStat::default()],
@@ -176,8 +193,56 @@ impl RegTree {
             split_categorical: vec![false],
             split_categories_segments: vec![(0, 0)],
             split_categories: Vec::new(),
+            leaf_size,
+            leaf_vectors: if leaf_size > 1 { vec![0.0; leaf_size] } else { Vec::new() },
             num_feature,
         }
+    }
+
+    /// Outputs each leaf carries; `1` for an ordinary tree.
+    #[inline]
+    pub fn leaf_size(&self) -> usize {
+        self.leaf_size
+    }
+
+    /// Whether this tree's leaves carry a vector rather than a single value.
+    #[inline]
+    pub fn is_multi_target(&self) -> bool {
+        self.leaf_size > 1
+    }
+
+    /// The outputs of leaf `nid`.
+    ///
+    /// Always `leaf_size` long, so a caller need not branch on the tree kind.
+    #[inline]
+    pub fn leaf_value(&self, nid: usize) -> &[f32] {
+        if self.leaf_size > 1 {
+            &self.leaf_vectors[nid * self.leaf_size..(nid + 1) * self.leaf_size]
+        } else {
+            std::slice::from_ref(&self.nodes[nid].value)
+        }
+    }
+
+    /// Set every output of leaf `nid`.
+    pub fn set_leaf_vector(&mut self, nid: usize, values: &[f32]) {
+        debug_assert_eq!(values.len(), self.leaf_size);
+        if self.leaf_size > 1 {
+            let base = nid * self.leaf_size;
+            self.leaf_vectors[base..base + self.leaf_size].copy_from_slice(values);
+        } else {
+            self.nodes[nid].value = values[0];
+        }
+    }
+
+    /// The whole leaf-output array, for serialisation.
+    pub(crate) fn leaf_vectors(&self) -> &[f32] {
+        &self.leaf_vectors
+    }
+
+    /// Restore the leaf-output array of a loaded vector-leaf tree.
+    pub(crate) fn set_leaf_vectors(&mut self, leaf_size: usize, values: Vec<f32>) {
+        self.leaf_size = leaf_size.max(1);
+        self.leaf_vectors = values;
     }
 
     /// Whether node `nid` splits on category membership.
@@ -276,6 +341,49 @@ impl RegTree {
             NodeStat { loss_chg: 0.0, sum_hess: left_sum, base_weight: left_leaf_weight };
         self.stats[pright] =
             NodeStat { loss_chg: 0.0, sum_hess: right_sum, base_weight: right_leaf_weight };
+    }
+
+    /// Split leaf `nid`, giving each child a whole vector of leaf outputs.
+    ///
+    /// The vector-leaf analogue of [`expand_node`](Self::expand_node): the
+    /// split itself is one decision shared by every target, and only the leaf
+    /// values differ per target.
+    #[allow(clippy::too_many_arguments)]
+    pub fn expand_node_multi(
+        &mut self,
+        nid: usize,
+        split_index: u32,
+        split_value: f32,
+        default_left: bool,
+        base_weight: f32,
+        left_leaf_weights: &[f32],
+        right_leaf_weights: &[f32],
+        loss_change: f32,
+        sum_hess: f32,
+        left_sum: f32,
+        right_sum: f32,
+    ) {
+        debug_assert_eq!(left_leaf_weights.len(), self.leaf_size);
+        debug_assert_eq!(right_leaf_weights.len(), self.leaf_size);
+        self.expand_node(
+            nid,
+            split_index,
+            split_value,
+            default_left,
+            base_weight,
+            // The scalar leaf values are overwritten below; passing zero keeps
+            // `Node::value` — which holds the split threshold for `nid` — from
+            // being read as an output by mistake.
+            0.0,
+            0.0,
+            loss_change,
+            sum_hess,
+            left_sum,
+            right_sum,
+        );
+        let node = self.nodes[nid];
+        self.set_leaf_vector(node.left as usize, left_leaf_weights);
+        self.set_leaf_vector(node.right as usize, right_leaf_weights);
     }
 
     /// Split leaf `nid` on membership of a category set, appending its two
@@ -453,6 +561,9 @@ impl RegTree {
         self.deleted.push(false);
         self.split_categorical.push(false);
         self.split_categories_segments.push((0, 0));
+        if self.leaf_size > 1 {
+            self.leaf_vectors.resize(self.leaf_vectors.len() + self.leaf_size, 0.0);
+        }
         let depth = if parent >= 0 { self.depths[parent as usize] + 1 } else { 0 };
         self.depths.push(depth);
         nid

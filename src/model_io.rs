@@ -187,11 +187,15 @@ fn tree_to_json(id: usize, tree: &RegTree) -> Value {
         "split_indices": split_indices,
         "split_type": split_type,
         "sum_hessian": sum_hessian,
+        // A vector-leaf tree's outputs do not fit in `split_conditions`, which
+        // holds one value per node; they ride alongside, as upstream's
+        // `MultiTargetTree` writes them.
+        "leaf_values": tree.leaf_vectors(),
         "tree_param": {
             "num_deleted": tree.num_deleted().to_string(),
             "num_feature": tree.num_feature().to_string(),
             "num_nodes": n.to_string(),
-            "size_leaf_vector": "1",
+            "size_leaf_vector": tree.leaf_size().to_string(),
         },
     })
 }
@@ -410,6 +414,27 @@ fn tree_from_json(t: &Value, num_feature: usize) -> Result<RegTree> {
     // part of the tree.
     tree.recompute_deleted();
     load_categorical_split(&mut tree, t, n)?;
+
+    // `size_leaf_vector` above 1 makes this a vector-leaf tree, whose outputs
+    // live in their own array rather than in `split_conditions`.
+    let leaf_size = t
+        .pointer("/tree_param/size_leaf_vector")
+        .and_then(|v| match v {
+            Value::String(s) => s.parse::<usize>().ok(),
+            other => other.as_u64().map(|n| n as usize),
+        })
+        .unwrap_or(1)
+        .max(1);
+    if leaf_size > 1 {
+        let values = float_array(t, "leaf_values")?;
+        if values.len() != n * leaf_size {
+            return Err(Error::ModelFormat(format!(
+                "`leaf_values` holds {} entries, expected {n} nodes x {leaf_size} outputs",
+                values.len()
+            )));
+        }
+        tree.set_leaf_vectors(leaf_size, values);
+    }
     Ok(tree)
 }
 

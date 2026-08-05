@@ -512,6 +512,11 @@ impl GBTree {
         n_rows: usize,
         new_weight: f32,
     ) -> crate::Result<()> {
+        // One tree covering every output, rather than one tree per output.
+        if self.param.multi_output_tree && n_groups > 1 {
+            return self.grow_round_multi(ctx, dtrain, gpair, preds, n_groups, n_rows, new_weight);
+        }
+
         // `approx` rebuilds its binned matrix from each group's hessians, so
         // it cannot share one grower across the round the way the other two do.
         if kind == TreeUpdaterName::GrowHistMaker {
@@ -580,6 +585,86 @@ impl GBTree {
                 self.model.tree_info.push(gid as u32);
                 self.model.tree_weight.push(new_weight);
             }
+        }
+        Ok(())
+    }
+
+    /// A `process_type=default` round under `multi_strategy=multi_output_tree`.
+    ///
+    /// The difference from [`grow_round`](Self::grow_round) is what a tree is:
+    /// one tree carries a vector leaf covering every output, so the round grows
+    /// `num_parallel_tree` trees instead of `num_parallel_tree * n_groups`, and
+    /// each split is a single decision that all the outputs share. That is the
+    /// point of the strategy — the outputs are modelled as related rather than
+    /// as independent problems — and it is also why the ensemble is smaller.
+    #[allow(clippy::too_many_arguments)]
+    fn grow_round_multi(
+        &mut self,
+        ctx: &mut Context,
+        dtrain: &DMatrix,
+        gpair: &[GradientPair],
+        preds: &mut [f32],
+        n_groups: usize,
+        n_rows: usize,
+        new_weight: f32,
+    ) -> crate::Result<()> {
+        let sampler = RowSampler::new(self.param.sampling_method, self.param.subsample);
+        let is_sampling = sampler.is_sampling(n_rows);
+        let param = &self.param;
+        let mut grower = HistGrower::new_multi(
+            param,
+            self.gindex.as_ref().expect("configured"),
+            dtrain,
+            n_groups,
+        );
+
+        for i in 0..self.param.num_parallel_tree {
+            if i > 0 {
+                grower.reset();
+            }
+
+            // Row sampling drops whole rows, not single outputs: a row the
+            // tree does not see contributes to none of them. The draw is made
+            // against each row's summed gradient, so gradient-based sampling
+            // still weighs a row by how much work it represents.
+            let tree_gpair: &[GradientPair] = if is_sampling {
+                let mut row_totals: Vec<GradientPair> = (0..n_rows)
+                    .map(|r| {
+                        let mut total = GradientPair::default();
+                        for t in 0..n_groups {
+                            let g = gpair[r * n_groups + t];
+                            total.grad += g.grad;
+                            total.hess += g.hess;
+                        }
+                        total
+                    })
+                    .collect();
+                let seed = ctx.rng().next_u32() as u64;
+                sampler.sample(&mut row_totals, seed, ctx.threads());
+
+                self.sampled.clear();
+                self.sampled.extend_from_slice(gpair);
+                for (r, total) in row_totals.iter().enumerate() {
+                    if total.hess == 0.0 && total.grad == 0.0 {
+                        for t in 0..n_groups {
+                            self.sampled[r * n_groups + t] = GradientPair::default();
+                        }
+                    }
+                }
+                &self.sampled
+            } else {
+                gpair
+            };
+
+            let mut tree = RegTree::new_multi(self.model.num_feature, n_groups);
+            grower.grow(ctx, tree_gpair, &mut tree);
+            grower.update_predictions(&tree, preds, n_groups, 0, new_weight);
+
+            self.model.trees.push(tree);
+            // A vector-leaf tree belongs to no single output, so it is recorded
+            // under group 0 and prediction reads its leaf vector instead.
+            self.model.tree_info.push(0);
+            self.model.tree_weight.push(new_weight);
         }
         Ok(())
     }

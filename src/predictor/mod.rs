@@ -51,7 +51,12 @@ pub fn predict_margin(
         let weight = model.weight_of(t);
         for r in 0..n {
             let leaf = tree.leaf_index(|f| feature_value(dmat, r, f));
-            preds[r * n_groups + group] += weight * tree.nodes[leaf].value;
+            // A vector-leaf tree contributes to every output at once; an
+            // ordinary one has a single value and a single group.
+            let base = r * n_groups + group;
+            for (t_idx, v) in tree.leaf_value(leaf).iter().enumerate() {
+                preds[base + t_idx] += weight * v;
+            }
         }
     }
     preds

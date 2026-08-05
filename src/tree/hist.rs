@@ -358,12 +358,18 @@ fn goes_left(rid: u32, task: &SplitTask, gi: &GHistIndex) -> bool {
 }
 
 /// Per-node gradient histograms, indexed by node id.
+///
+/// A vector-leaf tree keeps one histogram *per target* per node, which is how
+/// upstream stores them too: the accumulation kernel stays scalar and is simply
+/// run once per target, so nothing on the hot path has to know about targets.
 struct HistCollection {
+    /// Indexed `nid * n_targets + target`.
     data: Vec<Vec<GradStats>>,
     /// Buffers of released nodes, kept for reuse: a histogram is hundreds of
     /// kilobytes and every level would otherwise allocate a fresh set.
     free: Vec<Vec<GradStats>>,
     total_bins: usize,
+    n_targets: usize,
     /// `max_cached_hist_node`: how many buffers may be held for reuse. Past
     /// this the released ones are dropped instead, which trades allocator
     /// traffic for a smaller resident set on a wide tree.
@@ -371,45 +377,67 @@ struct HistCollection {
 }
 
 impl HistCollection {
-    fn new(total_bins: usize, max_cached: usize) -> Self {
-        Self { data: Vec::new(), free: Vec::new(), total_bins, max_cached }
+    fn new(total_bins: usize, n_targets: usize, max_cached: usize) -> Self {
+        Self { data: Vec::new(), free: Vec::new(), total_bins, n_targets, max_cached }
     }
 
-    /// Give node `nid` a buffer of the right size. Its contents are undefined;
-    /// callers either fill it completely or zero it first.
+    /// Slot of one `(node, target)` histogram.
+    #[inline]
+    fn slot(&self, nid: usize, target: usize) -> usize {
+        nid * self.n_targets + target
+    }
+
+    /// Give node `nid` a buffer per target. Their contents are undefined;
+    /// callers either fill them completely or zero them first.
     fn allocate(&mut self, nid: usize) {
-        if self.data.len() <= nid {
-            self.data.resize_with(nid + 1, Vec::new);
+        let last = self.slot(nid, self.n_targets - 1);
+        if self.data.len() <= last {
+            self.data.resize_with(last + 1, Vec::new);
         }
-        if self.data[nid].len() == self.total_bins {
-            return;
+        for t in 0..self.n_targets {
+            let slot = self.slot(nid, t);
+            if self.data[slot].len() == self.total_bins {
+                continue;
+            }
+            self.data[slot] = match self.free.pop() {
+                Some(buf) => buf,
+                None => vec![GradStats::default(); self.total_bins],
+            };
         }
-        self.data[nid] = match self.free.pop() {
-            Some(buf) => buf,
-            None => vec![GradStats::default(); self.total_bins],
-        };
     }
 
-    /// Release a histogram that will not be read again.
+    /// Release a node's histograms, which will not be read again.
     fn release(&mut self, nid: usize) {
-        if nid < self.data.len() && !self.data[nid].is_empty() {
-            let buf = std::mem::take(&mut self.data[nid]);
-            if self.free.len() < self.max_cached {
-                self.free.push(buf);
+        for t in 0..self.n_targets {
+            let slot = self.slot(nid, t);
+            if slot < self.data.len() && !self.data[slot].is_empty() {
+                let buf = std::mem::take(&mut self.data[slot]);
+                if self.free.len() < self.max_cached {
+                    self.free.push(buf);
+                }
             }
         }
     }
 
     fn clear(&mut self) {
         for i in 0..self.data.len() {
-            self.release(i);
+            let buf = std::mem::take(&mut self.data[i]);
+            if !buf.is_empty() && self.free.len() < self.max_cached {
+                self.free.push(buf);
+            }
         }
         self.data.clear();
     }
 
     #[inline]
     fn get(&self, nid: usize) -> &[GradStats] {
-        &self.data[nid]
+        &self.data[nid * self.n_targets]
+    }
+
+    /// One target's histogram of node `nid`.
+    #[inline]
+    fn get_target(&self, nid: usize, target: usize) -> &[GradStats] {
+        &self.data[self.slot(nid, target)]
     }
 }
 
@@ -482,6 +510,16 @@ fn build_hist(hist: &mut [GradStats], rows: &[u32], gi: &GHistIndex, gpair: &[Gr
     }
 }
 
+/// The per-target sums added together, which is what the scalar bookkeeping —
+/// node cover, split validity, the tree's own statistics — is stated in.
+fn sum_targets(stats: &[GradStats]) -> GradStats {
+    let mut out = GradStats::default();
+    for s in stats {
+        out.add_stats(s);
+    }
+    out
+}
+
 /// Lanes to use for a node: bounded by its block count, the lane cap, and the
 /// memory budget. Depends only on the data, never on the thread count.
 fn lanes_for(n_rows: usize, total_bins: usize) -> usize {
@@ -506,17 +544,38 @@ pub struct HistGrower<'a> {
     constraints: InteractionConstraints,
     /// Which features each node *has* to choose from, after column sampling.
     column_sampler: ColumnSampler,
+    /// Outputs a leaf carries. `1` is the ordinary one-tree-per-target fit;
+    /// more makes this a vector-leaf grower.
+    n_targets: usize,
+    /// Per-`(node, target)` gradient sums, indexed `nid * n_targets + t`. Only
+    /// used by the vector-leaf path; the scalar path keeps them in [`Self::snode`].
+    snode_targets: Vec<GradStats>,
+    /// Per-target gradient columns, extracted once per round so the scalar
+    /// accumulation kernel can be reused unchanged.
+    target_gpair: Vec<Vec<GradientPair>>,
 }
 
 impl<'a> HistGrower<'a> {
     pub fn new(param: &'a TrainParam, gi: &'a GHistIndex, dmat: &'a DMatrix) -> Self {
+        Self::new_multi(param, gi, dmat, 1)
+    }
+
+    /// A grower for vector-leaf trees: one tree covering `n_targets` outputs.
+    pub fn new_multi(
+        param: &'a TrainParam,
+        gi: &'a GHistIndex,
+        dmat: &'a DMatrix,
+        n_targets: usize,
+    ) -> Self {
         let n_features = dmat.num_col();
+        let n_targets = n_targets.max(1);
         Self {
             param,
             gi,
             dmat,
             hist: HistCollection::new(
                 gi.total_bins(),
+                n_targets,
                 param.max_cached_hist_node.min(usize::MAX as u64) as usize,
             ),
             partitioner: Partitioner::new(dmat.num_row()),
@@ -532,7 +591,38 @@ impl<'a> HistGrower<'a> {
                 param.colsample_bylevel,
                 param.colsample_bytree,
             ),
+            n_targets,
+            snode_targets: Vec::new(),
+            target_gpair: Vec::new(),
         }
+    }
+
+    /// Whether this grower produces vector leaves.
+    #[inline]
+    fn is_multi(&self) -> bool {
+        self.n_targets > 1
+    }
+
+    /// Split the round's `(row, target)` gradients into one column per target.
+    ///
+    /// The histogram kernels take a gradient per row, so a vector-leaf round
+    /// hands them one column at a time rather than teaching them a stride.
+    fn split_gpair(&mut self, gpair: &[GradientPair]) {
+        if !self.is_multi() {
+            return;
+        }
+        let n_rows = self.dmat.num_row();
+        self.target_gpair.resize_with(self.n_targets, Vec::new);
+        for (t, column) in self.target_gpair.iter_mut().enumerate() {
+            column.clear();
+            column.extend((0..n_rows).map(|r| gpair[r * self.n_targets + t]));
+        }
+    }
+
+    /// Per-`(node, target)` sums, as a slice over the node's targets.
+    #[inline]
+    fn node_targets(&self, nid: usize) -> &[GradStats] {
+        &self.snode_targets[nid * self.n_targets..(nid + 1) * self.n_targets]
     }
 
     /// Reset for another tree over the same data, keeping allocations.
@@ -551,6 +641,7 @@ impl<'a> HistGrower<'a> {
     /// samples, in that order.
     pub fn grow(&mut self, ctx: &mut Context, gpair: &[GradientPair], tree: &mut RegTree) {
         let threads = ctx.threads();
+        self.split_gpair(gpair);
         // The column sample for a whole tree is drawn before any split is
         // considered, as `ColumnSampler::Init` is called from the evaluator's
         // constructor once per tree.
@@ -626,9 +717,14 @@ impl<'a> HistGrower<'a> {
             if !tree.nodes[nid].is_leaf() {
                 continue;
             }
-            let value = tree.nodes[nid].value * weight;
+            // A vector leaf writes every output column of the row; a scalar
+            // one writes the single column its tree belongs to.
+            let values = tree.leaf_value(nid);
             for &rid in self.partitioner.rows(nid) {
-                preds[rid as usize * n_groups + group] += value;
+                let base = rid as usize * n_groups;
+                for (t, v) in values.iter().enumerate() {
+                    preds[base + group + t] += v * weight;
+                }
             }
         }
     }
@@ -645,30 +741,58 @@ impl<'a> HistGrower<'a> {
 
         // Upstream sums the first feature's bins for dense data instead of the
         // gradients themselves; the two differ in rounding, so match the choice.
-        let mut root_sum = GradStats::default();
-        if self.dmat.is_dense() {
-            let cuts = &self.gi.cuts;
-            let (b, e) = (cuts.cut_ptrs[0] as usize, cuts.cut_ptrs[1] as usize);
-            for bin in b..e {
-                let cell = self.hist.get(0)[bin];
-                root_sum.add(cell.sum_grad, cell.sum_hess);
+        let root_target_sum = |t: usize, this: &Self| -> GradStats {
+            let mut sum = GradStats::default();
+            if this.dmat.is_dense() {
+                let cuts = &this.gi.cuts;
+                let (b, e) = (cuts.cut_ptrs[0] as usize, cuts.cut_ptrs[1] as usize);
+                for bin in b..e {
+                    let cell = this.hist.get_target(0, t)[bin];
+                    sum.add(cell.sum_grad, cell.sum_hess);
+                }
+            } else if this.is_multi() {
+                for g in &this.target_gpair[t] {
+                    sum.add(g.grad as f64, g.hess as f64);
+                }
             }
-        } else {
-            for g in gpair {
-                root_sum.add(g.grad as f64, g.hess as f64);
+            sum
+        };
+
+        let mut root_targets: Vec<GradStats> = Vec::with_capacity(self.n_targets);
+        for t in 0..self.n_targets {
+            let mut sum = root_target_sum(t, self);
+            if !self.dmat.is_dense() && !self.is_multi() {
+                sum = GradStats::default();
+                for g in gpair {
+                    sum.add(g.grad as f64, g.hess as f64);
+                }
             }
+            root_targets.push(sum);
         }
+        let root_sum = sum_targets(&root_targets);
 
         self.snode.clear();
         self.snode.push(NodeEntry {
             stats: root_sum,
             root_gain: self.evaluator.calc_gain(0, self.param, &root_sum),
         });
-        let weight = self.evaluator.calc_weight(0, self.param, &root_sum);
+        self.snode_targets.clear();
+        self.snode_targets.extend_from_slice(&root_targets);
 
-        tree.stats[0].sum_hess = root_sum.sum_hess as f32;
-        tree.stats[0].base_weight = weight;
-        tree.set_leaf(0, self.param.learning_rate * weight);
+        if self.is_multi() {
+            let weights: Vec<f32> = root_targets
+                .iter()
+                .map(|s| self.param.learning_rate * self.evaluator.calc_weight(0, self.param, s))
+                .collect();
+            tree.stats[0].sum_hess = root_sum.sum_hess as f32;
+            tree.stats[0].base_weight = self.evaluator.calc_weight(0, self.param, &root_sum);
+            tree.set_leaf_vector(0, &weights);
+        } else {
+            let weight = self.evaluator.calc_weight(0, self.param, &root_sum);
+            tree.stats[0].sum_hess = root_sum.sum_hess as f32;
+            tree.stats[0].base_weight = weight;
+            tree.set_leaf(0, self.param.learning_rate * weight);
+        }
 
         let features = self.feature_sets(&[0], rng);
         let (split, cat_bits) = self.evaluate_splits(&[0], &features).pop().unwrap_or_default();
@@ -757,6 +881,10 @@ impl<'a> HistGrower<'a> {
     }
 
     fn apply_split(&mut self, candidate: &ExpandEntry, tree: &mut RegTree) {
+        if self.is_multi() {
+            self.apply_split_multi(candidate, tree);
+            return;
+        }
         let split = &candidate.split;
         let mut parent_sum = split.left_sum;
         parent_sum.add_stats(&split.right_sum);
@@ -816,6 +944,72 @@ impl<'a> HistGrower<'a> {
             stats: split.right_sum,
             root_gain: self.evaluator.calc_gain(nid, self.param, &split.right_sum),
         };
+
+        self.constraints.split(nid, node.split_index, left, right);
+    }
+
+    /// [`apply_split`](Self::apply_split) for a vector-leaf tree: one shared
+    /// split decision, one leaf value per target.
+    fn apply_split_multi(&mut self, candidate: &ExpandEntry, tree: &mut RegTree) {
+        let split = &candidate.split;
+        let nid = candidate.nid;
+        let (left_sums, right_sums) = self.multi_child_sums(nid, split);
+
+        let mut parent_sum = split.left_sum;
+        parent_sum.add_stats(&split.right_sum);
+        let base_weight = self.evaluator.calc_weight(nid, self.param, &parent_sum);
+        let lr = self.param.learning_rate;
+        let left_weights: Vec<f32> = left_sums
+            .iter()
+            .map(|s| lr * self.evaluator.calc_weight(nid, self.param, s))
+            .collect();
+        let right_weights: Vec<f32> = right_sums
+            .iter()
+            .map(|s| lr * self.evaluator.calc_weight(nid, self.param, s))
+            .collect();
+
+        tree.expand_node_multi(
+            nid,
+            split.split_index(),
+            split.split_value,
+            split.default_left(),
+            base_weight,
+            &left_weights,
+            &right_weights,
+            split.loss_chg,
+            parent_sum.sum_hess as f32,
+            split.left_sum.sum_hess as f32,
+            split.right_sum.sum_hess as f32,
+        );
+
+        let node = tree.nodes[nid];
+        let (left, right) = (node.left as usize, node.right as usize);
+        // Monotonicity is stated per feature, not per target, so the bounds are
+        // handed on from the summed weights just as the scalar path does.
+        self.evaluator.add_split(
+            nid,
+            left,
+            right,
+            node.split_index,
+            self.evaluator.calc_weight(nid, self.param, &split.left_sum),
+            self.evaluator.calc_weight(nid, self.param, &split.right_sum),
+        );
+
+        if self.snode.len() < tree.num_nodes() {
+            self.snode.resize(tree.num_nodes(), NodeEntry::default());
+        }
+        if self.snode_targets.len() < tree.num_nodes() * self.n_targets {
+            self.snode_targets.resize(tree.num_nodes() * self.n_targets, GradStats::default());
+        }
+        for (child, sums) in [(left, &left_sums), (right, &right_sums)] {
+            let total = sum_targets(sums);
+            self.snode[child] = NodeEntry {
+                stats: total,
+                root_gain: self.evaluator.calc_gain(nid, self.param, &total),
+            };
+            self.snode_targets[child * self.n_targets..(child + 1) * self.n_targets]
+                .copy_from_slice(sums);
+        }
 
         self.constraints.split(nid, node.split_index, left, right);
     }
@@ -898,16 +1092,25 @@ impl<'a> HistGrower<'a> {
         for (subtract, _, _) in &to_subtract {
             self.hist.allocate(*subtract);
         }
-        let mut dsts: Vec<Vec<GradStats>> = to_subtract
+        // The subtraction is per `(node, target)`: a vector-leaf node holds one
+        // histogram per target, and each is `parent - built` in its own right.
+        let n_targets = self.n_targets;
+        let slots: Vec<(usize, usize, usize)> = to_subtract
             .iter()
-            .map(|(subtract, _, _)| std::mem::take(&mut self.hist.data[*subtract]))
+            .flat_map(|&(subtract, parent, built)| {
+                (0..n_targets).map(move |t| {
+                    (subtract * n_targets + t, parent * n_targets + t, built * n_targets + t)
+                })
+            })
             .collect();
+        let mut dsts: Vec<Vec<GradStats>> =
+            slots.iter().map(|&(dst, _, _)| std::mem::take(&mut self.hist.data[dst])).collect();
         {
             let hist = &self.hist;
             dsts.par_iter_mut().enumerate().for_each(|(i, dst)| {
-                let (_, parent, built) = to_subtract[i];
-                let p = hist.get(parent);
-                let b = hist.get(built);
+                let (_, parent, built) = slots[i];
+                let p = &hist.data[parent];
+                let b = &hist.data[built];
                 dst.par_chunks_mut(REDUCE_CHUNK_BINS).enumerate().for_each(|(c, out)| {
                     let lo = c * REDUCE_CHUNK_BINS;
                     for (k, o) in out.iter_mut().enumerate() {
@@ -917,8 +1120,8 @@ impl<'a> HistGrower<'a> {
                 });
             });
         }
-        for ((subtract, _, _), dst) in to_subtract.iter().zip(dsts) {
-            self.hist.data[*subtract] = dst;
+        for (&(dst_slot, _, _), dst) in slots.iter().zip(dsts) {
+            self.hist.data[dst_slot] = dst;
         }
 
         let mut out = Vec::with_capacity(candidates.len() * 2);
@@ -935,6 +1138,25 @@ impl<'a> HistGrower<'a> {
     /// Every per-bin step — zeroing, accumulation, reduction — runs in
     /// parallel; leaving any of them serial caps the whole level's speedup.
     fn build_hists(&mut self, nodes: &[usize], gpair: &[GradientPair]) {
+        if self.is_multi() {
+            // One scalar pass per target, over the same row sets.
+            for t in 0..self.n_targets {
+                let column = std::mem::take(&mut self.target_gpair[t]);
+                self.build_hists_target(nodes, &column, t);
+                self.target_gpair[t] = column;
+            }
+            return;
+        }
+        self.build_hists_target(nodes, gpair, 0);
+    }
+
+    /// Build one target's histogram for every node in `nodes`.
+    fn build_hists_target(
+        &mut self,
+        nodes: &[usize],
+        gpair: &[GradientPair],
+        target: usize,
+    ) {
         let total_bins = self.hist.total_bins;
         let lanes: Vec<usize> = nodes
             .iter()
@@ -958,7 +1180,7 @@ impl<'a> HistGrower<'a> {
         let gi = self.gi;
         let partitioner = &self.partitioner;
         let mut targets: Vec<Vec<GradStats>> =
-            nodes.iter().map(|&nid| std::mem::take(&mut self.hist.data[nid])).collect();
+            nodes.iter().map(|&nid| std::mem::take(&mut self.hist.data[nid * self.n_targets + target])).collect();
 
         // Single-lane nodes: zero and accumulate in one pass over the node set.
         //
@@ -1022,7 +1244,7 @@ impl<'a> HistGrower<'a> {
         }
 
         for (i, &nid) in nodes.iter().enumerate() {
-            self.hist.data[nid] = std::mem::take(&mut targets[i]);
+            self.hist.data[nid * self.n_targets + target] = std::mem::take(&mut targets[i]);
         }
     }
 
@@ -1053,7 +1275,13 @@ impl<'a> HistGrower<'a> {
 
         let per_task: Vec<(SplitEntry, Vec<u32>)> = tasks
             .par_iter()
-            .map(|&(node_idx, fidx)| self.evaluate_one(nodes[node_idx], fidx))
+            .map(|&(node_idx, fidx)| {
+                if self.is_multi() {
+                    (self.evaluate_one_multi(nodes[node_idx], fidx), Vec::new())
+                } else {
+                    self.evaluate_one(nodes[node_idx], fidx)
+                }
+            })
             .collect();
 
         let mut out = vec![(SplitEntry::default(), Vec::new()); nodes.len()];
@@ -1245,6 +1473,169 @@ impl<'a> HistGrower<'a> {
         }
         p_best.update_entry(&best);
         bits
+    }
+
+    /// The gain of a vector-leaf node, `TreeEvaluator::CalcGain` over targets.
+    ///
+    /// Every target contributes its own regularised gain at its own weight;
+    /// the split itself is shared, which is the whole point of a vector leaf.
+    fn multi_gain(&self, nid: usize, stats: &[GradStats]) -> f32 {
+        stats.iter().map(|s| self.evaluator.calc_gain(nid, self.param, s)).sum()
+    }
+
+    /// `CalcSplitGain` for vector leaves: the summed per-target gain, rejected
+    /// as a whole when the children's *mean* hessian is too small.
+    ///
+    /// The validity test uses the mean rather than each target's own hessian
+    /// because the split is one decision for all of them, so `min_child_weight`
+    /// is a statement about the node, not about any single output.
+    fn multi_split_gain(
+        &self,
+        nid: usize,
+        fidx: u32,
+        left: &[GradStats],
+        right: &[GradStats],
+    ) -> f32 {
+        let k = self.n_targets as f64;
+        let left_hess: f64 = left.iter().map(|s| s.sum_hess).sum::<f64>() / k;
+        let right_hess: f64 = right.iter().map(|s| s.sum_hess).sum::<f64>() / k;
+        let mean_left = GradStats::new(0.0, left_hess);
+        let mean_right = GradStats::new(0.0, right_hess);
+        // Reuse the scalar validity rule, which is what upstream does with the
+        // averaged hessians.
+        if !self.evaluator.calc_split_gain(nid, fidx, self.param, &mean_left, &mean_right).is_finite()
+        {
+            return f32::NEG_INFINITY;
+        }
+        let mut gain = 0.0f32;
+        for (l, r) in left.iter().zip(right) {
+            gain += self.evaluator.calc_gain(nid, self.param, l);
+            gain += self.evaluator.calc_gain(nid, self.param, r);
+        }
+        gain
+    }
+
+    /// The best split of one node on one feature, for a vector-leaf tree.
+    ///
+    /// Structurally the scalar scan, run over `n_targets` histograms at once:
+    /// one accumulator per target, one shared gain.
+    fn evaluate_one_multi(&self, nid: usize, fidx: u32) -> SplitEntry {
+        let mut best = SplitEntry::default();
+        if !self.constraints.query(nid, fidx) {
+            return best;
+        }
+        let cuts = &self.gi.cuts;
+        let f = fidx as usize;
+        let (ibegin, iend) = (cuts.cut_ptrs[f] as usize, cuts.cut_ptrs[f + 1] as usize);
+        let parent = self.node_targets(nid);
+        let parent_gain = self.multi_gain(nid, parent);
+
+        let mut left = vec![GradStats::default(); self.n_targets];
+        let mut right = vec![GradStats::default(); self.n_targets];
+
+        // Forward: the head of the feature's bins goes left, and the rows with
+        // no value for it go right.
+        let mut non_missing = GradStats::default();
+        for i in ibegin..iend {
+            for t in 0..self.n_targets {
+                let cell = self.hist.get_target(nid, t)[i];
+                left[t].add(cell.sum_grad, cell.sum_hess);
+                right[t].set_subtract(&parent[t], &left[t]);
+            }
+            let gain = self.multi_split_gain(nid, fidx, &left, &right);
+            if gain.is_finite() {
+                best.update(
+                    gain - parent_gain,
+                    fidx,
+                    cuts.cut_values[i],
+                    false,
+                    sum_targets(&left),
+                    sum_targets(&right),
+                );
+            }
+        }
+        for t in 0..self.n_targets {
+            non_missing.add_stats(&left[t]);
+        }
+
+        // Backward, only when the feature has missing rows in this node.
+        let parent_total = sum_targets(parent);
+        if non_missing.sum_grad != parent_total.sum_grad
+            || non_missing.sum_hess != parent_total.sum_hess
+        {
+            for s in right.iter_mut() {
+                *s = GradStats::default();
+            }
+            for i in (ibegin..iend).rev() {
+                for t in 0..self.n_targets {
+                    let cell = self.hist.get_target(nid, t)[i];
+                    // Scanning backwards, the accumulator is the right side.
+                    right[t].add(cell.sum_grad, cell.sum_hess);
+                    left[t].set_subtract(&parent[t], &right[t]);
+                }
+                let gain = self.multi_split_gain(nid, fidx, &left, &right);
+                if gain.is_finite() {
+                    best.update(
+                        gain - parent_gain,
+                        fidx,
+                        cuts.backward_split_point(f, i),
+                        true,
+                        sum_targets(&left),
+                        sum_targets(&right),
+                    );
+                }
+            }
+        }
+        best
+    }
+
+    /// Recover a chosen split's per-target child sums by re-scanning the
+    /// node's histograms.
+    ///
+    /// The split search keeps only the summed-over-targets totals, because
+    /// [`SplitEntry`] is copied by the thousand and a per-target vector cannot
+    /// ride along. Rebuilding them here costs one pass over one feature's bins
+    /// per applied split, against a full scan per candidate during the search.
+    fn multi_child_sums(
+        &self,
+        nid: usize,
+        split: &SplitEntry,
+    ) -> (Vec<GradStats>, Vec<GradStats>) {
+        let cuts = &self.gi.cuts;
+        let f = split.split_index() as usize;
+        let (ibegin, iend) = (cuts.cut_ptrs[f] as usize, cuts.cut_ptrs[f + 1] as usize);
+        let parent = self.node_targets(nid);
+
+        // Bins at or below `cond` take the left branch; the rows with no value
+        // are on whichever side `default_left` names, and are recovered as the
+        // difference from the parent.
+        let cond = self.find_split_condition(split.split_index(), split.split_value);
+        let mut accumulated = vec![GradStats::default(); self.n_targets];
+        let range: Box<dyn Iterator<Item = usize>> = if split.default_left() {
+            // The right side is the bins strictly above `cond`.
+            Box::new((cond.max(-1) as usize + 1).max(ibegin)..iend)
+        } else {
+            Box::new(ibegin..=(cond as usize).min(iend - 1))
+        };
+        for i in range {
+            for t in 0..self.n_targets {
+                let cell = self.hist.get_target(nid, t)[i];
+                accumulated[t].add(cell.sum_grad, cell.sum_hess);
+            }
+        }
+
+        let mut left = vec![GradStats::default(); self.n_targets];
+        let mut right = vec![GradStats::default(); self.n_targets];
+        for t in 0..self.n_targets {
+            if split.default_left() {
+                right[t] = accumulated[t];
+                left[t].set_subtract(&parent[t], &right[t]);
+            } else {
+                left[t] = accumulated[t];
+                right[t].set_subtract(&parent[t], &left[t]);
+            }
+        }
+        (left, right)
     }
 
     fn enumerate_forward(

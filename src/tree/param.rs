@@ -55,6 +55,10 @@ pub struct TrainParam {
     /// deep or wide tree holds; it changes speed, never the model.
     pub max_cached_hist_node: u64,
 
+    /// Whether one tree covers every output with a vector leaf, rather than
+    /// one tree being grown per output. `multi_strategy=multi_output_tree`.
+    pub multi_output_tree: bool,
+
     /// Density below which a column is stored sparsely in the transposed copy
     /// the row partitioner reads. Trades lookup speed for memory; it changes
     /// neither the split search nor the model.
@@ -104,6 +108,7 @@ impl Default for TrainParam {
             interaction_constraints: None,
             // `HistMakerTrainParam::CpuDefaultNodes`.
             max_cached_hist_node: 1 << 16,
+            multi_output_tree: false,
             sparse_threshold: 0.2,
             max_cat_to_onehot: 4,
             max_cat_threshold: 64,

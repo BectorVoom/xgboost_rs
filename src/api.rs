@@ -739,15 +739,25 @@ fn check_supported_tree_options(
     dtrain: &DMatrix,
     device: Device,
 ) -> Result<()> {
-    if tree.multi_strategy != MultiStrategy::OneOutputPerTree {
-        return Err(Error::invalid(
-            "multi_strategy",
-            format!(
-                "`{}` needs vector-leaf trees, which are not implemented; use \
-                 `one_output_per_tree`",
-                tree.multi_strategy
-            ),
-        ));
+    if tree.multi_strategy == MultiStrategy::MultiOutputTree {
+        // A vector leaf is grown from one histogram per target, which only the
+        // `hist` updater builds here. The others would silently fall back to
+        // one tree per target, which is the opposite of what was asked for.
+        let updaters = tree.resolved_updaters(device)?;
+        if updaters != [TreeUpdaterName::GrowQuantileHistMaker] {
+            return Err(Error::invalid(
+                "multi_strategy",
+                "`multi_output_tree` is implemented for the `hist` tree method only; \
+                 use `tree_method=hist` with the default updater pipeline",
+            ));
+        }
+        if dtrain.info().has_categorical() {
+            return Err(Error::invalid(
+                "multi_strategy",
+                "`multi_output_tree` has no categorical split; one-hot encode the \
+                 categories, or use `one_output_per_tree`",
+            ));
+        }
     }
     // Only the histogram updaters bin by category. `exact` enumerates a
     // column's values in ascending order, which would read the category codes
@@ -858,6 +868,7 @@ fn train_param(tree: &TreeBoosterParameters, device: Device) -> Result<TrainPara
         monotone_constraints: tree.monotone_constraints.clone(),
         interaction_constraints: tree.interaction_constraints.clone(),
         max_cached_hist_node: tree.max_cached_hist_nodes(Device::Cpu),
+        multi_output_tree: tree.multi_strategy == MultiStrategy::MultiOutputTree,
         sparse_threshold: tree.sparse_threshold,
         max_cat_to_onehot: tree.max_cat_to_onehot,
         max_cat_threshold: tree.max_cat_threshold,

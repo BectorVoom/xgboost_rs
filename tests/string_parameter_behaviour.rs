@@ -778,28 +778,45 @@ fn refresh_leaf_decides_whether_refresh_moves_the_predictions() {
     assert_ne!(kept, moved, "refresh_leaf = true must re-fit the leaves");
 }
 
-/// Every `multi_strategy` spelling is honoured or rejected naming the
-/// parameter.
+/// Every `multi_strategy` spelling trains, and the two differ in what a round
+/// grows: one tree per output, or one tree with a vector leaf.
 #[test]
-fn every_multi_strategy_spelling_is_honoured_or_rejected_by_name() {
-    let d = universal_data(100);
+fn every_multi_strategy_spelling_reaches_the_fit() {
+    // Two targets, so the strategies have something to disagree about.
+    let rows = 200usize;
+    let x: Vec<f32> = (0..rows * 3).map(|i| ((i * 37) % 101) as f32 / 101.0).collect();
+    let y: Vec<f32> = (0..rows * 2)
+        .map(|i| {
+            let (r, t) = (i / 2, i % 2);
+            x[r * 3] + if t == 0 { 0.0 } else { x[r * 3 + 1] }
+        })
+        .collect();
+    let mut d = DMatrix::from_dense(&x, rows, 3, f32::NAN).unwrap();
+    d.set_labels_multi(&y, 2).unwrap();
+
+    let mut trees = Vec::new();
     for &strategy in MultiStrategy::ALL {
         let p = training(
             LearningTaskParameters::default(),
             TreeBoosterParameters { multi_strategy: strategy, ..Default::default() },
         );
-        match api::train(&p, &d, &[]) {
-            Ok(_) => assert_eq!(
-                strategy,
-                MultiStrategy::OneOutputPerTree,
-                "`{strategy}` trained but vector leaves are not implemented"
-            ),
-            Err(e) => assert!(
-                e.to_string().contains("multi_strategy"),
-                "`{strategy}` was rejected without naming the parameter: {e}"
-            ),
-        }
+        let booster = api::train(&p, &d, &[])
+            .unwrap_or_else(|e| panic!("`{strategy}` failed to train: {e}"))
+            .0;
+        let model: serde_json::Value = serde_json::from_str(&booster.save_model()).unwrap();
+        let n_trees = model
+            .pointer("/learner/gradient_booster/model/trees")
+            .and_then(|t| t.as_array())
+            .map(Vec::len)
+            .unwrap();
+        trees.push((strategy, n_trees, booster.predict(&d)));
     }
+
+    // One output per tree grows two trees a round; one output *tree* grows one.
+    let per_tree = trees.iter().find(|(s, ..)| *s == MultiStrategy::OneOutputPerTree).unwrap();
+    let vector = trees.iter().find(|(s, ..)| *s == MultiStrategy::MultiOutputTree).unwrap();
+    assert_eq!(per_tree.1, vector.1 * 2, "a vector leaf halves the ensemble: {trees:?}");
+    assert_ne!(per_tree.2, vector.2, "the two strategies must not fit the same model");
 }
 
 /// `default_direction` steers the `exact` updater's missing-value handling, so
