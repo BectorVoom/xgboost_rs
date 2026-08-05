@@ -6,6 +6,8 @@
 //! Doing it all in `f64` would produce split decisions that drift from the
 //! reference on near-ties, so the widths are matched exactly.
 
+use crate::parameters::{MonotoneConstraint, SamplingMethod};
+
 /// Growth order for the node expansion queue.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GrowPolicy {
@@ -32,6 +34,23 @@ pub struct TrainParam {
     pub reg_lambda: f32,
     pub reg_alpha: f32,
     pub max_delta_step: f32,
+
+    /// Row subsample ratio, drawn once per tree.
+    pub subsample: f32,
+    /// How rows are drawn when `subsample < 1`.
+    pub sampling_method: SamplingMethod,
+    /// Column subsample ratio, drawn once per tree.
+    pub colsample_bytree: f32,
+    /// Column subsample ratio, drawn once per depth level.
+    pub colsample_bylevel: f32,
+    /// Column subsample ratio, drawn once per node.
+    pub colsample_bynode: f32,
+    /// Trees grown per boosting round.
+    pub num_parallel_tree: u32,
+    /// One monotonicity direction per feature; empty means unconstrained.
+    pub monotone_constraints: Vec<MonotoneConstraint>,
+    /// Feature groups allowed to interact; `None` means unconstrained.
+    pub interaction_constraints: Option<Vec<Vec<u32>>>,
 }
 
 impl Default for TrainParam {
@@ -47,6 +66,14 @@ impl Default for TrainParam {
             reg_lambda: 1.0,
             reg_alpha: 0.0,
             max_delta_step: 0.0,
+            subsample: 1.0,
+            sampling_method: SamplingMethod::Uniform,
+            colsample_bytree: 1.0,
+            colsample_bylevel: 1.0,
+            colsample_bynode: 1.0,
+            num_parallel_tree: 1,
+            monotone_constraints: Vec::new(),
+            interaction_constraints: None,
         }
     }
 }
@@ -135,20 +162,6 @@ pub fn calc_gain_given_weight(p: &TrainParam, stats: &GradStats, w: f32) -> f32 
     // `tree::CalcGainGivenWeight<ParamT, float>`: all-`f32` arithmetic.
     let (g, h) = (stats.sum_grad as f32, stats.sum_hess as f32);
     -(2.0 * g * w + (h + p.reg_lambda) * w * w + 2.0 * p.reg_alpha * w.abs())
-}
-
-/// Gain of a node evaluated at its own optimal weight.
-#[inline]
-pub fn calc_gain(p: &TrainParam, stats: &GradStats) -> f32 {
-    calc_gain_given_weight(p, stats, calc_weight(p, stats))
-}
-
-/// Gain of the split that separates `left` from `right`.
-#[inline]
-pub fn calc_split_gain(p: &TrainParam, left: &GradStats, right: &GradStats) -> f32 {
-    let wleft = calc_weight(p, left);
-    let wright = calc_weight(p, right);
-    calc_gain_given_weight(p, left, wleft) + calc_gain_given_weight(p, right, wright)
 }
 
 /// A candidate split, mirroring `SplitEntry`.
@@ -247,7 +260,7 @@ mod tests {
         let p = TrainParam::default();
         let s = GradStats::new(1.0, 0.0);
         assert_eq!(calc_weight(&p, &s), 0.0);
-        assert_eq!(calc_gain(&p, &s), 0.0);
+        assert_eq!(calc_gain_given_weight(&p, &s, calc_weight(&p, &s)), 0.0);
     }
 
     #[test]

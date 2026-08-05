@@ -28,13 +28,15 @@
 //! never on the thread count, so a model trained on 1 core and on 32 cores is
 //! bit-identical.
 
+use super::column_sampler::{ColumnSampler, FeatureSet};
+use super::evaluator::{InteractionConstraints, SplitEvaluator};
 use super::model::RegTree;
-use super::param::{
-    GradStats, GrowPolicy, RT_EPS, SplitEntry, TrainParam, calc_gain, calc_split_gain, calc_weight,
-};
+use super::param::{GradStats, GrowPolicy, RT_EPS, SplitEntry, TrainParam};
+use crate::context::Context;
 use crate::data::gradient_index::{GHistIndex, dispatch_bins};
 use crate::data::DMatrix;
 use crate::objective::GradientPair;
+use crate::rng::Mt19937;
 use crate::threading;
 use rayon::prelude::*;
 
@@ -199,7 +201,7 @@ impl Partitioner {
         let mut n_left = vec![0usize; tasks.len()];
         {
             let slots: Vec<(usize, &mut usize)> =
-                n_left.iter_mut().enumerate().map(|(i, v)| (i, v)).collect();
+                n_left.iter_mut().enumerate().collect();
             let mut by_task: Vec<Option<&mut usize>> = (0..tasks.len()).map(|_| None).collect();
             for (i, v) in slots {
                 by_task[i] = Some(v);
@@ -460,10 +462,17 @@ pub struct HistGrower<'a> {
     snode: Vec<NodeEntry>,
     /// Partial histograms, reused across nodes and rounds.
     lane_buf: Vec<GradStats>,
+    /// Monotonicity: the per-node weight boxes and the split gain rule.
+    evaluator: SplitEvaluator,
+    /// Which features each node may split on.
+    constraints: InteractionConstraints,
+    /// Which features each node *has* to choose from, after column sampling.
+    column_sampler: ColumnSampler,
 }
 
 impl<'a> HistGrower<'a> {
     pub fn new(param: &'a TrainParam, gi: &'a GHistIndex, dmat: &'a DMatrix) -> Self {
+        let n_features = dmat.num_col();
         Self {
             param,
             gi,
@@ -472,6 +481,16 @@ impl<'a> HistGrower<'a> {
             partitioner: Partitioner::new(dmat.num_row()),
             snode: Vec::new(),
             lane_buf: Vec::new(),
+            evaluator: SplitEvaluator::new(&param.monotone_constraints, n_features),
+            constraints: InteractionConstraints::new(
+                param.interaction_constraints.as_ref(),
+                n_features,
+            ),
+            column_sampler: ColumnSampler::new(
+                param.colsample_bynode,
+                param.colsample_bylevel,
+                param.colsample_bytree,
+            ),
         }
     }
 
@@ -480,16 +499,28 @@ impl<'a> HistGrower<'a> {
         self.partitioner.reset(self.dmat.num_row());
         self.hist.clear();
         self.snode.clear();
+        self.evaluator.reset();
+        self.constraints.reset();
     }
 
     /// Grow `tree` from `gpair`, mirroring upstream's `UpdateTree`.
-    pub fn grow(&mut self, gpair: &[GradientPair], tree: &mut RegTree) {
-        threading::install(|| self.grow_inner(gpair, tree));
+    ///
+    /// `ctx` supplies the thread count and the session random engine; the
+    /// engine is advanced here by the per-tree, per-level and per-node column
+    /// samples, in that order.
+    pub fn grow(&mut self, ctx: &mut Context, gpair: &[GradientPair], tree: &mut RegTree) {
+        let threads = ctx.threads();
+        // The column sample for a whole tree is drawn before any split is
+        // considered, as `ColumnSampler::Init` is called from the evaluator's
+        // constructor once per tree.
+        self.column_sampler.reset(self.dmat.num_col(), ctx.rng());
+        let rng = ctx.rng();
+        threading::install_with(threads, || self.grow_inner(rng, gpair, tree));
     }
 
-    fn grow_inner(&mut self, gpair: &[GradientPair], tree: &mut RegTree) {
+    fn grow_inner(&mut self, rng: &mut Mt19937, gpair: &[GradientPair], tree: &mut RegTree) {
         let mut num_leaves: i32 = 1;
-        let root = self.init_root(gpair, tree);
+        let root = self.init_root(rng, gpair, tree);
 
         let mut queue: Vec<ExpandEntry> = Vec::new();
         if root.split.loss_chg > RT_EPS {
@@ -514,10 +545,12 @@ impl<'a> HistGrower<'a> {
             // built in one parallel pass, then their siblings are subtracted.
             let built = self.build_children_hists(&valid_candidates, tree, gpair);
 
+            let depths: Vec<i32> = built.iter().map(|&nid| tree.depth(nid)).collect();
+            let features = self.feature_sets(&depths, rng);
             let mut best_splits = Vec::with_capacity(built.len());
-            let splits = self.evaluate_splits(&built);
-            for (nid, split) in built.iter().zip(splits) {
-                best_splits.push(ExpandEntry { nid: *nid, depth: tree.depth(*nid), split });
+            let splits = self.evaluate_splits(&built, &features);
+            for ((nid, split), depth) in built.iter().zip(splits).zip(depths) {
+                best_splits.push(ExpandEntry { nid: *nid, depth, split });
             }
 
             // Parent histograms are dead once both children exist.
@@ -549,7 +582,12 @@ impl<'a> HistGrower<'a> {
     }
 
     /// Build the root histogram, set the root leaf, and evaluate its split.
-    fn init_root(&mut self, gpair: &[GradientPair], tree: &mut RegTree) -> ExpandEntry {
+    fn init_root(
+        &mut self,
+        rng: &mut Mt19937,
+        gpair: &[GradientPair],
+        tree: &mut RegTree,
+    ) -> ExpandEntry {
         self.hist.allocate(0);
         self.build_hists(&[0], gpair);
 
@@ -572,16 +610,27 @@ impl<'a> HistGrower<'a> {
         self.snode.clear();
         self.snode.push(NodeEntry {
             stats: root_sum,
-            root_gain: calc_gain(self.param, &root_sum),
+            root_gain: self.evaluator.calc_gain(0, self.param, &root_sum),
         });
-        let weight = calc_weight(self.param, &root_sum);
+        let weight = self.evaluator.calc_weight(0, self.param, &root_sum);
 
         tree.stats[0].sum_hess = root_sum.sum_hess as f32;
         tree.stats[0].base_weight = weight;
         tree.set_leaf(0, self.param.learning_rate * weight);
 
-        let split = self.evaluate_splits(&[0]).pop().unwrap_or_default();
+        let features = self.feature_sets(&[0], rng);
+        let split = self.evaluate_splits(&[0], &features).pop().unwrap_or_default();
         ExpandEntry { nid: 0, depth: 0, split }
+    }
+
+    /// The candidate features for each node in an expansion batch, in the same
+    /// order as `depths`.
+    ///
+    /// Drawn here rather than inside the parallel evaluation because with
+    /// `colsample_bynode < 1` each call advances the random engine, and the
+    /// order of those draws is part of what the model is.
+    fn feature_sets(&mut self, depths: &[i32], rng: &mut Mt19937) -> Vec<FeatureSet> {
+        depths.iter().map(|&depth| self.column_sampler.feature_set(depth, rng)).collect()
     }
 
     /// The node batch to expand next, following upstream's `Driver::Pop`.
@@ -660,9 +709,12 @@ impl<'a> HistGrower<'a> {
         let mut parent_sum = split.left_sum;
         parent_sum.add_stats(&split.right_sum);
 
-        let base_weight = calc_weight(self.param, &parent_sum);
-        let left_weight = calc_weight(self.param, &split.left_sum);
-        let right_weight = calc_weight(self.param, &split.right_sum);
+        // All three weights are bounded by the *parent's* box: the children do
+        // not have one until `add_split` below derives it from these values.
+        let nid = candidate.nid;
+        let base_weight = self.evaluator.calc_weight(nid, self.param, &parent_sum);
+        let left_weight = self.evaluator.calc_weight(nid, self.param, &split.left_sum);
+        let right_weight = self.evaluator.calc_weight(nid, self.param, &split.right_sum);
         let lr = self.param.learning_rate;
 
         tree.expand_node(
@@ -681,15 +733,23 @@ impl<'a> HistGrower<'a> {
 
         let node = tree.nodes[candidate.nid];
         let (left, right) = (node.left as usize, node.right as usize);
+        self.evaluator.add_split(nid, left, right, node.split_index, left_weight, right_weight);
+
         if self.snode.len() < tree.num_nodes() {
             self.snode.resize(tree.num_nodes(), NodeEntry::default());
         }
-        self.snode[left] =
-            NodeEntry { stats: split.left_sum, root_gain: calc_gain(self.param, &split.left_sum) };
+        // Upstream evaluates both children's gains against the parent's node
+        // id, so the parent's bounds — not the ones just derived — apply here.
+        self.snode[left] = NodeEntry {
+            stats: split.left_sum,
+            root_gain: self.evaluator.calc_gain(nid, self.param, &split.left_sum),
+        };
         self.snode[right] = NodeEntry {
             stats: split.right_sum,
-            root_gain: calc_gain(self.param, &split.right_sum),
+            root_gain: self.evaluator.calc_gain(nid, self.param, &split.right_sum),
         };
+
+        self.constraints.split(nid, node.split_index, left, right);
     }
 
     fn split_task(&self, candidate: &ExpandEntry, tree: &RegTree) -> SplitTask {
@@ -879,58 +939,64 @@ impl<'a> HistGrower<'a> {
         }
     }
 
-    /// Best split for each node.
+    /// Best split for each node, considering only that node's candidate
+    /// features.
     ///
     /// Candidates are evaluated over a flat `(node, feature)` task list so a
     /// level with many small nodes parallelises as well as one big node, then
-    /// merged per node in feature order. The merge rule is a total order on
-    /// `(loss change, smallest feature index)`, so the result does not depend
-    /// on how the work was scheduled.
-    fn evaluate_splits(&self, nodes: &[usize]) -> Vec<SplitEntry> {
-        let n_features = self.gi.cuts.num_features();
-        let n_tasks = nodes.len() * n_features;
-        let per_task: Vec<SplitEntry> = (0..n_tasks)
-            .into_par_iter()
-            .map(|task| {
-                let (node_idx, fidx) = (task / n_features, task % n_features);
+    /// merged per node. The merge rule is a total order on `(loss change,
+    /// smallest feature index)`, so the result does not depend on how the work
+    /// was scheduled.
+    fn evaluate_splits(&self, nodes: &[usize], features: &[FeatureSet]) -> Vec<SplitEntry> {
+        debug_assert_eq!(nodes.len(), features.len());
+        // Flat task list: one entry per (node, candidate feature) pair.
+        let tasks: Vec<(usize, u32)> = features
+            .iter()
+            .enumerate()
+            .flat_map(|(node_idx, set)| set.iter().map(move |&fidx| (node_idx, fidx)))
+            .collect();
+
+        let per_task: Vec<SplitEntry> = tasks
+            .par_iter()
+            .map(|&(node_idx, fidx)| {
                 let nid = nodes[node_idx];
+                let mut best = SplitEntry::default();
+                if !self.constraints.query(nid, fidx) {
+                    return best;
+                }
                 let hist = self.hist.get(nid);
                 let parent = self.snode[nid];
-                let mut best = SplitEntry::default();
-                let non_missing = self.enumerate_forward(fidx, hist, &parent, &mut best);
+                let non_missing = self.enumerate_forward(nid, fidx, hist, &parent, &mut best);
                 // A feature has missing values in this node exactly when its
                 // bins do not account for the node's whole gradient sum.
                 if non_missing.sum_grad != parent.stats.sum_grad
                     || non_missing.sum_hess != parent.stats.sum_hess
                 {
-                    self.enumerate_backward(fidx, hist, &parent, &mut best);
+                    self.enumerate_backward(nid, fidx, hist, &parent, &mut best);
                 }
                 best
             })
             .collect();
 
-        per_task
-            .chunks(n_features)
-            .map(|candidates| {
-                let mut best = SplitEntry::default();
-                for candidate in candidates {
-                    best.update_entry(candidate);
-                }
-                best
-            })
-            .collect()
+        let mut out = vec![SplitEntry::default(); nodes.len()];
+        for ((node_idx, _), candidate) in tasks.iter().zip(&per_task) {
+            out[*node_idx].update_entry(candidate);
+        }
+        out
     }
 
     fn enumerate_forward(
         &self,
-        fidx: usize,
+        nid: usize,
+        fidx: u32,
         hist: &[GradStats],
         parent: &NodeEntry,
         p_best: &mut SplitEntry,
     ) -> GradStats {
         let cuts = &self.gi.cuts;
         let p = self.param;
-        let (ibegin, iend) = (cuts.cut_ptrs[fidx] as usize, cuts.cut_ptrs[fidx + 1] as usize);
+        let f = fidx as usize;
+        let (ibegin, iend) = (cuts.cut_ptrs[f] as usize, cuts.cut_ptrs[f + 1] as usize);
 
         let mut left_sum = GradStats::default();
         let mut best = SplitEntry::default();
@@ -938,9 +1004,16 @@ impl<'a> HistGrower<'a> {
             left_sum.add(hist[i].sum_grad, hist[i].sum_hess);
             let mut right_sum = GradStats::default();
             right_sum.set_subtract(&parent.stats, &left_sum);
-            if is_valid_split(p, &left_sum, &right_sum) {
-                let loss_chg = calc_split_gain(p, &left_sum, &right_sum) - parent.root_gain;
-                best.update(loss_chg, fidx as u32, cuts.cut_values[i], false, left_sum, right_sum);
+            let gain = self.evaluator.calc_split_gain(nid, fidx, p, &left_sum, &right_sum);
+            if gain.is_finite() {
+                best.update(
+                    gain - parent.root_gain,
+                    fidx,
+                    cuts.cut_values[i],
+                    false,
+                    left_sum,
+                    right_sum,
+                );
             }
         }
         p_best.update_entry(&best);
@@ -949,14 +1022,16 @@ impl<'a> HistGrower<'a> {
 
     fn enumerate_backward(
         &self,
-        fidx: usize,
+        nid: usize,
+        fidx: u32,
         hist: &[GradStats],
         parent: &NodeEntry,
         p_best: &mut SplitEntry,
     ) {
         let cuts = &self.gi.cuts;
         let p = self.param;
-        let (ibegin, iend) = (cuts.cut_ptrs[fidx] as usize, cuts.cut_ptrs[fidx + 1] as usize);
+        let f = fidx as usize;
+        let (ibegin, iend) = (cuts.cut_ptrs[f] as usize, cuts.cut_ptrs[f + 1] as usize);
 
         let mut left_sum = GradStats::default();
         let mut best = SplitEntry::default();
@@ -965,20 +1040,21 @@ impl<'a> HistGrower<'a> {
             left_sum.add(hist[i].sum_grad, hist[i].sum_hess);
             let mut right_sum = GradStats::default();
             right_sum.set_subtract(&parent.stats, &left_sum);
-            if is_valid_split(p, &left_sum, &right_sum) {
-                let loss_chg = calc_split_gain(p, &right_sum, &left_sum) - parent.root_gain;
-                let split_pt = cuts.backward_split_point(fidx, i);
-                best.update(loss_chg, fidx as u32, split_pt, true, right_sum, left_sum);
+            let gain = self.evaluator.calc_split_gain(nid, fidx, p, &right_sum, &left_sum);
+            if gain.is_finite() {
+                let split_pt = cuts.backward_split_point(f, i);
+                best.update(
+                    gain - parent.root_gain,
+                    fidx,
+                    split_pt,
+                    true,
+                    right_sum,
+                    left_sum,
+                );
             }
         }
         p_best.update_entry(&best);
     }
-}
-
-/// Both children must carry at least `min_child_weight` Hessian.
-#[inline]
-fn is_valid_split(p: &TrainParam, left: &GradStats, right: &GradStats) -> bool {
-    left.sum_hess >= p.min_child_weight as f64 && right.sum_hess >= p.min_child_weight as f64
 }
 
 #[cfg(test)]
@@ -1004,7 +1080,7 @@ mod tests {
         let cuts = build_cuts(d, param.max_bin).unwrap();
         let gi = build_gradient_index(d, &cuts).unwrap();
         let mut tree = RegTree::new(d.num_col());
-        HistGrower::new(param, &gi, d).grow(gpair, &mut tree);
+        HistGrower::new(param, &gi, d).grow(&mut Context::default(), gpair, &mut tree);
         tree
     }
 
@@ -1047,7 +1123,7 @@ mod tests {
         let gi = build_gradient_index(&d, &cuts).unwrap();
         let mut tree = RegTree::new(1);
         let mut grower = HistGrower::new(&param, &gi, &d);
-        grower.grow(&gpair, &mut tree);
+        grower.grow(&mut Context::default(), &gpair, &mut tree);
 
         let mut seen: Vec<u32> = grower.partitioner.row_indices.clone();
         seen.sort_unstable();
@@ -1073,7 +1149,7 @@ mod tests {
 
         let mut tree = RegTree::new(1);
         let mut grower = HistGrower::new(&param, &gi, &d);
-        grower.grow(&gpair, &mut tree);
+        grower.grow(&mut Context::default(), &gpair, &mut tree);
         for nid in 0..tree.num_nodes() {
             if tree.nodes[nid].is_leaf() {
                 let rows = grower.partitioner.rows(nid);

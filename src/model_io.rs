@@ -22,7 +22,11 @@ pub fn save_model(booster: &Booster) -> String {
     let model = &learner.gbm().model;
 
     let trees: Vec<Value> = model.trees.iter().enumerate().map(|(i, t)| tree_to_json(i, t)).collect();
-    let iteration_indptr: Vec<usize> = (0..=model.trees.len()).collect();
+    // One entry per boosting round, so a forest round contributes
+    // `num_parallel_tree` trees to a single interval.
+    let per_round = model.num_parallel_tree.max(1) as usize;
+    let iteration_indptr: Vec<usize> =
+        (0..=model.trees.len() / per_round).map(|i| i * per_round).collect();
     let tree_info = vec![0u32; model.trees.len()];
 
     let doc = json!({
@@ -33,7 +37,7 @@ pub fn save_model(booster: &Booster) -> String {
             "gradient_booster": {
                 "model": {
                     "gbtree_model_param": {
-                        "num_parallel_tree": "1",
+                        "num_parallel_tree": model.num_parallel_tree.max(1).to_string(),
                         "num_trees": model.trees.len().to_string(),
                     },
                     "iteration_indptr": iteration_indptr,
@@ -144,10 +148,17 @@ pub fn load_model(text: &str) -> Result<Booster> {
         trees.push(tree_from_json(t, num_feature)?);
     }
 
+    let num_parallel_tree = learner_json
+        .pointer("/gradient_booster/model/gbtree_model_param/num_parallel_tree")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1)
+        .max(1);
+
     let obj = crate::objective::create(objective_name)?;
     let metric = crate::metric::create(obj.default_metric())?;
     let mut gbm = GBTree::new(num_feature, TrainParam::default());
-    gbm.model = GBTreeModel { trees, num_feature };
+    gbm.model = GBTreeModel { trees, num_feature, num_parallel_tree };
 
     Ok(Booster::from_learner(Learner::from_model(obj, metric, gbm, base_score)))
 }

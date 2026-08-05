@@ -43,6 +43,8 @@ struct Args {
     depth: u32,
     max_bin: u32,
     sparsity: f32,
+    subsample: f32,
+    colsample: f32,
     threads: usize,
     repeats: usize,
     /// When set, write the generated dataset here so the Python harness can
@@ -63,6 +65,8 @@ impl Default for Args {
             depth: 6,
             max_bin: 256,
             sparsity: 0.0,
+            subsample: 1.0,
+            colsample: 1.0,
             threads: 0,
             repeats: 1,
             dump: None,
@@ -87,6 +91,8 @@ fn parse_args() -> Args {
             "--depth" => args.depth = value().parse().unwrap(),
             "--max-bin" => args.max_bin = value().parse().unwrap(),
             "--sparsity" => args.sparsity = value().parse().unwrap(),
+            "--subsample" => args.subsample = value().parse().unwrap(),
+            "--colsample" => args.colsample = value().parse().unwrap(),
             "--threads" => args.threads = value().parse().unwrap(),
             "--repeats" => args.repeats = value().parse().unwrap(),
             "--dump" => args.dump = Some(value()),
@@ -157,6 +163,8 @@ fn main() {
                 eta: 0.3,
                 max_depth: args.depth,
                 max_bin: args.max_bin,
+                subsample: args.subsample,
+                colsample_bytree: args.colsample,
                 ..Default::default()
             }),
             learning: LearningTaskParameters::default(),
@@ -167,13 +175,16 @@ fn main() {
     };
 
     println!(
-        "rows={} features={} rounds={} depth={} max_bin={} sparsity={} threads={}",
+        "rows={} features={} rounds={} depth={} max_bin={} sparsity={} \
+         subsample={} colsample={} threads={}",
         args.rows,
         args.features,
         args.rounds,
         args.depth,
         args.max_bin,
         args.sparsity,
+        args.subsample,
+        args.colsample,
         xgboost_rs::num_threads(),
     );
     println!("data build: {:.3}s", build.as_secs_f64());

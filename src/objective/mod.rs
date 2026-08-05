@@ -37,10 +37,16 @@ pub trait Objective {
     fn default_metric(&self) -> &'static str;
 }
 
-/// Construct an objective by its XGBoost name.
+/// Construct an objective by its XGBoost name, at its default settings.
 pub fn create(name: &str) -> crate::Result<Box<dyn Objective>> {
+    create_with(name, 1.0)
+}
+
+/// Construct an objective by its XGBoost name, with the learning-task
+/// parameters that objectives read.
+pub fn create_with(name: &str, scale_pos_weight: f32) -> crate::Result<Box<dyn Objective>> {
     match name {
-        "reg:squarederror" | "reg:linear" => Ok(Box::new(SquaredError)),
+        "reg:squarederror" | "reg:linear" => Ok(Box::new(SquaredError::new(scale_pos_weight))),
         other => Err(crate::Error::invalid(
             "objective",
             format!("`{other}` is not implemented; Phase 1 supports `reg:squarederror`"),

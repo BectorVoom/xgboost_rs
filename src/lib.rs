@@ -22,13 +22,34 @@
 //!
 //! ```text
 //! api            train() / Booster: predict, eval, importance, model IO
-//!   learner      objective -> booster -> metric for one run
+//!   learner      objective -> booster -> metrics for one run
 //!     gbm        the tree ensemble and one boosting round
-//!       tree     RegTree, the split arithmetic, and the hist updater
+//!       tree     RegTree, the split arithmetic, and the hist updater,
+//!                with row/column sampling and the two constraint systems
 //!     objective  gradients and the base_score intercept
 //!     metric     rmse
+//!   context      threads, seed, and the session random engine
+//!   rng          the C++ generators sampling decisions are drawn from
 //!   data         DMatrix, quantile cuts, the binned feature matrix
 //! ```
+//!
+//! ## What the fit reads
+//!
+//! Everything in [`parameters::TreeBoosterParameters`] that a CPU `hist` fit
+//! can act on is acted on: `eta`, `gamma`, `max_depth`, `max_leaves`,
+//! `max_bin`, `grow_policy`, `min_child_weight`, `lambda`, `alpha`,
+//! `max_delta_step`, `subsample` with either `sampling_method`, all three
+//! `colsample_*` ratios, `num_parallel_tree`, `monotone_constraints` and
+//! `interaction_constraints`. From the other groups: `nthread`, `verbosity`,
+//! `seed`, `seed_per_iteration`, `scale_pos_weight`, `base_score`,
+//! `eval_metric` (all of them, not just the first),
+//! `disable_default_eval_metric`, and the loop controls `num_boost_round`,
+//! `early_stopping_rounds`, `verbose_eval` and `maximize`.
+//!
+//! A parameter that selects an algorithm this crate does not have — a booster
+//! other than `gbtree`, a `tree_method` other than `hist`, a non-CPU `device`,
+//! an objective other than `reg:squarederror` — is rejected by [`train`] rather
+//! than ignored.
 //!
 //! Two further modules stand beside them:
 //!
@@ -56,14 +77,17 @@
 //!
 //! # Parallelism
 //!
-//! Training uses every core by default; see [`set_num_threads`]. It is
-//! deterministic: rows are cut into fixed-size blocks, blocks are dealt to a
-//! fixed number of lanes, and partial results are reduced in lane order, none
-//! of which depends on the thread count. The same data and parameters give a
-//! bit-identical model on one core or on many, which `tests/determinism.rs`
-//! checks.
+//! Training uses every core by default; set `nthread` on the parameters for a
+//! single fit, or [`set_num_threads`] for the process. It is deterministic:
+//! rows are cut into fixed-size blocks, blocks are dealt to a fixed number of
+//! lanes, and partial results are reduced in lane order, none of which depends
+//! on the thread count. Row sampling is deterministic the same way — row `i`'s
+//! draw is a closed-form function of `i` and the seed. The same data and
+//! parameters give a bit-identical model on one core or on many, which
+//! `tests/determinism.rs` checks.
 
 pub mod api;
+pub mod context;
 pub mod data;
 pub mod error;
 pub mod gbm;
@@ -77,10 +101,12 @@ pub mod parameters;
 pub mod predictor;
 #[cfg(feature = "gpu")]
 pub mod reference;
+pub mod rng;
 pub mod threading;
 pub mod tree;
 
 pub use api::{Booster, train};
+pub use context::Context;
 pub use data::DMatrix;
 pub use error::{Error, Result};
 pub use threading::{num_threads, set_num_threads};

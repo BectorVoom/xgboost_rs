@@ -32,6 +32,12 @@ name = "bench"
 path = "src/bin/bench.rs"
 required-features = ["gpu"]
 
+# Timing sweep over the fit parameters that change how much work a fit does.
+# CPU only, so it builds without a GPU toolchain.
+[[bin]]
+name = "param_bench"
+path = "src/bin/param_bench.rs"
+
 [[test]]
 name = "kernels"
 path = "tests/kernels.rs"
