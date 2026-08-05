@@ -11,7 +11,7 @@ use crate::parameters::{GeneralParameters, LearningTaskParameters, Verbosity};
 use crate::rng::Mt19937;
 
 /// `LearnerImpl::kRandSeedMagic`, the multiplier `seed_per_iteration` uses.
-const RAND_SEED_MAGIC: i64 = 127;
+pub(crate) const RAND_SEED_MAGIC: i64 = 127;
 
 /// Per-run context: threads, seed, verbosity, and the session random engine.
 #[derive(Clone, Debug)]

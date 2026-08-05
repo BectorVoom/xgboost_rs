@@ -429,3 +429,67 @@ fn multi_class_prediction_keeps_its_groups() {
     let hard = train(&p, &d);
     assert_eq!(hard.predict_with(&PredictParameters::default(), &d).unwrap().shape, vec![120]);
 }
+
+/// `training = true` asks for the prediction a DART fit sees *while* it is
+/// training: one made from a thinned ensemble, with this round's dropout
+/// applied.
+#[test]
+fn the_training_flag_applies_dart_dropout() {
+    let d = data(300, 4);
+    let booster = train(
+        &dart(DartParameters { rate_drop: 0.5, ..Default::default() }, 12),
+        &d,
+    );
+
+    let inference = PredictParameters::default();
+    let training_time =
+        PredictParameters::builder().training(true).build().unwrap();
+
+    let full = booster.predict_with(&inference, &d).unwrap().values;
+    let thinned = booster.predict_with(&training_time, &d).unwrap().values;
+    assert_ne!(full, thinned, "dropout must actually remove trees from the prediction");
+
+    // Predicting is not a training round: it must be repeatable, and must not
+    // disturb what a later prediction sees.
+    assert_eq!(thinned, booster.predict_with(&training_time, &d).unwrap().values);
+    assert_eq!(full, booster.predict_with(&inference, &d).unwrap().values);
+}
+
+/// The flag reaches margin prediction too, not just the transformed values.
+#[test]
+fn the_training_flag_applies_to_margins() {
+    let d = data(300, 4);
+    let booster = train(&dart(DartParameters { rate_drop: 0.5, ..Default::default() }, 12), &d);
+
+    let margin = |training: bool| {
+        let p = PredictParameters::builder()
+            .predict_type(PredictionType::Margin)
+            .training(training)
+            .build()
+            .unwrap();
+        booster.predict_with(&p, &d).unwrap().values
+    };
+    assert_ne!(margin(false), margin(true));
+}
+
+/// `gbtree` drops nothing, so the flag is accepted and changes nothing — which
+/// is exactly what upstream does with it.
+#[test]
+fn the_training_flag_is_inert_without_dropout() {
+    let d = data(200, 3);
+    let booster = train(&tree(8), &d);
+
+    let inference = PredictParameters::default();
+    let training_time = PredictParameters::builder().training(true).build().unwrap();
+    assert_eq!(
+        booster.predict_with(&inference, &d).unwrap().values,
+        booster.predict_with(&training_time, &d).unwrap().values
+    );
+
+    // And a `dart` fit that never drops is in the same position.
+    let no_drop = train(&dart(DartParameters { rate_drop: 0.0, ..Default::default() }, 8), &d);
+    assert_eq!(
+        no_drop.predict_with(&inference, &d).unwrap().values,
+        no_drop.predict_with(&training_time, &d).unwrap().values
+    );
+}

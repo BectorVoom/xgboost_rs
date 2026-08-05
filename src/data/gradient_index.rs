@@ -93,22 +93,65 @@ pub(crate) use dispatch_bins;
 /// feature of a row, but wrong for partitioning, which walks every row of one
 /// feature — there it touches a fresh cache line per row. Keeping a transposed
 /// copy (as upstream's `ColumnMatrix` does) makes partitioning sequential.
+///
+/// # Two layouts, chosen per feature
+///
+/// `sparse_threshold` picks each column's storage, exactly as upstream's
+/// `ColumnMatrix::InitStorage` does:
+///
+/// * a **dense** column holds one entry per row, so a lookup is one index —
+///   fastest, but it pays for the rows that have no value;
+/// * a **sparse** column holds only the rows that have a value, so a lookup is
+///   a binary search over that column's row ids — slower per probe, but a
+///   column that is mostly missing costs a fraction of the memory.
+///
+/// A column is stored sparsely when fewer than `sparse_threshold * n_rows` of
+/// its entries are present. The choice changes speed and memory only: both
+/// layouts answer every query identically.
 #[derive(Clone, Debug)]
 pub(crate) struct ColumnIndex {
-    /// `data[f * n_rows + r]` is the feature-local bin, or [`Self::missing`].
-    pub(crate) data: BinStorage,
-    /// Sentinel for an absent value; `u32::MAX` for dense matrices, which have
-    /// none.
-    pub(crate) missing: u32,
-    pub(crate) n_rows: usize,
+    /// Concatenated per-feature segments of feature-local bins.
+    data: BinStorage,
+    /// `data` segment bounds, `n_features + 1` entries.
+    data_ptr: Vec<usize>,
+    /// Row ids of the stored entries of every sparse column, ascending within
+    /// a column. Dense columns contribute an empty segment.
+    row_ind: Vec<u32>,
+    /// `row_ind` segment bounds, `n_features + 1` entries.
+    row_ptr: Vec<usize>,
+    /// Whether each column took the sparse layout.
+    sparse: Vec<bool>,
+    /// Sentinel for an absent value in a dense column; `u32::MAX` when the
+    /// matrix has no missing values at all.
+    missing: u32,
 }
 
 impl ColumnIndex {
     /// Feature-local bin of row `r`, or `None` when the value is missing.
     #[inline]
     pub(crate) fn get(&self, fidx: u32, r: usize) -> Option<u32> {
-        let v = self.data.get(fidx as usize * self.n_rows + r);
-        if v == self.missing { None } else { Some(v) }
+        let f = fidx as usize;
+        let base = self.data_ptr[f];
+        if !self.sparse[f] {
+            let v = self.data.get(base + r);
+            return if v == self.missing { None } else { Some(v) };
+        }
+        let rows = &self.row_ind[self.row_ptr[f]..self.row_ptr[f + 1]];
+        match rows.binary_search(&(r as u32)) {
+            Ok(k) => Some(self.data.get(base + k)),
+            Err(_) => None,
+        }
+    }
+
+    /// How many columns took the sparse layout. Speed and memory only, but it
+    /// is what `sparse_threshold` decides, so it is worth being able to check.
+    pub(crate) fn sparse_columns(&self) -> usize {
+        self.sparse.iter().filter(|s| **s).count()
+    }
+
+    /// Bytes held by the column index.
+    pub(crate) fn size_bytes(&self) -> usize {
+        self.data.len() * self.data.width() + self.row_ind.len() * size_of::<u32>()
     }
 }
 
@@ -143,6 +186,17 @@ impl GHistIndex {
     /// Bytes held by the binned index.
     pub fn size_bytes(&self) -> usize {
         self.index.len() * self.index.width()
+    }
+
+    /// Bytes held by the transposed copy the row partitioner reads. This is
+    /// what `sparse_threshold` trades against lookup speed.
+    pub fn column_size_bytes(&self) -> usize {
+        self.columns.size_bytes()
+    }
+
+    /// How many columns took the sparse layout.
+    pub fn sparse_columns(&self) -> usize {
+        self.columns.sparse_columns()
     }
 
     /// Range of `index` covered by row `r`.
@@ -197,11 +251,28 @@ fn local_bin(cuts: &HistogramCuts, value: f32, fidx: usize) -> u32 {
     }
 }
 
+/// XGBoost's `sparse_threshold` default, used by the callers that have no
+/// training parameters to hand.
+pub const DEFAULT_SPARSE_THRESHOLD: f64 = 0.2;
+
+/// Bin every entry of `dmat` against `cuts`, with the default column layout
+/// rule.
+pub fn build_gradient_index(dmat: &DMatrix, cuts: &HistogramCuts) -> Result<GHistIndex> {
+    build_gradient_index_with(dmat, cuts, DEFAULT_SPARSE_THRESHOLD)
+}
+
 /// Bin every entry of `dmat` against `cuts`.
 ///
 /// Rows are independent, so the work is split across threads by row block. The
 /// output depends only on the data, never on how it was blocked.
-pub fn build_gradient_index(dmat: &DMatrix, cuts: &HistogramCuts) -> Result<GHistIndex> {
+///
+/// `sparse_threshold` selects each column's storage layout in the transposed
+/// copy; see [`ColumnIndex`]. It changes memory and speed, never the model.
+pub fn build_gradient_index_with(
+    dmat: &DMatrix,
+    cuts: &HistogramCuts,
+    sparse_threshold: f64,
+) -> Result<GHistIndex> {
     let is_dense = dmat.is_dense();
     let num_row = dmat.num_row();
     let num_col = dmat.num_col();
@@ -254,7 +325,7 @@ pub fn build_gradient_index(dmat: &DMatrix, cuts: &HistogramCuts) -> Result<GHis
         }
     });
 
-    let columns = build_column_index(dmat, cuts, &local, is_dense);
+    let columns = build_column_index(dmat, cuts, &local, is_dense, sparse_threshold);
 
     let max_feature_bins = (0..num_col).map(|f| cuts.feature_bins(f)).max().unwrap_or(0);
     let (index, offsets, row_stride) = if is_dense {
@@ -283,50 +354,110 @@ pub fn build_gradient_index(dmat: &DMatrix, cuts: &HistogramCuts) -> Result<GHis
     })
 }
 
-/// Transpose the feature-local bins into column-major order for partitioning.
+/// Transpose the feature-local bins into column-major order for partitioning,
+/// giving each column the layout `sparse_threshold` selects.
 fn build_column_index(
     dmat: &DMatrix,
     cuts: &HistogramCuts,
     local: &[u32],
     is_dense: bool,
+    sparse_threshold: f64,
 ) -> ColumnIndex {
     let n_rows = dmat.num_row();
     let n_features = dmat.num_col();
+    let counts = dmat.column_sizes();
     let max_feature_bins = (0..n_features).map(|f| cuts.feature_bins(f)).max().unwrap_or(0);
-    // Sparse columns need one extra value to mark an absent entry.
+    // A dense column needs one extra value to mark an absent entry; a matrix
+    // with no missing values needs none.
     let (missing, n_values) = if is_dense {
         (u32::MAX, max_feature_bins)
     } else {
         (max_feature_bins as u32, max_feature_bins + 1)
     };
 
-    let mut data = vec![if is_dense { 0 } else { missing }; n_rows * n_features];
+    // `ColumnMatrix::InitStorage`: a column with fewer stored values than
+    // `sparse_threshold * n_rows` is worth the binary search.
+    let limit = sparse_threshold * n_rows as f64;
+    let sparse: Vec<bool> =
+        (0..n_features).map(|f| (counts[f] as f64) < limit).collect();
 
-    // Each task owns whole columns, so its output slice is exclusive. Groups
+    let mut data_ptr = Vec::with_capacity(n_features + 1);
+    let mut row_ptr = Vec::with_capacity(n_features + 1);
+    let (mut d_acc, mut r_acc) = (0usize, 0usize);
+    for f in 0..n_features {
+        data_ptr.push(d_acc);
+        row_ptr.push(r_acc);
+        if sparse[f] {
+            d_acc += counts[f];
+            r_acc += counts[f];
+        } else {
+            d_acc += n_rows;
+        }
+    }
+    data_ptr.push(d_acc);
+    row_ptr.push(r_acc);
+
+    let mut data = vec![missing; d_acc];
+    let mut row_ind = vec![0u32; r_acc];
+
+    // Each task owns whole columns, so its output slices are exclusive. Groups
     // are wide enough that the strided reads still use most of a cache line.
     let group = n_features
         .div_ceil(crate::threading::num_threads() * 2)
         .max(16 / size_of::<u32>())
         .min(n_features.max(1));
+    let n_groups = n_features.div_ceil(group.max(1));
+
+    // Carve the two output buffers into one disjoint slice per group.
+    let mut jobs: Vec<(usize, usize, &mut [u32], &mut [u32])> = Vec::with_capacity(n_groups);
+    {
+        let mut data_rest: &mut [u32] = &mut data;
+        let mut rows_rest: &mut [u32] = &mut row_ind;
+        for g in 0..n_groups {
+            let first = g * group;
+            let last = (first + group).min(n_features);
+            let (d_here, d_tail) = data_rest.split_at_mut(data_ptr[last] - data_ptr[first]);
+            let (r_here, r_tail) = rows_rest.split_at_mut(row_ptr[last] - row_ptr[first]);
+            data_rest = d_tail;
+            rows_rest = r_tail;
+            jobs.push((first, last, d_here, r_here));
+        }
+    }
+
     crate::threading::install(|| {
-        data.par_chunks_mut(n_rows * group).enumerate().for_each(|(c, out)| {
-            let first = c * group;
-            let n_here = out.len() / n_rows;
+        jobs.into_par_iter().for_each(|(first, last, d_out, r_out)| {
+            // Where each column of this group starts inside the group's slices.
+            let d_base = data_ptr[first];
+            let r_base = row_ptr[first];
+            // Fill position of each sparse column, so its row ids stay
+            // ascending.
+            let mut fill = vec![0usize; last - first];
+
+            let mut place = |col: usize, r: usize, v: u32, fill: &mut [usize]| {
+                let j = col - first;
+                if sparse[col] {
+                    let k = fill[j];
+                    fill[j] = k + 1;
+                    d_out[data_ptr[col] - d_base + k] = v;
+                    r_out[row_ptr[col] - r_base + k] = r as u32;
+                } else {
+                    d_out[data_ptr[col] - d_base + r] = v;
+                }
+            };
+
             if is_dense {
                 for r in 0..n_rows {
-                    let row = &local[r * n_features + first..r * n_features + first + n_here];
-                    for (j, &v) in row.iter().enumerate() {
-                        out[j * n_rows + r] = v;
+                    for col in first..last {
+                        place(col, r, local[r * n_features + col], &mut fill);
                     }
                 }
             } else {
-                let last = first + n_here;
                 for r in 0..n_rows {
                     let (b, e) = (dmat.row_ptr[r], dmat.row_ptr[r + 1]);
                     for k in b..e {
                         let col = dmat.index[k] as usize;
                         if col >= first && col < last {
-                            out[(col - first) * n_rows + r] = local[k];
+                            place(col, r, local[k], &mut fill);
                         }
                     }
                 }
@@ -334,7 +465,14 @@ fn build_column_index(
         });
     });
 
-    ColumnIndex { data: BinStorage::from_u32(data, n_values), missing, n_rows }
+    ColumnIndex {
+        data: BinStorage::from_u32(data, n_values),
+        data_ptr,
+        row_ind,
+        row_ptr,
+        sparse,
+        missing,
+    }
 }
 
 #[cfg(test)]
@@ -383,6 +521,80 @@ mod tests {
         assert!(gi.columns.get(0, 0).is_some());
         assert_eq!(gi.columns.get(1, 0), None, "row 0 has no feature 1");
         assert!(gi.columns.get(1, 1).is_some());
+    }
+
+    /// Both column layouts must answer every query the same way; only their
+    /// memory and lookup cost differ.
+    #[test]
+    fn the_two_column_layouts_agree_on_every_lookup() {
+        let (rows, cols) = (400usize, 6usize);
+        // Columns of very different density, so a middling threshold splits
+        // them between the two layouts.
+        let x: Vec<f32> = (0..rows * cols)
+            .map(|i| {
+                let (r, c) = (i / cols, i % cols);
+                if (r * (c + 1)) % (c + 2) == 0 { ((i * 37) % 97) as f32 } else { f32::NAN }
+            })
+            .collect();
+        let d = DMatrix::from_dense(&x, rows, cols, f32::NAN).unwrap();
+        let cuts = build_cuts(&d, 32).unwrap();
+
+        // 0 forces every column dense, 1 forces every partly-missing column
+        // sparse, and the default splits them.
+        let all_dense = build_gradient_index_with(&d, &cuts, 0.0).unwrap();
+        let all_sparse = build_gradient_index_with(&d, &cuts, 1.0).unwrap();
+        let mixed = build_gradient_index_with(&d, &cuts, 0.5).unwrap();
+
+        assert_eq!(all_dense.sparse_columns(), 0, "threshold 0 keeps every column dense");
+        assert!(all_sparse.sparse_columns() > 0, "threshold 1 stores sparse columns sparsely");
+        assert!(
+            mixed.sparse_columns() > 0 && mixed.sparse_columns() < cols,
+            "0.5 should split the columns between the layouts, got {}",
+            mixed.sparse_columns()
+        );
+
+        for f in 0..cols as u32 {
+            for r in 0..rows {
+                let expected = all_dense.columns.get(f, r);
+                assert_eq!(all_sparse.columns.get(f, r), expected, "feature {f} row {r}");
+                assert_eq!(mixed.columns.get(f, r), expected, "feature {f} row {r}");
+            }
+        }
+    }
+
+    /// The sparse layout exists to save memory, so it must actually do so.
+    #[test]
+    fn a_sparse_column_layout_is_smaller() {
+        let (rows, cols) = (500usize, 4usize);
+        // Every column is mostly missing.
+        let x: Vec<f32> = (0..rows * cols)
+            .map(|i| if i % 10 == 0 { (i % 50) as f32 } else { f32::NAN })
+            .collect();
+        let d = DMatrix::from_dense(&x, rows, cols, f32::NAN).unwrap();
+        let cuts = build_cuts(&d, 32).unwrap();
+
+        let dense = build_gradient_index_with(&d, &cuts, 0.0).unwrap();
+        let sparse = build_gradient_index_with(&d, &cuts, 1.0).unwrap();
+        assert!(
+            sparse.column_size_bytes() < dense.column_size_bytes(),
+            "sparse columns should cost less: {} vs {}",
+            sparse.column_size_bytes(),
+            dense.column_size_bytes()
+        );
+    }
+
+    /// A fully populated column is never worth storing sparsely, whatever the
+    /// threshold: the rule compares against `sparse_threshold * n_rows`, and a
+    /// full column is never below that for a threshold of at most 1.
+    #[test]
+    fn a_full_column_always_stays_dense() {
+        let vals: Vec<f32> = (0..300).map(|i| (i % 17) as f32).collect();
+        let d = DMatrix::from_dense(&vals, 100, 3, f32::NAN).unwrap();
+        let cuts = build_cuts(&d, 16).unwrap();
+        for threshold in [0.0f64, 0.2, 0.5, 1.0] {
+            let gi = build_gradient_index_with(&d, &cuts, threshold).unwrap();
+            assert_eq!(gi.sparse_columns(), 0, "threshold {threshold}");
+        }
     }
 
     #[test]

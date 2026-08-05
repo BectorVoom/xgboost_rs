@@ -131,6 +131,12 @@ impl Learner {
         self.obj.as_ref()
     }
 
+    /// The configured `seed`, for the paths that need a reproducible draw
+    /// without advancing the session engine.
+    pub fn seed(&self) -> i64 {
+        self.ctx.seed
+    }
+
     /// The configured metrics, in evaluation order.
     pub fn metrics(&self) -> &[Box<dyn Metric>] {
         &self.metrics

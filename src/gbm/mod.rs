@@ -333,8 +333,11 @@ impl GBTree {
             Some(TreeUpdaterName::GrowHistMaker) => {}
             Some(_) if self.gindex.is_none() => {
                 let cuts = crate::data::cuts::build_cuts(dtrain, self.param.max_bin)?;
-                self.gindex =
-                    Some(crate::data::gradient_index::build_gradient_index(dtrain, &cuts)?);
+                self.gindex = Some(crate::data::gradient_index::build_gradient_index_with(
+                    dtrain,
+                    &cuts,
+                    self.param.sparse_threshold,
+                )?);
             }
             Some(_) => {}
             // `process_type=update` has no grower: it rewrites existing trees.
@@ -355,28 +358,37 @@ impl GBTree {
     /// of DART is that a round's gradients are the residuals of a *thinned*
     /// ensemble. A no-op for `gbtree`.
     pub fn pre_boost(&mut self, ctx: &mut Context, dtrain: &DMatrix, preds: &mut [f32]) {
-        self.dropped.clear();
-        let Some(dart) = self.dart else { return };
+        self.dropped = self.choose_dropped(ctx.rng());
+        self.remove_trees(&self.dropped.clone(), dtrain, preds);
+    }
+
+    /// `Dart::DropTrees` — pick the trees this round leaves out.
+    ///
+    /// Empty for `gbtree`, for an empty ensemble, and whenever `skip_drop`
+    /// fires.
+    fn choose_dropped(&self, rng: &mut crate::rng::Mt19937) -> Vec<usize> {
+        let mut dropped = Vec::new();
+        let Some(dart) = self.dart else { return dropped };
         if self.model.trees.is_empty() {
-            return;
+            return dropped;
         }
 
         // `skip_drop` skips the whole dropout for this round.
-        if dart.skip_drop > 0.0 && (ctx.rng().next_f64() as f32) < dart.skip_drop {
-            return;
+        if dart.skip_drop > 0.0 && (rng.next_f64() as f32) < dart.skip_drop {
+            return dropped;
         }
 
         let n = self.model.trees.len();
         match dart.sample_type {
             DartSampleType::Uniform => {
                 for i in 0..n {
-                    if (ctx.rng().next_f64() as f32) < dart.rate_drop {
-                        self.dropped.push(i);
+                    if (rng.next_f64() as f32) < dart.rate_drop {
+                        dropped.push(i);
                     }
                 }
-                if dart.one_drop && self.dropped.is_empty() {
-                    let pick = (ctx.rng().next_f64() * n as f64) as usize;
-                    self.dropped.push(pick.min(n - 1));
+                if dart.one_drop && dropped.is_empty() {
+                    let pick = (rng.next_f64() * n as f64) as usize;
+                    dropped.push(pick.min(n - 1));
                 }
             }
             DartSampleType::Weighted => {
@@ -384,14 +396,14 @@ impl GBTree {
                 if sum_weight > RT_EPS {
                     for i in 0..n {
                         let p = dart.rate_drop * n as f32 * self.model.weight_of(i) / sum_weight;
-                        if (ctx.rng().next_f64() as f32) < p {
-                            self.dropped.push(i);
+                        if (rng.next_f64() as f32) < p {
+                            dropped.push(i);
                         }
                     }
-                    if dart.one_drop && self.dropped.is_empty() {
+                    if dart.one_drop && dropped.is_empty() {
                         // A weight-proportional draw, the discrete
                         // distribution upstream falls back to.
-                        let target = ctx.rng().next_f64() as f32 * sum_weight;
+                        let target = rng.next_f64() as f32 * sum_weight;
                         let mut acc = 0.0f32;
                         let mut pick = n - 1;
                         for i in 0..n {
@@ -401,30 +413,51 @@ impl GBTree {
                                 break;
                             }
                         }
-                        self.dropped.push(pick);
+                        dropped.push(pick);
                     }
                 } else {
                     // Every weight has decayed to nothing: fall back to uniform.
                     for i in 0..n {
-                        if (ctx.rng().next_f64() as f32) < dart.rate_drop {
-                            self.dropped.push(i);
+                        if (rng.next_f64() as f32) < dart.rate_drop {
+                            dropped.push(i);
                         }
                     }
                 }
             }
         }
+        dropped
+    }
 
-        // Take the dropped trees back out of the running prediction.
+    /// Subtract the named trees' contributions from `preds`.
+    fn remove_trees(&self, trees: &[usize], dmat: &DMatrix, preds: &mut [f32]) {
         let n_groups = self.model.num_output_group.max(1);
-        for &t in &self.dropped {
+        for &t in trees {
             let tree = &self.model.trees[t];
             let group = self.model.group_of(t);
             let weight = self.model.weight_of(t);
-            for r in 0..dtrain.num_row() {
-                let leaf = tree.leaf_index(|f| feature_value(dtrain, r, f));
+            for r in 0..dmat.num_row() {
+                let leaf = tree.leaf_index(|f| feature_value(dmat, r, f));
                 preds[r * n_groups + group] -= weight * tree.nodes[leaf].value;
             }
         }
+    }
+
+    /// Apply a DART dropout to an already-computed margin, which is what a
+    /// prediction asked for with `training = true` wants: the thinned ensemble
+    /// a training round would see, not the full one.
+    ///
+    /// A no-op for `gbtree`, which drops nothing. The draw is seeded from
+    /// `seed` rather than the session engine, so repeating the call repeats the
+    /// answer — a prediction is not a round, and must not advance the state a
+    /// later round depends on.
+    pub fn apply_training_dropout(&self, seed: u32, dmat: &DMatrix, preds: &mut [f32]) -> usize {
+        if self.dart.is_none() {
+            return 0;
+        }
+        let mut rng = crate::rng::Mt19937::new(seed);
+        let dropped = self.choose_dropped(&mut rng);
+        self.remove_trees(&dropped, dmat, preds);
+        dropped.len()
     }
 
     /// Run one round of the updater pipeline and fold its output into
@@ -589,7 +622,7 @@ impl GBTree {
             // re-sketching would give the same cuts, and upstream skips it too.
             if !(self.constant_hessian && self.gindex.is_some()) {
                 self.gindex =
-                    Some(build_approx_index(dtrain, self.param.max_bin, &group_gpair)?);
+                    Some(build_approx_index(dtrain, &self.param, &group_gpair)?);
             }
 
             let param = &self.param;
@@ -717,14 +750,14 @@ impl GBTree {
 /// which drops it from the quantiles as well as from the histograms.
 fn build_approx_index(
     dtrain: &DMatrix,
-    max_bin: u32,
+    param: &TrainParam,
     gpair: &[GradientPair],
 ) -> crate::Result<GHistIndex> {
     let info = dtrain.info();
     let weights: Vec<f32> =
         gpair.iter().enumerate().map(|(r, g)| g.hess * info.weight(r)).collect();
-    let cuts = crate::data::cuts::build_cuts_weighted(dtrain, max_bin, Some(&weights))?;
-    crate::data::gradient_index::build_gradient_index(dtrain, &cuts)
+    let cuts = crate::data::cuts::build_cuts_weighted(dtrain, param.max_bin, Some(&weights))?;
+    crate::data::gradient_index::build_gradient_index_with(dtrain, &cuts, param.sparse_threshold)
 }
 
 /// The grower a round runs, chosen by the pipeline's first non-modifying

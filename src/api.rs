@@ -73,6 +73,38 @@ impl Booster {
         Ok(crate::predictor::predict_leaf(model, dmat, self.all_trees()))
     }
 
+    /// Apply DART's dropout to a margin when the caller asked for a
+    /// training-time prediction.
+    ///
+    /// This is the `training` flag: a DART model predicts from a *thinned*
+    /// ensemble while it is being fitted, and a caller computing its own
+    /// gradients needs the same thinned prediction the training loop uses. For
+    /// `gbtree` there is nothing to drop and the flag changes nothing, which is
+    /// also what upstream does.
+    ///
+    /// The draw is seeded from the configured `seed` and the ensemble size, not
+    /// from the session engine: predicting must be repeatable and must not
+    /// consume randomness a later round depends on. That makes the dropped set
+    /// a deterministic function of the model rather than the same sequence
+    /// upstream's engine would produce.
+    fn apply_training_dropout(
+        &self,
+        params: &PredictParameters,
+        dmat: &DMatrix,
+        values: &mut [f32],
+    ) {
+        if !params.training {
+            return;
+        }
+        let Some(tree) = self.learner.booster().tree() else { return };
+        let seed = self
+            .learner
+            .seed()
+            .wrapping_mul(crate::context::RAND_SEED_MAGIC)
+            .wrapping_add(self.boosted_rounds() as i64) as u32;
+        tree.apply_training_dropout(seed, dmat, values);
+    }
+
     /// The tree ensemble, or an error naming the booster that has none.
     fn tree_model(&self) -> Result<&crate::gbm::GBTree> {
         self.learner.gbm().ok_or_else(|| {
@@ -116,13 +148,15 @@ impl Booster {
         Ok(match params.predict_type {
             PredictionType::Value => {
                 let mut values = self.learner.predict_margin(dmat, trees);
+                self.apply_training_dropout(params, dmat, &mut values);
                 self.learner.objective().pred_transform(&mut values);
                 // `multi:softmax` collapses its groups into one class index.
                 let stride = values.len() / n_rows.max(1);
                 Prediction { values, shape: shape_for_value(n_rows, stride, params.strict_shape) }
             }
             PredictionType::Margin => {
-                let values = self.learner.predict_margin(dmat, trees);
+                let mut values = self.learner.predict_margin(dmat, trees);
+                self.apply_training_dropout(params, dmat, &mut values);
                 Prediction {
                     values,
                     shape: shape_for_value(n_rows, n_groups, params.strict_shape),
@@ -779,9 +813,12 @@ fn unused_parameters(
         if tree.debug_synchronize {
             unused.push("debug_synchronize".to_owned());
         }
-        // `sparse_threshold` selects between two `hist` column layouts that
-        // differ only in speed; this crate keeps one.
-        if tree.sparse_threshold != default.sparse_threshold {
+        // `sparse_threshold` picks the column layout the row partitioner
+        // reads, which only the histogram updaters use.
+        if !uses(TreeUpdaterName::GrowQuantileHistMaker)
+            && !uses(TreeUpdaterName::GrowHistMaker)
+            && tree.sparse_threshold != default.sparse_threshold
+        {
             unused.push("sparse_threshold".to_owned());
         }
     }
@@ -821,6 +858,7 @@ fn train_param(tree: &TreeBoosterParameters, device: Device) -> Result<TrainPara
         monotone_constraints: tree.monotone_constraints.clone(),
         interaction_constraints: tree.interaction_constraints.clone(),
         max_cached_hist_node: tree.max_cached_hist_nodes(Device::Cpu),
+        sparse_threshold: tree.sparse_threshold,
         max_cat_to_onehot: tree.max_cat_to_onehot,
         max_cat_threshold: tree.max_cat_threshold,
         default_direction: tree.default_direction,

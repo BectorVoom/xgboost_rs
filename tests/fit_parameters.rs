@@ -725,3 +725,40 @@ fn auto_and_hist_are_the_same_fit() {
     );
     assert_eq!(auto.save_model(), hist.save_model());
 }
+
+/// `sparse_threshold` picks how each column is stored in the transposed copy
+/// the row partitioner reads. It is a memory/speed trade, so every setting must
+/// reach the fit and produce *the same* model.
+#[test]
+fn sparse_threshold_changes_the_layout_but_not_the_model() {
+    // A matrix with columns of very different density, so the threshold has
+    // something to choose between.
+    let (rows, cols) = (600usize, 8usize);
+    let x: Vec<f32> = (0..rows * cols)
+        .map(|i| {
+            let (r, c) = (i / cols, i % cols);
+            if (r * 7 + c) % (c + 2) == 0 { ((i * 31) % 89) as f32 / 89.0 } else { f32::NAN }
+        })
+        .collect();
+    let mut d = DMatrix::from_dense(&x, rows, cols, f32::NAN).unwrap();
+    let y: Vec<f32> = (0..rows).map(|r| ((r % 13) as f32) / 13.0).collect();
+    d.set_labels(&y).unwrap();
+
+    let fit = |threshold: f64| {
+        let tree = TreeBoosterParameters::builder()
+            .sparse_threshold(threshold)
+            .max_depth(5)
+            .build()
+            .unwrap();
+        train(&params(tree, 10), &d).save_model()
+    };
+
+    let baseline = fit(0.0);
+    for threshold in [0.2f64, 0.5, 0.9, 1.0] {
+        assert_eq!(
+            baseline,
+            fit(threshold),
+            "sparse_threshold={threshold} changed the model; it must only change storage"
+        );
+    }
+}

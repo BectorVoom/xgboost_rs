@@ -55,6 +55,11 @@ pub struct TrainParam {
     /// deep or wide tree holds; it changes speed, never the model.
     pub max_cached_hist_node: u64,
 
+    /// Density below which a column is stored sparsely in the transposed copy
+    /// the row partitioner reads. Trades lookup speed for memory; it changes
+    /// neither the split search nor the model.
+    pub sparse_threshold: f64,
+
     /// Category count below which a categorical feature is split one-hot —
     /// "equals this category" — instead of by partitioning the categories.
     pub max_cat_to_onehot: u32,
@@ -99,6 +104,7 @@ impl Default for TrainParam {
             interaction_constraints: None,
             // `HistMakerTrainParam::CpuDefaultNodes`.
             max_cached_hist_node: 1 << 16,
+            sparse_threshold: 0.2,
             max_cat_to_onehot: 4,
             max_cat_threshold: 64,
             default_direction: DefaultDirection::Learn,
