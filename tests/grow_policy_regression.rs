@@ -82,27 +82,25 @@ fn model(grow_policy: GrowPolicy, max_depth: u32, max_leaves: u32) -> String {
 #[test]
 fn depthwise_models_are_unchanged() {
     for (max_depth, max_leaves, expected) in [
-        (6u32, 0u32, "DEPTH_6"),
-        (0, 32, "DEPTH_0_LEAVES_32"),
-        (8, 64, "DEPTH_8_LEAVES_64"),
+        (6u32, 0u32, "f3dd2c94663b81b8"),
+        (0, 32, "20c52842a9329002"),
+        (8, 64, "7d88de5acacc1246"),
     ] {
         let got = digest(&model(GrowPolicy::DepthWise, max_depth, max_leaves));
-        println!("DEPTHWISE {max_depth} {max_leaves} {got}");
-        let _ = expected;
+        assert_eq!(got, expected, "depthwise depth={max_depth} leaves={max_leaves}");
     }
 }
 
 #[test]
 fn lossguide_models_are_unchanged() {
     for (max_depth, max_leaves, expected) in [
-        (0u32, 16u32, "LOSS_LEAVES_16"),
-        (0, 64, "LOSS_LEAVES_64"),
-        (0, 256, "LOSS_LEAVES_256"),
-        (6, 64, "LOSS_DEPTH_6_LEAVES_64"),
+        (0u32, 16u32, "68aaf5131424dc52"),
+        (0, 64, "211d6c73e74dc0d4"),
+        (0, 256, "66c9527d1b53c2e4"),
+        (6, 64, "e3dd3764cba26a52"),
     ] {
         let got = digest(&model(GrowPolicy::LossGuide, max_depth, max_leaves));
-        println!("LOSSGUIDE {max_depth} {max_leaves} {got}");
-        let _ = expected;
+        assert_eq!(got, expected, "lossguide depth={max_depth} leaves={max_leaves}");
     }
 }
 

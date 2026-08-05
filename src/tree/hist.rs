@@ -28,26 +28,25 @@
 //! never on the thread count, so a model trained on 1 core and on 32 cores is
 //! bit-identical.
 //!
-//! # Why `lossguide` scales worse than `depthwise`
+//! # Parallelism across growth policies
 //!
-//! Measured on 200k x 40, 64 leaves: single-threaded the two policies are
-//! within ~12% of each other, but on 8 threads `depthwise` speeds up 2.4x and
-//! `lossguide` only 1.7x. The cause is the lane rule above. `depthwise`
-//! expands a whole level at once, so even when every node is too small for a
-//! second lane there are many nodes to build concurrently. `lossguide` expands
-//! one node at a time, and a node with fewer than `BLOCK_ROWS` rows gets a
-//! single lane — so its histogram is built on one thread while the rest idle.
-//! The effect shrinks as rows grow and nodes get big enough to earn lanes:
-//! the same fit speeds up 1.45x at 50k rows, 1.71x at 200k and 2.18x at 1M.
+//! Queue selection itself is policy-specific and cheap: monotonically allocated
+//! node ids make `depthwise` a FIFO, while `lossguide` uses a gain-ordered heap.
+//! This keeps queue work linear or `O(n log n)` as `max_leaves` grows instead of
+//! repeatedly scanning and shifting a flat pending-node vector.
 //!
-//! Closing that gap means giving small nodes more lanes, which means changing
-//! the block size, which changes the order the `f64` bin sums accumulate in —
-//! and that is part of the model, not an implementation detail. It was tried:
-//! dropping `BLOCK_ROWS` to 512 bought only ~6% even with the model free to
-//! move, so the gap is mostly memory bandwidth rather than idle threads, and
-//! is not worth the bit-exactness. Two other attempts measured as no better
-//! or worse: chunking the split-evaluation task list into fatter rayon jobs,
-//! and spreading a single node's histogram zeroing across threads.
+//! `depthwise` expands a whole level, so small nodes naturally run concurrently.
+//! `lossguide` expands one node at a time; when that node has fewer row lanes
+//! than workers, its dense histogram is additionally divided into contiguous,
+//! disjoint feature groups. Every feature stays in one task and visits rows in
+//! the same order as the ordinary row-major kernel, so this uses otherwise idle
+//! workers without changing a bin's floating-point addition sequence.
+//!
+//! Lowering `BLOCK_ROWS` would also create more work, but it changes the order
+//! the `f64` partial histograms are reduced in and therefore changes the model.
+//! The feature-group fallback is deliberately limited to dense lossguide nodes
+//! with enough bin updates to repay nested task setup; sparse data and
+//! depth-wise batches keep the cache-friendly row-lane kernel.
 
 use super::cat;
 use super::column_sampler::{ColumnSampler, FeatureSet};
@@ -55,12 +54,14 @@ use super::evaluator::{InteractionConstraints, SplitEvaluator};
 use super::model::RegTree;
 use super::param::{GradStats, GrowPolicy, RT_EPS, SplitEntry, TrainParam, calc_weight};
 use crate::context::Context;
-use crate::data::gradient_index::{GHistIndex, dispatch_bins};
+use crate::data::gradient_index::{DenseColumn, GHistIndex, dispatch_bins};
 use crate::data::DMatrix;
 use crate::objective::GradientPair;
 use crate::rng::Mt19937;
 use crate::threading;
 use rayon::prelude::*;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, VecDeque};
 
 /// Rows per histogram block. Large enough to amortise per-block overhead,
 /// small enough that lanes stay balanced.
@@ -72,8 +73,13 @@ const LANE_BUDGET: usize = 16 << 20;
 /// Nodes below this size are partitioned serially; the parallel path costs more
 /// than it saves.
 const PARALLEL_PARTITION_MIN: usize = 1 << 15;
+/// Minimum bin updates before nested feature-group parallelism pays for its
+/// task setup on a lossguide node with too few row lanes.
+const FEATURE_GROUP_MIN_UPDATES: usize = 1 << 15;
 /// Bins per task when reducing or subtracting histograms.
 const REDUCE_CHUNK_BINS: usize = 2048;
+/// Maximum number of nodes expanded together by the depth-wise policy.
+const MAX_NODE_BATCH_SIZE: usize = 256;
 
 /// A bin index stored in the compressed feature matrix.
 pub(crate) trait BinIdx: Copy + Send + Sync {
@@ -133,6 +139,104 @@ impl ExpandEntry {
     }
 }
 
+/// Heap wrapper whose maximum is the loss-guide candidate expanded next.
+///
+/// Split gains entering the queue are finite and positive. `total_cmp` still
+/// gives the heap a complete ordering, while reversing the node-id comparison
+/// preserves upstream's smaller-id tie break.
+#[derive(Debug)]
+struct LossGuideEntry(ExpandEntry);
+
+impl PartialEq for LossGuideEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for LossGuideEntry {}
+
+impl PartialOrd for LossGuideEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for LossGuideEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0
+            .split
+            .loss_chg
+            .total_cmp(&other.0.split.loss_chg)
+            .then_with(|| other.0.nid.cmp(&self.0.nid))
+    }
+}
+
+/// Policy-specific expansion queue.
+///
+/// Tree node ids are allocated monotonically, so depth-wise growth is a FIFO:
+/// new children always follow every node already waiting. Loss-guide needs a
+/// real priority queue because every child can have a different gain.
+enum ExpandQueue {
+    DepthWise(VecDeque<ExpandEntry>),
+    LossGuide(BinaryHeap<LossGuideEntry>),
+}
+
+impl ExpandQueue {
+    fn new(policy: GrowPolicy) -> Self {
+        match policy {
+            GrowPolicy::DepthWise => Self::DepthWise(VecDeque::new()),
+            GrowPolicy::LossGuide => Self::LossGuide(BinaryHeap::new()),
+        }
+    }
+
+    fn push(&mut self, entry: ExpandEntry) {
+        match self {
+            Self::DepthWise(queue) => {
+                debug_assert!(queue.back().is_none_or(|last| last.nid < entry.nid));
+                queue.push_back(entry);
+            }
+            Self::LossGuide(queue) => queue.push(LossGuideEntry(entry)),
+        }
+    }
+
+    /// Fill `out` with the next expansion batch, retaining its allocation for
+    /// the next call. This is one entry for loss-guide and up to 256 entries
+    /// from one level for depth-wise growth.
+    fn pop_batch(
+        &mut self,
+        param: &TrainParam,
+        num_leaves: &mut i32,
+        out: &mut Vec<ExpandEntry>,
+    ) {
+        out.clear();
+        match self {
+            Self::LossGuide(queue) => {
+                let Some(LossGuideEntry(entry)) = queue.pop() else {
+                    return;
+                };
+                if entry.is_valid(param, *num_leaves) {
+                    *num_leaves += 1;
+                    out.push(entry);
+                }
+            }
+            Self::DepthWise(queue) => {
+                let Some(level) = queue.front().map(|entry| entry.depth) else {
+                    return;
+                };
+                while out.len() < MAX_NODE_BATCH_SIZE
+                    && queue.front().is_some_and(|entry| entry.depth == level)
+                {
+                    let entry = queue.pop_front().expect("front entry was present");
+                    if entry.is_valid(param, *num_leaves) {
+                        *num_leaves += 1;
+                        out.push(entry);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Node statistics carried alongside the tree during growth.
 #[derive(Clone, Copy, Debug, Default)]
 struct NodeEntry {
@@ -146,6 +250,8 @@ struct Partitioner {
     /// `(begin, end)` into `row_indices` for each node id, if live.
     segments: Vec<Option<(usize, usize)>>,
     scratch: Vec<u32>,
+    /// One cached left/right decision per row while a large node is partitioned.
+    decisions: Vec<u8>,
 }
 
 /// One node's partitioning job.
@@ -162,12 +268,22 @@ struct SplitTask {
     cat_bits: Vec<u32>,
 }
 
+type PartitionJob<'a> = (usize, &'a mut [u32], &'a mut [u32], &'a mut [u8]);
+type PartitionWork<'task, 'data, 'out> = (
+    &'task SplitTask,
+    &'data mut [u32],
+    &'data mut [u32],
+    &'data mut [u8],
+    &'out mut usize,
+);
+
 impl Partitioner {
     fn new(num_row: usize) -> Self {
         Self {
             row_indices: (0..num_row as u32).collect(),
             segments: vec![Some((0, num_row))],
             scratch: vec![0; num_row],
+            decisions: vec![0; num_row],
         }
     }
 
@@ -176,6 +292,8 @@ impl Partitioner {
         self.row_indices.extend(0..num_row as u32);
         self.segments.clear();
         self.segments.push(Some((0, num_row)));
+        self.scratch.resize(num_row, 0);
+        self.decisions.resize(num_row, 0);
     }
 
     #[inline]
@@ -214,17 +332,21 @@ impl Partitioner {
 
         let mut src_rest: &mut [u32] = &mut self.row_indices;
         let mut dst_rest: &mut [u32] = &mut self.scratch;
+        let mut decision_rest: &mut [u8] = &mut self.decisions;
         let mut consumed = 0usize;
-        let mut jobs: Vec<(usize, &mut [u32], &mut [u32])> = Vec::with_capacity(ranges.len());
+        let mut jobs: Vec<PartitionJob<'_>> = Vec::with_capacity(ranges.len());
         for &(begin, end, task_idx) in &ranges {
             let (_, s_tail) = src_rest.split_at_mut(begin - consumed);
             let (_, d_tail) = dst_rest.split_at_mut(begin - consumed);
+            let (_, decision_tail) = decision_rest.split_at_mut(begin - consumed);
             let (s_here, s_tail) = s_tail.split_at_mut(end - begin);
             let (d_here, d_tail) = d_tail.split_at_mut(end - begin);
+            let (decision_here, decision_tail) = decision_tail.split_at_mut(end - begin);
             src_rest = s_tail;
             dst_rest = d_tail;
+            decision_rest = decision_tail;
             consumed = end;
-            jobs.push((task_idx, s_here, d_here));
+            jobs.push((task_idx, s_here, d_here, decision_here));
         }
 
         let mut n_left = vec![0usize; tasks.len()];
@@ -235,15 +357,14 @@ impl Partitioner {
             for (i, v) in slots {
                 by_task[i] = Some(v);
             }
-            let mut work: Vec<(&SplitTask, &mut [u32], &mut [u32], &mut usize)> =
-                Vec::with_capacity(jobs.len());
-            for (task_idx, src, dst) in jobs {
+            let mut work: Vec<PartitionWork<'_, '_, '_>> = Vec::with_capacity(jobs.len());
+            for (task_idx, src, dst, decisions) in jobs {
                 let out = by_task[task_idx].take().expect("each task appears once");
-                work.push((&tasks[task_idx], src, dst, out));
+                work.push((&tasks[task_idx], src, dst, decisions, out));
             }
-            work.into_par_iter().for_each(|(task, src, dst, out)| {
+            work.into_par_iter().for_each(|(task, src, dst, decisions, out)| {
                 *out = if src.len() >= PARALLEL_PARTITION_MIN {
-                    partition_blocked(src, dst, task, gi)
+                    partition_blocked(src, dst, decisions, task, gi)
                 } else {
                     let n = partition_block(src, dst, task, gi);
                     src.copy_from_slice(dst);
@@ -270,17 +391,38 @@ impl Partitioner {
 fn partition_blocked(
     src: &mut [u32],
     dst: &mut [u32],
+    decisions: &mut [u8],
     task: &SplitTask,
     gi: &GHistIndex,
 ) -> usize {
+    debug_assert_eq!(src.len(), decisions.len());
     let n_blocks = src.len().div_ceil(BLOCK_ROWS);
 
-    let mut left_counts: Vec<usize> = vec![0; n_blocks];
-    left_counts.par_iter_mut().enumerate().for_each(|(b, count)| {
-        let lo = b * BLOCK_ROWS;
-        let hi = ((b + 1) * BLOCK_ROWS).min(src.len());
-        *count = src[lo..hi].iter().filter(|&&rid| goes_left(rid, task, gi)).count();
-    });
+    // Cache routing decisions during the counting pass. The scatter pass used
+    // to call `goes_left` again, repeating the feature-column lookup for every
+    // row in every large node.
+    let left_counts = match gi.columns.dense_column(task.fidx) {
+        Some((DenseColumn::U8(bins), missing)) if task.cat_bits.is_empty() => {
+            dense_numeric_decisions(decisions, src, bins, missing, task)
+        }
+        Some((DenseColumn::U16(bins), missing)) if task.cat_bits.is_empty() => {
+            dense_numeric_decisions(decisions, src, bins, missing, task)
+        }
+        Some((DenseColumn::U32(bins), missing)) if task.cat_bits.is_empty() => {
+            dense_numeric_decisions(decisions, src, bins, missing, task)
+        }
+        _ => decisions
+            .par_chunks_mut(BLOCK_ROWS)
+            .zip(src.par_chunks(BLOCK_ROWS))
+            .map(|(flags, rows)| {
+                flags.iter_mut().zip(rows).fold(0usize, |count, (flag, &rid)| {
+                    let left = goes_left(rid, task, gi);
+                    *flag = u8::from(left);
+                    count + usize::from(left)
+                })
+            })
+            .collect(),
+    };
     let n_left: usize = left_counts.iter().sum();
 
     // Each block owns one contiguous slice on each side, handed out as disjoint
@@ -303,19 +445,75 @@ fn partition_blocked(
         let lo = b * BLOCK_ROWS;
         let hi = ((b + 1) * BLOCK_ROWS).min(src_ro.len());
         let (mut li, mut ri) = (0usize, 0usize);
-        for &rid in &src_ro[lo..hi] {
-            if goes_left(rid, task, gi) {
-                l_out[li] = rid;
+        for (&rid, &left) in src_ro[lo..hi].iter().zip(&decisions[lo..hi]) {
+            if left != 0 {
+                debug_assert!(li < l_out.len());
+                // SAFETY: `l_out` was sized from this block's cached count.
+                unsafe { *l_out.get_unchecked_mut(li) = rid };
                 li += 1;
             } else {
-                r_out[ri] = rid;
+                debug_assert!(ri < r_out.len());
+                // SAFETY: the complementary count sized `r_out` exactly.
+                unsafe { *r_out.get_unchecked_mut(ri) = rid };
                 ri += 1;
             }
         }
+        debug_assert_eq!(li, l_out.len());
+        debug_assert_eq!(ri, r_out.len());
     });
 
     src.copy_from_slice(dst);
     n_left
+}
+
+/// Route a dense numerical column after dispatching its bin width once.
+fn dense_numeric_decisions<T>(
+    decisions: &mut [u8],
+    rows: &[u32],
+    bins: &[T],
+    missing: u32,
+    task: &SplitTask,
+) -> Vec<usize>
+where
+    T: Copy + Into<u32> + Sync,
+{
+    if missing == u32::MAX {
+        decisions
+            .par_chunks_mut(BLOCK_ROWS)
+            .zip(rows.par_chunks(BLOCK_ROWS))
+            .map(|(flags, rows)| {
+                flags.iter_mut().zip(rows).fold(0usize, |count, (flag, &rid)| {
+                    debug_assert!((rid as usize) < bins.len());
+                    // SAFETY: the column has one bin per matrix row, and row
+                    // ids originate from `0..num_row`.
+                    let bin: u32 = unsafe { (*bins.get_unchecked(rid as usize)).into() };
+                    let left = (bin as i64) <= task.local_cond;
+                    *flag = u8::from(left);
+                    count + usize::from(left)
+                })
+            })
+            .collect()
+    } else {
+        decisions
+            .par_chunks_mut(BLOCK_ROWS)
+            .zip(rows.par_chunks(BLOCK_ROWS))
+            .map(|(flags, rows)| {
+                flags.iter_mut().zip(rows).fold(0usize, |count, (flag, &rid)| {
+                    debug_assert!((rid as usize) < bins.len());
+                    // SAFETY: as above; this branch additionally handles the
+                    // dense missing-value sentinel.
+                    let bin: u32 = unsafe { (*bins.get_unchecked(rid as usize)).into() };
+                    let left = if bin == missing {
+                        task.default_left
+                    } else {
+                        (bin as i64) <= task.local_cond
+                    };
+                    *flag = u8::from(left);
+                    count + usize::from(left)
+                })
+            })
+            .collect()
+    }
 }
 
 /// Serial partition of one node, used by the small-node path.
@@ -442,13 +640,6 @@ impl HistCollection {
 }
 
 /// Accumulate one block of dense rows into `hist`.
-///
-/// Every bin index is in range by construction — a dense entry holds a
-/// feature-local bin `< feature_bins(f)`, and `offsets[f] + feature_bins(f) ==
-/// cut_ptrs[f + 1] <= total_bins == hist.len()`, which
-/// `histogram_kernels_stay_in_bounds` pins down. Skipping the bounds check
-/// anyway was measured and made no difference: the loop is bound by memory
-/// latency on the scattered `hist` updates, not by the compare.
 #[inline]
 fn build_dense<T: BinIdx>(
     hist: &mut [GradStats],
@@ -460,16 +651,118 @@ fn build_dense<T: BinIdx>(
 ) {
     debug_assert_eq!(offsets.len(), stride);
     for &rid in rows {
-        let g = gpair[rid as usize];
+        let rid = rid as usize;
+        debug_assert!(rid < gpair.len());
+        debug_assert!(rid.checked_mul(stride).is_some_and(|base| base + stride <= index.len()));
+
+        // SAFETY: row ids originate as `0..num_row` in `Partitioner`; a dense
+        // gradient index stores exactly `stride` bins for every row. Cut
+        // offsets turn each feature-local bin into a global bin below
+        // `hist.len()` (covered by `histogram_kernels_stay_in_bounds`). Avoiding
+        // these repeated checks matters because this is the training hot loop.
+        let g = unsafe { *gpair.get_unchecked(rid) };
         let (gd, hd) = (g.grad as f64, g.hess as f64);
-        let base = rid as usize * stride;
-        let row = &index[base..base + stride];
-        for (off, bin) in offsets.iter().zip(row) {
-            let cell = &mut hist[*off as usize + bin.idx()];
+        let base = rid * stride;
+        for feature in 0..stride {
+            // SAFETY: justified by the invariants above.
+            let bin = unsafe { (*index.get_unchecked(base + feature)).idx() };
+            let off = unsafe { *offsets.get_unchecked(feature) as usize };
+            let cell = unsafe { hist.get_unchecked_mut(off + bin) };
             cell.sum_grad += gd;
             cell.sum_hess += hd;
         }
     }
+}
+
+/// Accumulate one row lane using parallel, disjoint groups of features.
+///
+/// Each feature remains in exactly one task, and that task visits the lane's
+/// rows in the same order as [`build_dense`]. The grouping therefore exposes
+/// spare parallelism without changing any bin's floating-point sum order.
+fn build_dense_feature_groups(
+    hist: &mut [GradStats],
+    rows: &[u32],
+    gi: &GHistIndex,
+    gpair: &[GradientPair],
+    first_block: usize,
+    block_step: usize,
+    groups: usize,
+) {
+    dispatch_bins!(&gi.index, |index| build_dense_feature_groups_typed(
+        hist,
+        rows,
+        index,
+        gi.row_stride,
+        &gi.offsets,
+        gpair,
+        first_block,
+        block_step,
+        groups,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_dense_feature_groups_typed<T: BinIdx>(
+    hist: &mut [GradStats],
+    rows: &[u32],
+    index: &[T],
+    stride: usize,
+    offsets: &[u32],
+    gpair: &[GradientPair],
+    first_block: usize,
+    block_step: usize,
+    groups: usize,
+) {
+    let groups = groups.min(stride).max(1);
+    let hist_len = hist.len();
+    let mut rest = hist;
+    let mut consumed = 0usize;
+    let mut tasks = Vec::with_capacity(groups);
+    for group in 0..groups {
+        let first_feature = group * stride / groups;
+        let end_feature = (group + 1) * stride / groups;
+        let begin = offsets[first_feature] as usize;
+        let end = if end_feature < stride {
+            offsets[end_feature] as usize
+        } else {
+            hist_len
+        };
+        debug_assert_eq!(begin, consumed);
+        let (group_hist, tail) = rest.split_at_mut(end - begin);
+        rest = tail;
+        consumed = end;
+        tasks.push((first_feature, end_feature, begin, group_hist));
+    }
+
+    tasks.into_par_iter().for_each(
+        |(first_feature, end_feature, hist_offset, group_hist)| {
+            let n_blocks = rows.len().div_ceil(BLOCK_ROWS);
+            let mut block = first_block;
+            while block < n_blocks {
+                let lo = block * BLOCK_ROWS;
+                let hi = ((block + 1) * BLOCK_ROWS).min(rows.len());
+                for &rid in &rows[lo..hi] {
+                    let rid = rid as usize;
+                    debug_assert!(rid < gpair.len());
+                    debug_assert!(rid * stride + end_feature <= index.len());
+                    let g = unsafe { *gpair.get_unchecked(rid) };
+                    let (gd, hd) = (g.grad as f64, g.hess as f64);
+                    let row_base = rid * stride;
+                    for feature in first_feature..end_feature {
+                        // SAFETY: the same dense-index and global-bin
+                        // invariants as `build_dense` apply. `group_hist`
+                        // covers precisely this task's feature range.
+                        let bin = unsafe { (*index.get_unchecked(row_base + feature)).idx() };
+                        let off = unsafe { *offsets.get_unchecked(feature) as usize };
+                        let cell = unsafe { group_hist.get_unchecked_mut(off - hist_offset + bin) };
+                        cell.sum_grad += gd;
+                        cell.sum_hess += hd;
+                    }
+                }
+                block += block_step;
+            }
+        },
+    );
 }
 
 /// Accumulate one block of sparse rows into `hist`.
@@ -484,10 +777,22 @@ fn build_sparse<T: BinIdx>(
     gpair: &[GradientPair],
 ) {
     for &rid in rows {
-        let g = gpair[rid as usize];
+        let rid = rid as usize;
+        debug_assert!(rid < gpair.len());
+        debug_assert!(rid + 1 < row_ptr.len());
+
+        // SAFETY: `Partitioner` contains only valid row ids. `row_ptr` was
+        // built with one terminal entry, and every stored sparse bin is a
+        // global bin below `hist.len()`; the latter invariant is exercised by
+        // `histogram_kernels_stay_in_bounds`.
+        let g = unsafe { *gpair.get_unchecked(rid) };
         let (gd, hd) = (g.grad as f64, g.hess as f64);
-        for bin in &index[row_ptr[rid as usize]..row_ptr[rid as usize + 1]] {
-            let cell = &mut hist[bin.idx()];
+        let begin = unsafe { *row_ptr.get_unchecked(rid) };
+        let end = unsafe { *row_ptr.get_unchecked(rid + 1) };
+        debug_assert!(begin <= end && end <= index.len());
+        for position in begin..end {
+            let bin = unsafe { (*index.get_unchecked(position)).idx() };
+            let cell = unsafe { hist.get_unchecked_mut(bin) };
             cell.sum_grad += gd;
             cell.sum_hess += hd;
         }
@@ -654,11 +959,16 @@ impl<'a> HistGrower<'a> {
         let mut num_leaves: i32 = 1;
         let root = self.init_root(rng, gpair, tree);
 
-        let mut queue: Vec<ExpandEntry> = Vec::new();
+        let mut queue = ExpandQueue::new(self.param.grow_policy);
         if root.split.loss_chg > RT_EPS {
             queue.push(root);
         }
-        let mut expand_set = self.pop(&mut queue, &mut num_leaves);
+        let batch_capacity = match self.param.grow_policy {
+            GrowPolicy::DepthWise => MAX_NODE_BATCH_SIZE,
+            GrowPolicy::LossGuide => 1,
+        };
+        let mut expand_set = Vec::with_capacity(batch_capacity);
+        queue.pop_batch(self.param, &mut num_leaves, &mut expand_set);
 
         while !expand_set.is_empty() {
             let mut valid_candidates = Vec::new();
@@ -695,7 +1005,7 @@ impl<'a> HistGrower<'a> {
                     queue.push(e);
                 }
             }
-            expand_set = self.pop(&mut queue, &mut num_leaves);
+            queue.pop_batch(self.param, &mut num_leaves, &mut expand_set);
         }
     }
 
@@ -807,67 +1117,6 @@ impl<'a> HistGrower<'a> {
     /// order of those draws is part of what the model is.
     fn feature_sets(&mut self, depths: &[i32], rng: &mut Mt19937) -> Vec<FeatureSet> {
         depths.iter().map(|&depth| self.column_sampler.feature_set(depth, rng)).collect()
-    }
-
-    /// The node batch to expand next, following upstream's `Driver::Pop`.
-    fn pop(&self, queue: &mut Vec<ExpandEntry>, num_leaves: &mut i32) -> Vec<ExpandEntry> {
-        if queue.is_empty() {
-            return Vec::new();
-        }
-        let pick = |q: &Vec<ExpandEntry>| -> usize {
-            match self.param.grow_policy {
-                // Depth-wise: smallest node id first.
-                GrowPolicy::DepthWise => {
-                    let mut best = 0;
-                    for i in 1..q.len() {
-                        if q[i].nid < q[best].nid {
-                            best = i;
-                        }
-                    }
-                    best
-                }
-                // Loss-guide: largest loss change, ties to the smaller node id.
-                GrowPolicy::LossGuide => {
-                    let mut best = 0;
-                    for i in 1..q.len() {
-                        let (a, b) = (&q[i], &q[best]);
-                        if a.split.loss_chg > b.split.loss_chg
-                            || (a.split.loss_chg == b.split.loss_chg && a.nid < b.nid)
-                        {
-                            best = i;
-                        }
-                    }
-                    best
-                }
-            }
-        };
-
-        if self.param.grow_policy == GrowPolicy::LossGuide {
-            let e = queue.remove(pick(queue));
-            return if e.is_valid(self.param, *num_leaves) {
-                *num_leaves += 1;
-                vec![e]
-            } else {
-                Vec::new()
-            };
-        }
-
-        let mut result = Vec::new();
-        let level = queue[pick(queue)].depth;
-        // Cap the batch the way upstream's `max_node_batch_size` does.
-        const MAX_BATCH: usize = 256;
-        while !queue.is_empty() && result.len() < MAX_BATCH {
-            let i = pick(queue);
-            if queue[i].depth != level {
-                break;
-            }
-            let e = queue.remove(i);
-            if e.is_valid(self.param, *num_leaves) {
-                *num_leaves += 1;
-                result.push(e);
-            }
-        }
-        result
     }
 
     fn is_child_valid(&self, parent: &ExpandEntry, num_leaves: i32) -> bool {
@@ -1179,6 +1428,7 @@ impl<'a> HistGrower<'a> {
         self.lane_buf.resize(lane_owner.len() * total_bins, GradStats::default());
         let gi = self.gi;
         let partitioner = &self.partitioner;
+        let feature_groups = self.param.grow_policy == GrowPolicy::LossGuide && gi.is_dense;
         let mut targets: Vec<Vec<GradStats>> =
             nodes.iter().map(|&nid| std::mem::take(&mut self.hist.data[nid * self.n_targets + target])).collect();
 
@@ -1196,7 +1446,16 @@ impl<'a> HistGrower<'a> {
             .filter(|(i, _)| lanes[*i] == 1)
             .for_each(|(i, dst)| {
                 dst.fill(GradStats::default());
-                build_hist(dst, partitioner.rows(nodes[i]), gi, gpair);
+                let rows = partitioner.rows(nodes[i]);
+                let threads = rayon::current_num_threads();
+                if feature_groups
+                    && threads > 1
+                    && rows.len() * gi.row_stride >= FEATURE_GROUP_MIN_UPDATES
+                {
+                    build_dense_feature_groups(dst, rows, gi, gpair, 0, 1, threads);
+                } else {
+                    build_hist(dst, rows, gi, gpair);
+                }
             });
 
         if !lane_owner.is_empty() {
@@ -1209,6 +1468,22 @@ impl<'a> HistGrower<'a> {
                     hist.fill(GradStats::default());
                     let rows = partitioner.rows(nodes[node_idx]);
                     let n_blocks = rows.len().div_ceil(BLOCK_ROWS);
+                    let threads = rayon::current_num_threads();
+                    if feature_groups
+                        && lanes[node_idx] * 2 <= threads
+                        && rows.len() * gi.row_stride >= FEATURE_GROUP_MIN_UPDATES
+                    {
+                        build_dense_feature_groups(
+                            hist,
+                            rows,
+                            gi,
+                            gpair,
+                            local_lane,
+                            lanes[node_idx],
+                            threads.div_ceil(lanes[node_idx]),
+                        );
+                        return;
+                    }
                     let mut b = local_lane;
                     while b < n_blocks {
                         let lo = b * BLOCK_ROWS;
@@ -1738,6 +2013,42 @@ mod tests {
     }
 
     #[test]
+    fn blocked_partition_matches_serial_with_dense_missing_values() {
+        let n = PARALLEL_PARTITION_MIN + 17;
+        let values: Vec<f32> = (0..n)
+            .map(|i| {
+                if i % 7 == 0 { f32::NAN } else { ((i * 37) % 101) as f32 / 101.0 }
+            })
+            .collect();
+        let d = DMatrix::from_dense(&values, n, 1, f32::NAN).unwrap();
+        let cuts = build_cuts(&d, 32).unwrap();
+        let gi = build_gradient_index(&d, &cuts).unwrap();
+        let task = SplitTask {
+            nid: 0,
+            left: 1,
+            right: 2,
+            fidx: 0,
+            local_cond: 15,
+            default_left: true,
+            cat_bits: Vec::new(),
+        };
+
+        let mut serial_src: Vec<u32> = (0..n as u32).rev().collect();
+        let mut serial_dst = vec![0; n];
+        let serial_left = partition_block(&serial_src, &mut serial_dst, &task, &gi);
+        serial_src.copy_from_slice(&serial_dst);
+
+        let mut blocked_src: Vec<u32> = (0..n as u32).rev().collect();
+        let mut blocked_dst = vec![0; n];
+        let mut decisions = vec![0; n];
+        let blocked_left =
+            partition_blocked(&mut blocked_src, &mut blocked_dst, &mut decisions, &task, &gi);
+
+        assert_eq!(blocked_left, serial_left);
+        assert_eq!(blocked_src, serial_src);
+    }
+
+    #[test]
     fn finds_the_obvious_split_and_signs_the_leaves() {
         let (d, gpair) = step_data(64);
         let param =
@@ -1766,6 +2077,58 @@ mod tests {
         // Every child would need 1000 hessian; only 64 rows exist.
         let param = TrainParam { min_child_weight: 1000.0, max_bin: 32, ..Default::default() };
         assert_eq!(grow(&d, &gpair, &param).num_nodes(), 1);
+    }
+
+    fn expand_entry(nid: usize, depth: i32, loss_chg: f32) -> ExpandEntry {
+        let child = GradStats { sum_hess: 1.0, ..Default::default() };
+        ExpandEntry {
+            nid,
+            depth,
+            split: SplitEntry { loss_chg, left_sum: child, right_sum: child, ..Default::default() },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn depthwise_queue_preserves_node_order_and_level_batches() {
+        let param = TrainParam { grow_policy: GrowPolicy::DepthWise, ..Default::default() };
+        let mut queue = ExpandQueue::new(param.grow_policy);
+        for entry in [
+            expand_entry(1, 1, 1.0),
+            expand_entry(2, 1, 3.0),
+            expand_entry(3, 2, 2.0),
+        ] {
+            queue.push(entry);
+        }
+
+        let mut num_leaves = 1;
+        let mut batch = Vec::new();
+        queue.pop_batch(&param, &mut num_leaves, &mut batch);
+        assert_eq!(batch.iter().map(|entry| entry.nid).collect::<Vec<_>>(), [1, 2]);
+        queue.pop_batch(&param, &mut num_leaves, &mut batch);
+        assert_eq!(batch.iter().map(|entry| entry.nid).collect::<Vec<_>>(), [3]);
+    }
+
+    #[test]
+    fn lossguide_queue_prioritises_gain_then_smaller_node_id() {
+        let param = TrainParam { grow_policy: GrowPolicy::LossGuide, ..Default::default() };
+        let mut queue = ExpandQueue::new(param.grow_policy);
+        for entry in [
+            expand_entry(1, 1, 1.0),
+            expand_entry(3, 1, 3.0),
+            expand_entry(2, 1, 3.0),
+        ] {
+            queue.push(entry);
+        }
+
+        let mut num_leaves = 1;
+        let mut batch = Vec::new();
+        let mut order = Vec::new();
+        for _ in 0..3 {
+            queue.pop_batch(&param, &mut num_leaves, &mut batch);
+            order.push(batch[0].nid);
+        }
+        assert_eq!(order, [2, 3, 1]);
     }
 
     #[test]

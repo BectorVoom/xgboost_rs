@@ -27,6 +27,10 @@ def main() -> None:
     ap.add_argument("--rounds", type=int, default=20)
     ap.add_argument("--depth", type=int, default=6)
     ap.add_argument("--max-bin", type=int, default=256)
+    ap.add_argument(
+        "--grow-policy", choices=("depthwise", "lossguide"), default="depthwise"
+    )
+    ap.add_argument("--max-leaves", type=int, default=0)
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--repeats", type=int, default=1)
     args = ap.parse_args()
@@ -43,6 +47,8 @@ def main() -> None:
         "eta": 0.3,
         "max_depth": args.depth,
         "max_bin": args.max_bin,
+        "grow_policy": args.grow_policy,
+        "max_leaves": args.max_leaves,
         "seed": 0,
     }
     if args.threads > 0:

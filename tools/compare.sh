@@ -19,17 +19,23 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 BIN=target/release/train_bench
-[ -x "$BIN" ] || cargo build --release --no-default-features --bin train_bench
+cargo build --release --no-default-features --bin train_bench
 
-# rows features rounds depth max_bin sparsity
+# policy rows features rounds depth max_leaves max_bin sparsity
 CASES=(
-  "100000 50 20 6 256 0.0"
-  "500000 50 20 6 256 0.0"
-  "100000 200 20 6 256 0.0"
-  "1000000 20 20 6 256 0.0"
-  "100000 50 20 10 256 0.0"
-  "100000 50 20 6 64 0.0"
-  "200000 50 20 6 256 0.3"
+  "depthwise 100000 50 20 6 0 256 0.0"
+  "depthwise 500000 50 20 6 0 256 0.0"
+  "depthwise 100000 200 20 6 0 256 0.0"
+  "depthwise 1000000 20 20 6 0 256 0.0"
+  "depthwise 100000 50 20 10 0 256 0.0"
+  "depthwise 100000 50 20 6 0 64 0.0"
+  "depthwise 200000 50 20 6 0 256 0.3"
+  "lossguide 100000 50 20 0 64 256 0.0"
+  "lossguide 500000 50 20 0 64 256 0.0"
+  "lossguide 100000 200 20 0 64 256 0.0"
+  "lossguide 1000000 20 20 0 64 256 0.0"
+  "lossguide 100000 50 20 0 64 64 0.0"
+  "lossguide 200000 50 20 0 64 256 0.3"
 )
 
 # Best of N whole-process runs: each run still pays full setup (sketch and
@@ -49,21 +55,24 @@ best_of() { # command... -> "seconds rmse"
   echo "$best $rmse"
 }
 
-printf '%-34s %10s %10s %8s   %s\n' "case (rows/feat/rounds/depth/bin)" "xgboost_rs" "xgboost" "speedup" "rmse match"
+printf '%-46s %10s %10s %8s   %s\n' "policy/case (rows/feat/rounds/depth/leaves/bin)" "xgboost_rs" "xgboost" "speedup" "rmse match"
 for c in "${CASES[@]}"; do
-  read -r rows feat rounds depth bin sparsity <<<"$c"
+  read -r policy rows feat rounds depth leaves bin sparsity <<<"$c"
   data="$TMP/d.bin"
+  policy_args=(--max-leaves "$leaves")
+  if [ "$policy" = "lossguide" ]; then policy_args+=(--lossguide); fi
 
   read -r rs_t rs_r <<<"$(best_of "$BIN" --rows "$rows" --features "$feat" --rounds "$rounds" \
         --depth "$depth" --max-bin "$bin" --sparsity "$sparsity" --threads "$THREADS" \
-        --repeats 1 --dump "$data")"
+        --repeats 1 --dump "$data" "${policy_args[@]}")"
 
   read -r xg_t xg_r <<<"$(best_of .venv-oracle/bin/python tools/bench_xgb.py "$data" \
         --rows "$rows" --features "$feat" --rounds "$rounds" --depth "$depth" \
-        --max-bin "$bin" --threads "$THREADS" --repeats 1)"
+        --max-leaves "$leaves" --grow-policy "$policy" --max-bin "$bin" \
+        --threads "$THREADS" --repeats 1)"
 
   speed=$(awk -v a="$xg_t" -v b="$rs_t" 'BEGIN{printf "%.2fx", a/b}')
   match=$(awk -v a="$rs_r" -v b="$xg_r" 'BEGIN{d=a-b; if(d<0)d=-d; print (d <= 1e-5*(b<0?-b:b)+1e-9) ? "yes" : "NO ("a" vs "b")"}')
-  printf '%-34s %10s %10s %8s   %s\n' "${rows}/${feat}/${rounds}/${depth}/${bin}$([ "$sparsity" != "0.0" ] && echo " sp$sparsity")" \
+  printf '%-46s %10s %10s %8s   %s\n' "$policy/${rows}/${feat}/${rounds}/${depth}/${leaves}/${bin}$([ "$sparsity" != "0.0" ] && echo " sp$sparsity")" \
     "$rs_t" "$xg_t" "$speed" "$match"
 done

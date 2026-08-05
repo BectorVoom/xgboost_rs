@@ -28,6 +28,14 @@ pub enum BinStorage {
     U32(Vec<u32>),
 }
 
+/// A dense feature column with its concrete bin width exposed once, outside
+/// row-processing loops.
+pub(crate) enum DenseColumn<'a> {
+    U8(&'a [u8]),
+    U16(&'a [u16]),
+    U32(&'a [u32]),
+}
+
 impl BinStorage {
     /// Build from bin indices that take `n_values` distinct values (`0..n`),
     /// narrowing to the smallest type that holds them.
@@ -127,6 +135,26 @@ pub(crate) struct ColumnIndex {
 }
 
 impl ColumnIndex {
+    /// Dense bins for `fidx` and their missing-value sentinel.
+    ///
+    /// Callers that process a whole column can dispatch on the storage width
+    /// once instead of repeating the sparse-layout and [`BinStorage`] matches
+    /// for every row.
+    pub(crate) fn dense_column(&self, fidx: u32) -> Option<(DenseColumn<'_>, u32)> {
+        let f = fidx as usize;
+        if self.sparse[f] {
+            return None;
+        }
+        let begin = self.data_ptr[f];
+        let end = self.data_ptr[f + 1];
+        let column = match &self.data {
+            BinStorage::U8(data) => DenseColumn::U8(&data[begin..end]),
+            BinStorage::U16(data) => DenseColumn::U16(&data[begin..end]),
+            BinStorage::U32(data) => DenseColumn::U32(&data[begin..end]),
+        };
+        Some((column, self.missing))
+    }
+
     /// Feature-local bin of row `r`, or `None` when the value is missing.
     #[inline]
     pub(crate) fn get(&self, fidx: u32, r: usize) -> Option<u32> {

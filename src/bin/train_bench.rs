@@ -12,7 +12,7 @@
 use std::time::Instant;
 use xgboost_rs::parameters::{
     BoosterParameters, BoosterType, GrowPolicy, LearningTaskParameters, TrainingParameters,
-    TreeBoosterParameters,
+    TreeBoosterParameters, VerboseEval,
 };
 use xgboost_rs::{DMatrix, api};
 
@@ -187,6 +187,7 @@ fn main() {
             ..Default::default()
         },
         num_boost_round: args.rounds,
+        verbose_eval: VerboseEval::Silent,
         ..Default::default()
     };
 
