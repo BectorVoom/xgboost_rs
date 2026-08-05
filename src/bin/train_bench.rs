@@ -11,7 +11,7 @@
 
 use std::time::Instant;
 use xgboost_rs::parameters::{
-    BoosterParameters, BoosterType, LearningTaskParameters, TrainingParameters,
+    BoosterParameters, BoosterType, GrowPolicy, LearningTaskParameters, TrainingParameters,
     TreeBoosterParameters,
 };
 use xgboost_rs::{DMatrix, api};
@@ -54,6 +54,9 @@ struct Args {
     breakdown: bool,
     /// Print a checksum of the trained model.
     hash: bool,
+    /// Growth order, and the leaf budget `lossguide` needs to be bounded by.
+    lossguide: bool,
+    max_leaves: u32,
 }
 
 impl Default for Args {
@@ -72,6 +75,8 @@ impl Default for Args {
             dump: None,
             breakdown: false,
             hash: false,
+            lossguide: false,
+            max_leaves: 0,
         }
     }
 }
@@ -102,6 +107,11 @@ fn parse_args() -> Args {
             }
             "--hash" => {
                 args.hash = true;
+                i -= 1;
+            }
+            "--max-leaves" => args.max_leaves = value().parse().unwrap(),
+            "--lossguide" => {
+                args.lossguide = true;
                 i -= 1;
             }
             other => panic!("unknown argument `{other}`"),
@@ -165,6 +175,12 @@ fn main() {
                 max_bin: args.max_bin,
                 subsample: args.subsample,
                 colsample_bytree: args.colsample,
+                grow_policy: if args.lossguide {
+                    GrowPolicy::LossGuide
+                } else {
+                    GrowPolicy::DepthWise
+                },
+                max_leaves: args.max_leaves,
                 ..Default::default()
             }),
             learning: LearningTaskParameters::default(),

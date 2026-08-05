@@ -8,6 +8,16 @@
 use std::process::Command;
 
 fn model_hash(threads: usize, sparsity: &str, subsample: &str, colsample: &str) -> String {
+    model_hash_with(threads, sparsity, subsample, colsample, &[])
+}
+
+fn model_hash_with(
+    threads: usize,
+    sparsity: &str,
+    subsample: &str,
+    colsample: &str,
+    extra: &[&str],
+) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_train_bench"))
         .args([
             "--rows", "20000",
@@ -19,6 +29,7 @@ fn model_hash(threads: usize, sparsity: &str, subsample: &str, colsample: &str) 
             "--threads", &threads.to_string(),
             "--hash",
         ])
+        .args(extra)
         .output()
         .expect("failed to run train_bench");
     assert!(
@@ -59,5 +70,24 @@ fn a_sampled_model_is_identical_across_thread_counts() {
             baseline,
             "{threads} threads produced a different sampled model than 1 thread"
         );
+    }
+}
+
+/// The split search sizes its parallel jobs from the thread count, so the
+/// thread count must stay invisible to the model. `lossguide` is the policy
+/// that stresses this hardest: it expands one node at a time, so it has the
+/// fewest tasks to divide and the job size varies most between 1 thread and 8.
+#[test]
+fn a_lossguide_model_is_identical_across_thread_counts() {
+    for max_leaves in ["16", "64"] {
+        let extra = ["--lossguide", "--depth", "0", "--max-leaves", max_leaves];
+        let baseline = model_hash_with(1, "0.0", "1.0", "1.0", &extra);
+        for threads in [2, 3, 8] {
+            assert_eq!(
+                model_hash_with(threads, "0.0", "1.0", "1.0", &extra),
+                baseline,
+                "lossguide max_leaves={max_leaves}: {threads} threads differed from 1 thread"
+            );
+        }
     }
 }
