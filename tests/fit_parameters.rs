@@ -683,23 +683,17 @@ fn a_fit_without_early_stopping_reports_no_best_round() {
 fn unimplemented_algorithm_choices_are_rejected_not_ignored() {
     let d = data(100, 3);
 
-    for method in [TreeMethod::Exact, TreeMethod::Approx] {
+    // Every tree method now trains; only a device this build has no code for
+    // and the algorithm choices below are refused.
+    for method in [TreeMethod::Auto, TreeMethod::Hist, TreeMethod::Exact, TreeMethod::Approx] {
         let p = params(TreeBoosterParameters { tree_method: method, ..Default::default() }, 1);
-        let err = train_error(&p, &d, &[]);
-        assert!(err.contains("tree_method"), "{method} should be rejected: {err}");
+        api::train(&p, &d, &[]).unwrap_or_else(|e| panic!("{method} must train: {e}"));
     }
 
     let mut gpu = params(TreeBoosterParameters::default(), 1);
     gpu.booster.general.device = xgboost_rs::parameters::Device::cuda(0);
     let err = train_error(&gpu, &d, &[]);
     assert!(err.contains("device"), "{err}");
-
-    // `gblinear` has no tree updater at all, so it is named in the rejection.
-    let mut linear = params(TreeBoosterParameters::default(), 1);
-    linear.booster.booster =
-        BoosterType::Gblinear(xgboost_rs::parameters::LinearBoosterParameters::default());
-    let err = train_error(&linear, &d, &[]);
-    assert!(err.contains("gblinear"), "{err}");
 }
 
 /// The objectives and metrics that used to be rejected now train, so the

@@ -6,7 +6,7 @@
 //! Doing it all in `f64` would produce split decisions that drift from the
 //! reference on near-ties, so the widths are matched exactly.
 
-use crate::parameters::{MonotoneConstraint, SamplingMethod};
+use crate::parameters::{DefaultDirection, MonotoneConstraint, ProcessType, SamplingMethod, TreeUpdaterName};
 
 /// Growth order for the node expansion queue.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -54,6 +54,20 @@ pub struct TrainParam {
     /// Histogram buffers the grower may keep for reuse. Bounds the memory a
     /// deep or wide tree holds; it changes speed, never the model.
     pub max_cached_hist_node: u64,
+
+    /// Where the `exact` updater sends rows whose split feature is missing.
+    pub default_direction: DefaultDirection,
+    /// Density above which the `exact` updater skips a column's forward scan.
+    pub opt_dense_col: f32,
+
+    /// The resolved updater pipeline: one grower, then any tree-modifying
+    /// stages. Under [`ProcessType::Update`] there is no grower and every
+    /// stage rewrites a tree the model already holds.
+    pub updaters: Vec<TreeUpdaterName>,
+    /// Whether a round grows new trees or revisits the existing ones.
+    pub process_type: ProcessType,
+    /// Whether the `refresh` updater also rewrites leaf values.
+    pub refresh_leaf: bool,
 }
 
 impl Default for TrainParam {
@@ -79,6 +93,11 @@ impl Default for TrainParam {
             interaction_constraints: None,
             // `HistMakerTrainParam::CpuDefaultNodes`.
             max_cached_hist_node: 1 << 16,
+            default_direction: DefaultDirection::Learn,
+            opt_dense_col: 1.0,
+            updaters: vec![TreeUpdaterName::GrowQuantileHistMaker],
+            process_type: ProcessType::Default,
+            refresh_leaf: true,
         }
     }
 }

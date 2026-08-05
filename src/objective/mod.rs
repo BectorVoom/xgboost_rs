@@ -92,6 +92,18 @@ pub trait Objective {
     /// value per output.
     fn init_estimation(&self, info: &MetaInfo) -> Vec<f32>;
 
+    /// Whether every row's hessian is the same in every round, which is
+    /// `ObjInfo::const_hess` upstream.
+    ///
+    /// Only `reg:squarederror` (and its `reg:linear` alias) qualifies, because
+    /// its second derivative is `1` whatever the prediction. It is what lets
+    /// `approx` sketch its quantiles once instead of once per round: the
+    /// sketch is weighted by the hessian, and a hessian that never moves gives
+    /// a sketch that never moves.
+    fn has_constant_hessian(&self) -> bool {
+        false
+    }
+
     /// Metric reported when the caller did not choose one.
     fn default_metric(&self) -> String;
 

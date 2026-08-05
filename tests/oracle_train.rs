@@ -122,7 +122,7 @@ fn leaf_assignment_matches_xgboost_exactly() {
     for (case, data) in CASES {
         let (booster, _, fixture, dmat) = train_case(case, data);
         let want = fixture["leaf"].as_array().unwrap();
-        let got = booster.predict_leaf(&dmat);
+        let got = booster.predict_leaf(&dmat).unwrap();
         for (r, (g, w)) in got.iter().zip(want).enumerate() {
             let w: Vec<u32> = w.as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
             assert_eq!(*g, w, "{case}: row {r} lands in different leaves");

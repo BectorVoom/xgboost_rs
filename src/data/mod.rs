@@ -5,6 +5,7 @@
 //! row holds an entry for every feature; [`DMatrix::is_dense`] reports it, and
 //! the hist path takes a faster route when it holds.
 
+pub mod csc;
 pub mod cuts;
 pub mod gradient_index;
 

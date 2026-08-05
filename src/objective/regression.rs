@@ -159,6 +159,12 @@ impl Objective for RegLossObj {
         self.loss.name()
     }
 
+    /// `LinearSquareLoss::Info` is the only one upstream marks constant: its
+    /// second derivative is the row weight and nothing else.
+    fn has_constant_hessian(&self) -> bool {
+        self.loss == Loss::SquaredError
+    }
+
     fn get_gradient(&self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
         let n_targets = info.n_targets();
         out.clear();

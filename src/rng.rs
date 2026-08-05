@@ -241,6 +241,22 @@ pub fn bernoulli(x: u64, p: f64) -> bool {
     canonical_f64(x) < p
 }
 
+/// `std::generate_canonical<double, 53, std::mt19937>`.
+///
+/// The engine's range is 2^32 and a `double` mantissa is 53 bits, so the
+/// standard's `k = ceil(bits / log2(range))` is **two** draws rather than the
+/// one [`canonical_f64`] takes from the 63-bit engine. The `exact` updater's
+/// row sampling draws through this, so getting the draw count right is what
+/// keeps its row sample the one upstream would take.
+#[inline]
+pub fn canonical_f64_from_mt(rng: &mut Mt19937) -> f64 {
+    let lo = rng.next_u32() as f64;
+    let hi = rng.next_u32() as f64;
+    let sum = lo + hi * 4_294_967_296.0;
+    let u = sum / 18_446_744_073_709_551_616.0;
+    if u >= 1.0 { F64_JUST_BELOW_ONE } else { u }
+}
+
 /// A uniform integer in `[0, n)`, following libstdc++'s
 /// `uniform_int_distribution` rejection scheme.
 ///

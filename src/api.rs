@@ -9,8 +9,9 @@ use crate::gbm::DartConfig;
 use crate::data::DMatrix;
 use crate::learner::Learner;
 use crate::parameters::{
-    BoosterType, Device, EvalMetric, MultiStrategy, PredictParameters, PredictionType,
-    TrainingParameters, TreeBoosterParameters, TreeUpdaterName, VerboseEval, Verbosity,
+    BoosterType, Device, EvalMetric, IterationRange, MultiStrategy, PredictParameters,
+    PredictionType, TrainingParameters, TreeBoosterParameters, TreeUpdaterName, VerboseEval,
+    Verbosity,
 };
 use crate::predictor::TreeRange;
 use crate::tree::param::{GrowPolicy, TrainParam};
@@ -64,8 +65,22 @@ impl Booster {
     }
 
     /// Leaf index reached in every tree, one row per input row.
-    pub fn predict_leaf(&self, dmat: &DMatrix) -> Vec<Vec<u32>> {
-        crate::predictor::predict_leaf(&self.learner.gbm().model, dmat, self.all_trees())
+    ///
+    /// An error for `gblinear`, which has no leaves — the same refusal
+    /// upstream's `GBLinear::PredictLeaf` makes.
+    pub fn predict_leaf(&self, dmat: &DMatrix) -> Result<Vec<Vec<u32>>> {
+        let model = &self.tree_model()?.model;
+        Ok(crate::predictor::predict_leaf(model, dmat, self.all_trees()))
+    }
+
+    /// The tree ensemble, or an error naming the booster that has none.
+    fn tree_model(&self) -> Result<&crate::gbm::GBTree> {
+        self.learner.gbm().ok_or_else(|| {
+            Error::invalid(
+                "booster",
+                "this operation needs a tree ensemble; the model is `gblinear`",
+            )
+        })
     }
 
     /// Predict with the full [`PredictParameters`] surface.
@@ -85,14 +100,18 @@ impl Booster {
                 ),
             ));
         }
-        let model = &self.learner.gbm().model;
-        let (begin, end) = params.iteration_range.resolve(self.boosted_rounds() as u32)?;
-        let trees = TreeRange::from_rounds(model, begin, end);
-
         let n_rows = dmat.num_row();
         let n_groups = self.learner.num_output_group();
         let n_features = self.num_features();
         let base = self.learner.base_margin();
+
+        if let Some(linear) = self.learner.booster().linear() {
+            return self.predict_linear(linear, params, dmat, n_rows, n_groups, n_features);
+        }
+
+        let model = &self.tree_model()?.model;
+        let (begin, end) = params.iteration_range.resolve(self.boosted_rounds() as u32)?;
+        let trees = TreeRange::from_rounds(model, begin, end);
 
         Ok(match params.predict_type {
             PredictionType::Value => {
@@ -152,8 +171,81 @@ impl Booster {
         })
     }
 
+    /// Predict with a `gblinear` model.
+    ///
+    /// Split out because almost every prediction kind means something
+    /// different — or nothing at all — for a model with no trees.
+    fn predict_linear(
+        &self,
+        linear: &crate::linear::GBLinear,
+        params: &PredictParameters,
+        dmat: &DMatrix,
+        n_rows: usize,
+        n_groups: usize,
+        n_features: usize,
+    ) -> Result<Prediction> {
+        // `GBLinear::PredictBatch` refuses a layer range outright: there are no
+        // rounds to slice, only one set of weights.
+        if params.iteration_range != IterationRange::default() {
+            return Err(Error::invalid(
+                "iteration_range",
+                "the `gblinear` booster has no per-round trees, so it cannot predict a \
+                 round range",
+            ));
+        }
+        let base = self.learner.base_margin();
+        let width = n_features + 1;
+        Ok(match params.predict_type {
+            PredictionType::Value => {
+                let mut values = linear.predict_margin(dmat, base);
+                self.learner.objective().pred_transform(&mut values);
+                let stride = values.len() / n_rows.max(1);
+                Prediction { values, shape: shape_for_value(n_rows, stride, params.strict_shape) }
+            }
+            PredictionType::Margin => Prediction {
+                values: linear.predict_margin(dmat, base),
+                shape: shape_for_value(n_rows, n_groups, params.strict_shape),
+            },
+            PredictionType::Leaf => {
+                return Err(Error::invalid(
+                    "predict_type",
+                    "the `gblinear` booster has no leaves to report",
+                ));
+            }
+            PredictionType::Contribution | PredictionType::ApproxContribution => {
+                let values = linear.predict_contribution(dmat, base);
+                let shape = if params.strict_shape || n_groups > 1 {
+                    vec![n_rows, n_groups, width]
+                } else {
+                    vec![n_rows, width]
+                };
+                Prediction { values, shape }
+            }
+            PredictionType::Interaction | PredictionType::ApproxInteraction => {
+                // A linear model has no interaction effects, so the whole of a
+                // feature's contribution is its main effect and the matrix is
+                // diagonal. That keeps the invariant the tree path guarantees —
+                // each row sums to the feature's total contribution — which
+                // upstream's zero-filled buffer does not.
+                let contribs = linear.predict_contribution(dmat, base);
+                let mut values = vec![0.0f32; n_rows * n_groups * width * width];
+                for slot in 0..n_rows * n_groups {
+                    for i in 0..width {
+                        values[slot * width * width + i * width + i] = contribs[slot * width + i];
+                    }
+                }
+                let shape = if params.strict_shape || n_groups > 1 {
+                    vec![n_rows, n_groups, width, width]
+                } else {
+                    vec![n_rows, width, width]
+                };
+                Prediction { values, shape }
+            }
+        })
+    }
+
     fn all_trees(&self) -> TreeRange {
-        TreeRange::all(&self.learner.gbm().model)
+        self.learner.all_trees()
     }
 
     /// Every configured metric evaluated on `dmat`, in configuration order.
@@ -170,11 +262,11 @@ impl Booster {
     /// Trees in the ensemble: `boosted_rounds() * num_parallel_tree *
     /// num_output_group`.
     pub fn num_trees(&self) -> usize {
-        self.learner.gbm().model.num_trees()
+        self.learner.gbm().map_or(0, |g| g.model.num_trees())
     }
 
     pub fn num_features(&self) -> usize {
-        self.learner.gbm().model.num_feature
+        self.learner.booster().num_feature()
     }
 
     /// Outputs this model predicts per row.
@@ -213,9 +305,33 @@ impl Booster {
     /// `"weight"` counts splits per feature; `"gain"` averages the loss
     /// reduction of those splits.
     pub fn get_score(&self, importance_type: &str) -> Result<BTreeMap<String, f64>> {
+        // `GBLinear::FeatureScore` defines only `weight`, and defines it as the
+        // model's own coefficients rather than a split count.
+        if let Some(linear) = self.learner.booster().linear() {
+            if importance_type != "weight" {
+                return Err(Error::invalid(
+                    "importance_type",
+                    format!(
+                        "`gblinear` defines only `weight` for feature importance, got \
+                         `{importance_type}`"
+                    ),
+                ));
+            }
+            let n_groups = linear.model.num_output_group;
+            return Ok((0..linear.model.num_feature)
+                .flat_map(|f| {
+                    (0..n_groups).map(move |g| {
+                        let key =
+                            if n_groups == 1 { format!("f{f}") } else { format!("f{f}-{g}") };
+                        (key, f, g)
+                    })
+                })
+                .map(|(key, f, g)| (key, linear.model.weight_of(f, g) as f64))
+                .collect());
+        }
         let mut counts: BTreeMap<u32, f64> = BTreeMap::new();
         let mut gains: BTreeMap<u32, f64> = BTreeMap::new();
-        for tree in &self.learner.gbm().model.trees {
+        for tree in &self.tree_model()?.model.trees {
             for (nid, node) in tree.nodes.iter().enumerate() {
                 if node.is_leaf() {
                     continue;
@@ -269,25 +385,44 @@ pub fn train(
     dtrain: &DMatrix,
     evals: &[(&DMatrix, &str)],
 ) -> Result<(Booster, EvalHistory)> {
+    train_from(params, dtrain, evals, None)
+}
+
+/// Train, optionally continuing from an already-trained model.
+///
+/// This is `xgboost.train`'s `xgb_model` argument. Passing a base model makes
+/// the rounds *add to* that ensemble instead of starting from nothing, and it
+/// is what gives `process_type=update` something to work on: under that
+/// setting a round rewrites one round of the base model rather than growing a
+/// new one.
+///
+/// The base model supplies the ensemble and the intercept; every other
+/// parameter comes from `params`, so a continued fit may legitimately use a
+/// different learning rate, depth or updater than the fit that produced it.
+pub fn train_from(
+    params: &TrainingParameters,
+    dtrain: &DMatrix,
+    evals: &[(&DMatrix, &str)],
+    base: Option<&Booster>,
+) -> Result<(Booster, EvalHistory)> {
     params.validate()?;
     let general = &params.booster.general;
+    if !general.device.is_cpu() {
+        return Err(Error::invalid(
+            "device",
+            format!("training runs on the CPU; got device `{}`", general.device),
+        ));
+    }
     let (tree, dart) = match &params.booster.booster {
-        BoosterType::Gbtree(tree) => (tree, None),
-        BoosterType::Dart(dart) => (&dart.tree, Some(DartConfig::from_parameters(dart))),
-        other => {
-            return Err(Error::invalid(
-                "booster",
-                format!(
-                    "`{}` is not implemented; this crate trains `gbtree` and `dart`",
-                    other.name()
-                ),
-            ));
-        }
+        BoosterType::Gbtree(tree) => (Some(tree), None),
+        BoosterType::Dart(dart) => (Some(&dart.tree), Some(DartConfig::from_parameters(dart))),
+        BoosterType::Gblinear(_) => (None, None),
     };
-    check_supported_updater(tree, general.device)?;
-    check_supported_tree_options(tree, dtrain)?;
-    check_feature_constraints(tree, dtrain.num_col())?;
-    let param = train_param(tree)?;
+    if let Some(tree) = tree {
+        check_supported_updater(tree, general.device)?;
+        check_supported_tree_options(tree, dtrain)?;
+        check_feature_constraints(tree, dtrain.num_col())?;
+    }
 
     let learning = &params.booster.learning;
     let obj = crate::objective::create(&learning.objective, learning.scale_pos_weight)?;
@@ -329,11 +464,40 @@ pub fn train(
         }
     }
 
-    let mut learner =
-        Learner::new(ctx, obj, metrics, dtrain.num_col(), param, learning.base_score);
+    let mut learner = match &params.booster.booster {
+        BoosterType::Gblinear(linear) => Learner::with_booster(
+            ctx,
+            obj,
+            metrics,
+            crate::gbm::Booster::Linear(Box::new(crate::linear::GBLinear::new(
+                dtrain.num_col(),
+                linear.clone(),
+            ))),
+            learning.base_score,
+        ),
+        _ => {
+            let param = train_param(tree.expect("a tree booster"), general.device)?;
+            Learner::new(ctx, obj, metrics, dtrain.num_col(), param, learning.base_score)
+        }
+    };
     learner.set_boost_from_average(learning.boost_from_average);
     if let Some(dart) = dart {
         learner.set_dart(dart);
+    }
+    if let Some(base) = base {
+        learner.continue_from(base.learner())?;
+    }
+    // `process_type=update` rewrites trees the model already holds. Without a
+    // base model there are none, so every round would be a silent no-op.
+    if let Some(tree) = tree
+        && tree.process_type == crate::parameters::ProcessType::Update
+        && !learner.has_trees()
+    {
+        return Err(Error::invalid(
+            "process_type",
+            "`update` revisits the trees an existing model holds; pass one to \
+             `api::train_from`, or use `process_type=default` to grow new trees",
+        ));
     }
 
     let mut stopper = match params.early_stopping_rounds {
@@ -505,22 +669,30 @@ fn check_feature_constraints(tree: &TreeBoosterParameters, num_col: usize) -> Re
 /// Reject configurations whose updater pipeline this crate does not implement,
 /// rather than silently training something else.
 fn check_supported_updater(tree: &TreeBoosterParameters, device: Device) -> Result<()> {
-    if !device.is_cpu() {
-        return Err(Error::invalid(
-            "device",
-            format!("training runs on the CPU; got device `{device}`"),
-        ));
-    }
     let updaters = tree.resolved_updaters(device)?;
-    if updaters != [TreeUpdaterName::GrowQuantileHistMaker] {
-        let names: Vec<&str> = updaters.iter().map(|u| u.as_str()).collect();
+    for updater in &updaters {
+        let implemented = matches!(
+            updater,
+            TreeUpdaterName::GrowQuantileHistMaker
+                | TreeUpdaterName::GrowHistMaker
+                | TreeUpdaterName::GrowColMaker
+                | TreeUpdaterName::Prune
+                | TreeUpdaterName::Refresh
+        );
+        if !implemented {
+            return Err(Error::invalid(
+                "updater",
+                format!("the `{updater}` updater is not implemented on this device"),
+            ));
+        }
+    }
+    // `ColMaker::Builder::Update` refuses an unbounded depth outright: it grows
+    // level by level and has no other stopping rule.
+    if updaters.contains(&TreeUpdaterName::GrowColMaker) && tree.max_depth == 0 {
         return Err(Error::invalid(
-            "tree_method",
-            format!(
-                "only the `hist` updater `grow_quantile_histmaker` is implemented; \
-                 this configuration resolves to `{}`",
-                names.join(",")
-            ),
+            "max_depth",
+            "the `exact` tree method grows level by level and cannot run with an \
+             unlimited depth; set max_depth",
         ));
     }
     Ok(())
@@ -554,31 +726,50 @@ fn check_supported_tree_options(tree: &TreeBoosterParameters, dtrain: &DMatrix) 
 /// This is what `validate_parameters` asks for: XGBoost prints a warning for
 /// every configuration entry nothing consumed, and so does this — otherwise a
 /// caller has no way to tell a knob that did nothing from one that did.
-fn unused_parameters(params: &TrainingParameters, tree: &TreeBoosterParameters) -> Vec<String> {
+fn unused_parameters(
+    params: &TrainingParameters,
+    tree: Option<&TreeBoosterParameters>,
+) -> Vec<String> {
     let mut unused = Vec::new();
     let default = TreeBoosterParameters::default();
 
-    // `exact`-only options, on a fit that runs `hist`.
-    if tree.default_direction != default.default_direction {
-        unused.push("default_direction".to_owned());
-    }
-    if tree.opt_dense_col != default.opt_dense_col {
-        unused.push("opt_dense_col".to_owned());
-    }
-    // `refresh`-only, and the refresh updater is not implemented.
-    if tree.refresh_leaf != default.refresh_leaf {
-        unused.push("refresh_leaf".to_owned());
-    }
-    // Categorical splits are rejected outright, so their knobs never apply.
-    if tree.max_cat_to_onehot != default.max_cat_to_onehot {
-        unused.push("max_cat_to_onehot".to_owned());
-    }
-    if tree.max_cat_threshold != default.max_cat_threshold {
-        unused.push("max_cat_threshold".to_owned());
-    }
-    // A single-process fit has no workers to synchronise.
-    if tree.debug_synchronize {
-        unused.push("debug_synchronize".to_owned());
+    if let Some(tree) = tree {
+        let updaters =
+            tree.resolved_updaters(params.booster.general.device).unwrap_or_default();
+        let uses = |u: TreeUpdaterName| updaters.contains(&u);
+
+        // The two `exact`-only knobs, on a fit that runs something else.
+        if !uses(TreeUpdaterName::GrowColMaker) {
+            if tree.default_direction != default.default_direction {
+                unused.push("default_direction".to_owned());
+            }
+            if tree.opt_dense_col != default.opt_dense_col {
+                unused.push("opt_dense_col".to_owned());
+            }
+        }
+        // `exact` enumerates every distinct value, so there are no bins.
+        if uses(TreeUpdaterName::GrowColMaker) && tree.max_bin != default.max_bin {
+            unused.push("max_bin".to_owned());
+        }
+        if !uses(TreeUpdaterName::Refresh) && tree.refresh_leaf != default.refresh_leaf {
+            unused.push("refresh_leaf".to_owned());
+        }
+        // Categorical splits are rejected outright, so their knobs never apply.
+        if tree.max_cat_to_onehot != default.max_cat_to_onehot {
+            unused.push("max_cat_to_onehot".to_owned());
+        }
+        if tree.max_cat_threshold != default.max_cat_threshold {
+            unused.push("max_cat_threshold".to_owned());
+        }
+        // A single-process fit has no workers to synchronise.
+        if tree.debug_synchronize {
+            unused.push("debug_synchronize".to_owned());
+        }
+        // `sparse_threshold` selects between two `hist` column layouts that
+        // differ only in speed; this crate keeps one.
+        if tree.sparse_threshold != default.sparse_threshold {
+            unused.push("sparse_threshold".to_owned());
+        }
     }
     // GPU-only settings, on a CPU fit.
     let general = &params.booster.general;
@@ -592,7 +783,7 @@ fn unused_parameters(params: &TrainingParameters, tree: &TreeBoosterParameters) 
 }
 
 /// Translate the public tree parameters into the internal training parameters.
-fn train_param(tree: &TreeBoosterParameters) -> Result<TrainParam> {
+fn train_param(tree: &TreeBoosterParameters, device: Device) -> Result<TrainParam> {
     Ok(TrainParam {
         learning_rate: tree.eta,
         min_split_loss: tree.gamma,
@@ -616,6 +807,11 @@ fn train_param(tree: &TreeBoosterParameters) -> Result<TrainParam> {
         monotone_constraints: tree.monotone_constraints.clone(),
         interaction_constraints: tree.interaction_constraints.clone(),
         max_cached_hist_node: tree.max_cached_hist_nodes(Device::Cpu),
+        default_direction: tree.default_direction,
+        opt_dense_col: tree.opt_dense_col,
+        updaters: tree.resolved_updaters(device)?,
+        process_type: tree.process_type,
+        refresh_leaf: tree.refresh_leaf,
     })
 }
 

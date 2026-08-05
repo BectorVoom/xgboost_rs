@@ -50,6 +50,31 @@ fn rich_data(rows: usize, cols: usize) -> DMatrix {
     d
 }
 
+/// The same relationship as [`rich_data`] with a quarter of the values
+/// missing, so the parameters that only steer *missing* values have something
+/// to steer.
+fn sparse_data(rows: usize, cols: usize) -> DMatrix {
+    let mut state = 0x0bad_c0de_0bad_c0deu64;
+    let mut next = || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32 / (1u32 << 24) as f32
+    };
+    let mut x: Vec<f32> = (0..rows * cols).map(|_| next()).collect();
+    let y: Vec<f32> = (0..rows)
+        .map(|r| x[r * cols..(r + 1) * cols].iter().enumerate().map(|(c, v)| v / (c + 1) as f32).sum())
+        .collect();
+    for (i, v) in x.iter_mut().enumerate() {
+        if (i * 7919) % 4 == 0 {
+            *v = f32::NAN;
+        }
+    }
+    let mut d = DMatrix::from_dense(&x, rows, cols, f32::NAN).unwrap();
+    d.set_labels(&y).unwrap();
+    d
+}
+
 /// Data that suits every objective at once: positive labels in `[0, 1]`, so the
 /// log links, the logistic losses and the classification objectives all accept
 /// it. Ranking metadata is attached too.
@@ -500,27 +525,69 @@ fn every_sycl_kind_keeps_its_spelling() {
 
 // ----------------------------------------------------- tree enumerations ----
 
-/// Every `tree_method` spelling is either trained or rejected naming
-/// `tree_method`; none is accepted and quietly replaced by another method.
+/// Every `tree_method` spelling trains, and each one that is a distinct
+/// algorithm builds a distinct model.
+///
+/// `auto` and `hist` are the same algorithm upstream, so they must agree
+/// exactly; `exact` and `approx` must not, or the parameter would be accepted
+/// and ignored.
 #[test]
-fn every_tree_method_spelling_is_honoured_or_rejected_by_name() {
-    let d = universal_data(100);
+fn every_tree_method_spelling_builds_its_own_model() {
+    let d = rich_data(1000, 5);
+    let mut models = std::collections::BTreeMap::new();
     for &method in TreeMethod::ALL {
         let p = training(
             LearningTaskParameters::default(),
             TreeBoosterParameters { tree_method: method, ..Default::default() },
         );
-        match api::train(&p, &d, &[]) {
-            // `auto` and `hist` are the same algorithm and both run.
-            Ok(_) => assert!(
-                matches!(method, TreeMethod::Auto | TreeMethod::Hist),
-                "`{method}` trained but is not the hist updater"
-            ),
-            Err(e) => assert!(
-                e.to_string().contains("tree_method"),
-                "`{method}` was rejected without naming the parameter: {e}"
-            ),
-        }
+        let (booster, _) =
+            api::train(&p, &d, &[]).unwrap_or_else(|e| panic!("`{method}` must train: {e}"));
+        models.insert(method.as_str(), booster.save_model());
+    }
+    assert_eq!(models["auto"], models["hist"], "`auto` resolves to `hist`");
+    assert_ne!(models["hist"], models["exact"], "`exact` must be its own algorithm");
+    assert_ne!(models["exact"], models["approx"]);
+
+    // `approx` sketches its quantiles weighted by the hessian. Under
+    // `reg:squarederror` every hessian is 1, so that sketch is the one `hist`
+    // builds and the two methods must coincide exactly — the same equality
+    // upstream has, and worth pinning so a future change to the weighting is
+    // not mistaken for noise.
+    assert_eq!(models["hist"], models["approx"], "a constant hessian makes approx == hist");
+
+    // Give the hessian something to vary and they must part company.
+    let binary = universal_data(600);
+    let mut varying = Vec::new();
+    for method in [TreeMethod::Hist, TreeMethod::Approx] {
+        let p = training(
+            LearningTaskParameters {
+                objective: Objective::BinaryLogistic,
+                ..Default::default()
+            },
+            TreeBoosterParameters { tree_method: method, max_bin: 16, ..Default::default() },
+        );
+        varying.push(api::train(&p, &binary, &[]).unwrap().0.save_model());
+    }
+    assert_ne!(varying[0], varying[1], "a varying hessian must move the approx cuts");
+}
+
+/// `exact` grows level by level and has no other stopping rule, so an
+/// unlimited depth is refused rather than silently bounded.
+#[test]
+fn exact_refuses_an_unlimited_depth() {
+    let d = rich_data(200, 3);
+    let p = training(
+        LearningTaskParameters::default(),
+        TreeBoosterParameters {
+            tree_method: TreeMethod::Exact,
+            max_depth: 0,
+            max_leaves: 8,
+            ..Default::default()
+        },
+    );
+    match api::train(&p, &d, &[]) {
+        Ok(_) => panic!("`exact` with max_depth = 0 must be rejected"),
+        Err(e) => assert!(e.to_string().contains("max_depth"), "{e}"),
     }
 }
 
@@ -560,8 +627,18 @@ fn both_sampling_method_spellings_select_a_sampler() {
 }
 
 /// Every `updater` spelling is either run or rejected naming the parameter.
+///
+/// The three that are refused are the ones whose device this build has no code
+/// for; a caller who names them gets an error, never a quiet substitution.
 #[test]
 fn every_updater_spelling_is_honoured_or_rejected_by_name() {
+    const CPU_UPDATERS: &[TreeUpdaterName] = &[
+        TreeUpdaterName::GrowQuantileHistMaker,
+        TreeUpdaterName::GrowHistMaker,
+        TreeUpdaterName::GrowColMaker,
+        TreeUpdaterName::Prune,
+        TreeUpdaterName::Refresh,
+    ];
     let d = universal_data(100);
     for &updater in TreeUpdaterName::ALL {
         // A tree-modifying updater cannot lead the pipeline, so pair it with a
@@ -573,44 +650,132 @@ fn every_updater_spelling_is_honoured_or_rejected_by_name() {
         };
         let p = training(
             LearningTaskParameters::default(),
-            TreeBoosterParameters { updater: Some(sequence), ..Default::default() },
+            TreeBoosterParameters { updater: Some(sequence), max_depth: 4, ..Default::default() },
         );
         match api::train(&p, &d, &[]) {
-            Ok(_) => assert_eq!(
-                updater,
-                TreeUpdaterName::GrowQuantileHistMaker,
-                "`{updater}` trained but only the CPU hist updater is implemented"
+            Ok(_) => assert!(
+                CPU_UPDATERS.contains(&updater),
+                "`{updater}` trained but has no CPU implementation"
             ),
-            Err(e) => assert!(
-                e.to_string().contains("tree_method") || e.to_string().contains("updater"),
-                "`{updater}` was rejected without naming the parameter: {e}"
-            ),
+            Err(e) => {
+                assert!(
+                    !CPU_UPDATERS.contains(&updater),
+                    "`{updater}` is implemented but was rejected: {e}"
+                );
+                assert!(
+                    e.to_string().contains("tree_method") || e.to_string().contains("updater"),
+                    "`{updater}` was rejected without naming the parameter: {e}"
+                );
+            }
         }
     }
 }
 
-/// Every `process_type` spelling is honoured or rejected naming the parameter.
+/// The `exact` pipeline is `grow_colmaker,prune`, so `gamma` has to reach the
+/// pruner rather than the grower — a split below it is built and then removed.
 #[test]
-fn every_process_type_spelling_is_honoured_or_rejected_by_name() {
-    let d = universal_data(100);
-    for &process_type in ProcessType::ALL {
-        // `update` requires a tree-modifying updater sequence.
-        let updater = match process_type {
-            ProcessType::Update => Some(vec![TreeUpdaterName::Refresh, TreeUpdaterName::Prune]),
-            ProcessType::Default => None,
-        };
+fn gamma_reaches_the_pruner_under_the_exact_tree_method() {
+    let d = rich_data(600, 4);
+    let mut sizes = Vec::new();
+    for gamma in [0.0f32, 5.0] {
         let p = training(
             LearningTaskParameters::default(),
-            TreeBoosterParameters { process_type, updater, ..Default::default() },
+            TreeBoosterParameters {
+                tree_method: TreeMethod::Exact,
+                max_depth: 4,
+                gamma,
+                ..Default::default()
+            },
         );
-        match api::train(&p, &d, &[]) {
-            Ok(_) => assert_eq!(process_type, ProcessType::Default),
-            Err(e) => assert!(
-                e.to_string().contains("tree_method") || e.to_string().contains("process_type"),
-                "`{process_type}` was rejected without naming the parameter: {e}"
-            ),
-        }
+        let (booster, _) = api::train(&p, &d, &[]).unwrap();
+        let model: serde_json::Value = serde_json::from_str(&booster.save_model()).unwrap();
+        let tree = &model["learner"]["gradient_booster"]["model"]["trees"][0];
+        let deleted: u64 =
+            tree["tree_param"]["num_deleted"].as_str().unwrap().parse().unwrap();
+        sizes.push(deleted);
     }
+    assert_eq!(sizes[0], 0, "no pruning without gamma");
+    assert!(sizes[1] > 0, "gamma must prune splits away");
+}
+
+/// Both `process_type` spellings reach the fit and do different things.
+///
+/// `update` rewrites the trees an existing model holds, so it needs one:
+/// without a base model it is refused by name rather than run as a silent
+/// no-op, and with one it produces a *different* ensemble from growing afresh.
+#[test]
+fn every_process_type_spelling_is_honoured_or_rejected_by_name() {
+    let d = rich_data(600, 4);
+    let base = api::train(
+        &training(LearningTaskParameters::default(), TreeBoosterParameters::default()),
+        &d,
+        &[],
+    )
+    .unwrap()
+    .0;
+
+    let update_params = training(
+        LearningTaskParameters::default(),
+        TreeBoosterParameters {
+            process_type: ProcessType::Update,
+            updater: Some(vec![TreeUpdaterName::Refresh]),
+            ..Default::default()
+        },
+    );
+
+    // Without a base model there is nothing to revisit.
+    match api::train(&update_params, &d, &[]) {
+        Ok(_) => panic!("`update` without a base model must be rejected"),
+        Err(e) => assert!(e.to_string().contains("process_type"), "{e}"),
+    }
+
+    // With one, the round rewrites rather than grows.
+    let (updated, _) = api::train_from(&update_params, &d, &[], Some(&base)).unwrap();
+    assert_eq!(updated.num_trees(), base.num_trees(), "`update` adds no trees");
+
+    let (grown, _) = api::train_from(
+        &training(LearningTaskParameters::default(), TreeBoosterParameters::default()),
+        &d,
+        &[],
+        Some(&base),
+    )
+    .unwrap();
+    assert!(grown.num_trees() > base.num_trees(), "`default` grows new trees");
+}
+
+/// `refresh_leaf` decides whether the `refresh` updater rewrites leaf values
+/// or only the statistics beneath them.
+#[test]
+fn refresh_leaf_decides_whether_refresh_moves_the_predictions() {
+    let d = rich_data(600, 4);
+    let base = api::train(
+        &training(LearningTaskParameters::default(), TreeBoosterParameters::default()),
+        &d,
+        &[],
+    )
+    .unwrap()
+    .0;
+    // Refreshing against *different* data is what makes the two settings
+    // visibly differ: refreshing on the same data reproduces the leaves it
+    // already has, so there would be nothing to see.
+    let other = sparse_data(600, 4);
+
+    let refreshed = |refresh_leaf: bool| {
+        let p = training(
+            LearningTaskParameters::default(),
+            TreeBoosterParameters {
+                process_type: ProcessType::Update,
+                updater: Some(vec![TreeUpdaterName::Refresh]),
+                refresh_leaf,
+                ..Default::default()
+            },
+        );
+        api::train_from(&p, &other, &[], Some(&base)).unwrap().0.predict(&d)
+    };
+    let kept = refreshed(false);
+    let moved = refreshed(true);
+    assert_eq!(kept, base.predict(&d), "refresh_leaf = false must not move a prediction");
+    assert_ne!(kept, moved, "refresh_leaf = true must re-fit the leaves");
 }
 
 /// Every `multi_strategy` spelling is honoured or rejected naming the
@@ -637,24 +802,53 @@ fn every_multi_strategy_spelling_is_honoured_or_rejected_by_name() {
     }
 }
 
-/// Every `default_direction` spelling belongs to `exact`, which is not
-/// implemented — so setting it on a `hist` fit changes nothing and setting it
-/// with `exact` is rejected naming `tree_method`.
+/// `default_direction` steers the `exact` updater's missing-value handling, so
+/// every spelling must change an `exact` fit over sparse data — and none of
+/// them may change a `hist` fit, which learns the direction from the
+/// histograms instead.
 #[test]
-fn every_default_direction_spelling_is_accepted_by_the_surface() {
-    let d = universal_data(100);
-    let mut models = Vec::new();
+fn every_default_direction_spelling_steers_the_exact_updater() {
+    // Sparse data, so there are missing values for the direction to route.
+    let d = sparse_data(600, 4);
+
+    let mut exact_models = Vec::new();
+    let mut hist_models = Vec::new();
     for &direction in DefaultDirection::ALL {
         let params =
             TreeBoosterParameters { default_direction: direction, ..Default::default() };
         assert_eq!(params.to_config_map()["default_direction"], direction.as_str());
-        let p = training(LearningTaskParameters::default(), params);
-        models.push(api::train(&p, &d, &[]).unwrap_or_else(|e| panic!("{direction}: {e}")).0.save_model());
+
+        let hist = training(LearningTaskParameters::default(), params.clone());
+        hist_models.push(api::train(&hist, &d, &[]).unwrap().0.save_model());
+
+        let exact = training(
+            LearningTaskParameters::default(),
+            TreeBoosterParameters { tree_method: TreeMethod::Exact, max_depth: 4, ..params },
+        );
+        exact_models
+            .push(api::train(&exact, &d, &[]).unwrap_or_else(|e| panic!("{direction}: {e}")).0);
     }
     assert!(
-        models.windows(2).all(|w| w[0] == w[1]),
-        "`default_direction` steers the `exact` updater only; the hist fit must be unchanged"
+        hist_models.windows(2).all(|w| w[0] == w[1]),
+        "`default_direction` steers `exact` only; a hist fit must be unchanged"
     );
+
+    // `left` sends every missing value left, `right` sends it right, and
+    // `learn` picks per split — so no two agree.
+    let flags = |b: &xgboost_rs::Booster| -> Vec<u64> {
+        let m: serde_json::Value = serde_json::from_str(&b.save_model()).unwrap();
+        m["learner"]["gradient_booster"]["model"]["trees"][0]["default_left"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect()
+    };
+    let left = flags(&exact_models[1]);
+    let right = flags(&exact_models[2]);
+    assert!(left.iter().any(|v| *v == 1), "`left` must route missing values left");
+    assert!(right.iter().all(|v| *v == 0), "`right` must route every missing value right");
+    assert_ne!(left, right);
 }
 
 /// Every `monotone_constraints` spelling reaches the fit, and the list is
@@ -789,7 +983,7 @@ fn every_dart_spelling_reaches_the_fit() {
 /// parameter surface, and a `gblinear` fit is rejected naming the booster —
 /// never accepted as a tree fit in disguise.
 #[test]
-fn every_linear_spelling_is_accepted_by_the_surface_and_rejected_by_the_fit() {
+fn every_linear_spelling_that_the_surface_accepts_also_trains() {
     let d = universal_data(50);
 
     for &updater in LinearUpdater::ALL {
@@ -808,10 +1002,11 @@ fn every_linear_spelling_is_accepted_by_the_surface_and_rejected_by_the_fit() {
                         TreeBoosterParameters::default(),
                     );
                     p.booster.booster = BoosterType::Gblinear(linear);
-                    match api::train(&p, &d, &[]) {
-                        Ok(_) => panic!("`gblinear` is not implemented and must be rejected"),
-                        Err(e) => assert!(e.to_string().contains("gblinear"), "{e}"),
-                    }
+                    p.num_boost_round = 10;
+                    let (booster, _) = api::train(&p, &d, &[])
+                        .unwrap_or_else(|e| panic!("{updater}/{selector}: {e}"));
+                    assert_eq!(booster.num_trees(), 0, "a linear fit grows no trees");
+                    assert!(booster.predict(&d).iter().all(|v| v.is_finite()));
                 }
                 Err(e) => {
                     assert_eq!(updater, LinearUpdater::Shotgun, "{selector}: {e}");

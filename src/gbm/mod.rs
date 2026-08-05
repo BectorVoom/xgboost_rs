@@ -8,11 +8,17 @@
 
 use crate::context::Context;
 use crate::data::{DMatrix, cuts::HistogramCuts, gradient_index::GHistIndex};
+use crate::linear::GBLinear;
 use crate::objective::GradientPair;
 use crate::parameters::{DartNormalizeType, DartParameters, DartSampleType};
+use crate::predictor::TreeRange;
+use crate::data::csc::CscPage;
+use crate::parameters::{ProcessType, TreeUpdaterName};
+use crate::tree::colmaker::ColMaker;
 use crate::tree::hist::HistGrower;
 use crate::tree::model::RegTree;
 use crate::tree::param::TrainParam;
+use crate::tree::refresh::refresh;
 use crate::tree::sampler::RowSampler;
 
 /// `kRtEps`, the floor the weighted dropout sampler compares against.
@@ -39,6 +45,133 @@ impl DartConfig {
             one_drop: dart.one_drop,
             skip_drop: dart.skip_drop,
             learning_rate: dart.tree.eta,
+        }
+    }
+}
+
+/// The gradient booster a fit runs: an ensemble of trees, or a linear model.
+///
+/// This is XGBoost's `GradientBooster` interface reduced to what a fit and a
+/// prediction actually ask of it. It is an enum rather than a trait object
+/// because the two implementations are the whole set — upstream registers no
+/// others — and because prediction needs to ask which one it has (a linear
+/// model has no leaves and no tree range).
+pub enum Booster {
+    /// `gbtree` or `dart`.
+    Tree(GBTree),
+    /// `gblinear`. Boxed because a tree booster is much the larger of the two
+    /// and every `Booster` would otherwise be sized for the bigger one.
+    Linear(Box<GBLinear>),
+}
+
+impl Booster {
+    /// The trees, for the callers that only make sense for a tree model.
+    pub fn tree(&self) -> Option<&GBTree> {
+        match self {
+            Self::Tree(t) => Some(t),
+            Self::Linear(_) => None,
+        }
+    }
+
+    /// The linear model, if this is a `gblinear` booster.
+    pub fn linear(&self) -> Option<&GBLinear> {
+        match self {
+            Self::Linear(l) => Some(l),
+            Self::Tree(_) => None,
+        }
+    }
+
+    /// The XGBoost `booster` name this model records itself under.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Tree(t) => {
+                if t.is_dart() {
+                    "dart"
+                } else {
+                    "gbtree"
+                }
+            }
+            Self::Linear(_) => "gblinear",
+        }
+    }
+
+    pub fn num_feature(&self) -> usize {
+        match self {
+            Self::Tree(t) => t.model.num_feature,
+            Self::Linear(l) => l.model.num_feature,
+        }
+    }
+
+    pub fn num_output_group(&self) -> usize {
+        match self {
+            Self::Tree(t) => t.model.num_output_group.max(1),
+            Self::Linear(l) => l.model.num_output_group.max(1),
+        }
+    }
+
+    pub fn set_num_output_group(&mut self, n: usize) {
+        match self {
+            Self::Tree(t) => t.set_num_output_group(n),
+            Self::Linear(l) => l.set_num_output_group(n),
+        }
+    }
+
+    pub fn boosted_rounds(&self) -> usize {
+        match self {
+            Self::Tree(t) => t.model.num_rounds(),
+            Self::Linear(l) => l.model.num_boosted_rounds,
+        }
+    }
+
+    /// Tell a tree booster whether the objective's hessian is constant, which
+    /// only `approx` reads. A no-op for `gblinear`.
+    pub fn set_constant_hessian(&mut self, constant: bool) {
+        if let Self::Tree(t) = self {
+            t.set_constant_hessian(constant);
+        }
+    }
+
+    /// Prepare for training on `dtrain`. Idempotent.
+    pub fn configure(&mut self, dtrain: &DMatrix) -> crate::Result<()> {
+        match self {
+            Self::Tree(t) => t.configure(dtrain),
+            Self::Linear(l) => l.configure(dtrain),
+        }
+    }
+
+    /// Work done before the round's gradients are taken. Only DART has any.
+    pub fn pre_boost(&mut self, ctx: &mut Context, dtrain: &DMatrix, preds: &mut [f32]) {
+        if let Self::Tree(t) = self {
+            t.pre_boost(ctx, dtrain, preds);
+        }
+    }
+
+    /// Run one boosting round, folding its output into `preds`.
+    pub fn do_boost(
+        &mut self,
+        ctx: &mut Context,
+        dtrain: &DMatrix,
+        gpair: &[GradientPair],
+        preds: &mut [f32],
+    ) -> crate::Result<()> {
+        match self {
+            Self::Tree(t) => t.do_boost(ctx, dtrain, gpair, preds),
+            Self::Linear(l) => l.do_boost(ctx, dtrain, gpair, preds),
+        }
+    }
+
+    /// Raw margins for `dmat`. `trees` is ignored by the linear booster, which
+    /// has no rounds to slice — the API layer rejects a range there rather than
+    /// silently ignoring one.
+    pub fn predict_margin(
+        &self,
+        dmat: &DMatrix,
+        base_margin: &[f32],
+        trees: TreeRange,
+    ) -> Vec<f32> {
+        match self {
+            Self::Tree(t) => crate::predictor::predict_margin(&t.model, dmat, base_margin, trees),
+            Self::Linear(l) => l.predict_margin(dmat, base_margin),
         }
     }
 }
@@ -103,8 +236,11 @@ impl GBTreeModel {
 pub struct GBTree {
     pub model: GBTreeModel,
     param: TrainParam,
-    /// Binned training matrix, built once and reused every round.
+    /// Binned training matrix, built once and reused every round. Only the
+    /// histogram growers need it.
     gindex: Option<GHistIndex>,
+    /// Value-sorted column view, which only the `exact` grower needs.
+    sorted: Option<CscPage>,
     /// Scratch for one group's gradients, and for the sampled copy of them.
     group_gpair: Vec<GradientPair>,
     sampled: Vec<GradientPair>,
@@ -112,6 +248,12 @@ pub struct GBTree {
     dart: Option<DartConfig>,
     /// Trees dropped for the round being grown.
     dropped: Vec<usize>,
+    /// The ensemble `process_type=update` is revisiting. Each round moves one
+    /// round's worth of trees out of here and into the model, rewritten.
+    trees_to_update: Vec<RegTree>,
+    /// Whether the objective's hessian never changes, which lets `approx`
+    /// sketch its quantiles once instead of once per round.
+    constant_hessian: bool,
 }
 
 impl GBTree {
@@ -122,11 +264,20 @@ impl GBTree {
             model,
             param,
             gindex: None,
+            sorted: None,
             group_gpair: Vec::new(),
             sampled: Vec::new(),
             dart: None,
             dropped: Vec::new(),
+            trees_to_update: Vec::new(),
+            constant_hessian: false,
         }
+    }
+
+    /// Tell the booster whether the objective's hessian is constant. Only
+    /// `approx` reads it.
+    pub fn set_constant_hessian(&mut self, constant: bool) {
+        self.constant_hessian = constant;
     }
 
     /// Turn this booster into `dart`: every round drops a random subset of the
@@ -159,11 +310,43 @@ impl GBTree {
     /// Cuts depend only on the data and `max_bin`, so this is done once per
     /// booster rather than once per round.
     pub fn configure(&mut self, dtrain: &DMatrix) -> crate::Result<()> {
-        if self.gindex.is_none() {
-            let cuts = crate::data::cuts::build_cuts(dtrain, self.param.max_bin)?;
-            self.gindex = Some(crate::data::gradient_index::build_gradient_index(dtrain, &cuts)?);
+        // `GBTreeModel::InitTreesToUpdate`: under `update` the model starts
+        // empty and the existing ensemble is set aside. Each round then moves
+        // one round of it back, rewritten — so a fit that stops early leaves a
+        // *shorter* model rather than a half-rewritten one, and the prediction
+        // cache grows exactly as it does for an ordinary fit.
+        if self.param.process_type == ProcessType::Update && self.trees_to_update.is_empty() {
+            self.trees_to_update = std::mem::take(&mut self.model.trees);
+            self.model.tree_info.clear();
+            self.model.tree_weight.clear();
+        }
+        match self.grower_kind() {
+            Some(TreeUpdaterName::GrowColMaker) => {
+                if self.sorted.is_none() {
+                    self.sorted = Some(crate::threading::install(|| {
+                        CscPage::build_sorted(dtrain, 0..dtrain.num_row())
+                    }));
+                }
+            }
+            // `approx` re-sketches per round from the current hessians, so
+            // there is nothing to build ahead of time.
+            Some(TreeUpdaterName::GrowHistMaker) => {}
+            Some(_) if self.gindex.is_none() => {
+                let cuts = crate::data::cuts::build_cuts(dtrain, self.param.max_bin)?;
+                self.gindex =
+                    Some(crate::data::gradient_index::build_gradient_index(dtrain, &cuts)?);
+            }
+            Some(_) => {}
+            // `process_type=update` has no grower: it rewrites existing trees.
+            None => {}
         }
         Ok(())
+    }
+
+    /// The updater that grows trees this round, or `None` under
+    /// `process_type=update` where every stage only modifies existing ones.
+    fn grower_kind(&self) -> Option<TreeUpdaterName> {
+        self.param.updaters.iter().copied().find(|u| !u.can_modify_tree())
     }
 
     /// Choose this round's dropped trees and remove them from `preds`.
@@ -244,12 +427,18 @@ impl GBTree {
         }
     }
 
-    /// Grow this round's trees from `gpair` and fold their output into `preds`.
+    /// Run one round of the updater pipeline and fold its output into
+    /// `preds`.
     ///
     /// `gpair` and `preds` are both row-major `(row, group)`. With
     /// `num_parallel_tree > 1` every tree of a group is grown from the same
     /// gradients but its own row and column samples, which is what turns the
     /// fit into a boosted forest.
+    ///
+    /// Under `process_type=update` nothing is grown: the round takes the trees
+    /// the model already holds at this round's slots and hands them to the
+    /// tree-modifying stages instead, which is why the prediction update
+    /// subtracts the old contribution before adding the new one.
     pub fn do_boost(
         &mut self,
         ctx: &mut Context,
@@ -258,19 +447,57 @@ impl GBTree {
         preds: &mut [f32],
     ) -> crate::Result<()> {
         self.configure(dtrain)?;
-        let gindex = self.gindex.as_ref().expect("configured above");
         let n_groups = self.model.num_output_group.max(1);
         let n_rows = dtrain.num_row();
-
-        let sampler = RowSampler::new(self.param.sampling_method, self.param.subsample);
-        let is_sampling = sampler.is_sampling(n_rows);
-        let mut grower = HistGrower::new(&self.param, gindex, dtrain);
-        let mut first_tree = true;
 
         // DART's rescaling depends only on how many trees were dropped and how
         // many are about to be added, both of which are known now.
         let size_new = n_groups * self.param.num_parallel_tree.max(1) as usize;
         let (new_weight, drop_factor) = self.dart_weights(size_new);
+
+        match self.grower_kind() {
+            Some(kind) => self.grow_round(
+                ctx, dtrain, gpair, preds, kind, n_groups, n_rows, new_weight,
+            )?,
+            None => self.update_round(dtrain, gpair, preds, n_groups, n_rows),
+        }
+
+        self.rescale_dropped(dtrain, preds, drop_factor);
+        Ok(())
+    }
+
+    /// A `process_type=default` round: grow this round's trees.
+    #[allow(clippy::too_many_arguments)]
+    fn grow_round(
+        &mut self,
+        ctx: &mut Context,
+        dtrain: &DMatrix,
+        gpair: &[GradientPair],
+        preds: &mut [f32],
+        kind: TreeUpdaterName,
+        n_groups: usize,
+        n_rows: usize,
+        new_weight: f32,
+    ) -> crate::Result<()> {
+        // `approx` rebuilds its binned matrix from each group's hessians, so
+        // it cannot share one grower across the round the way the other two do.
+        if kind == TreeUpdaterName::GrowHistMaker {
+            return self.grow_round_approx(ctx, dtrain, gpair, preds, n_groups, n_rows, new_weight);
+        }
+
+        let sampler = RowSampler::new(self.param.sampling_method, self.param.subsample);
+        // The `exact` updater draws its own row sample, because it excludes a
+        // row by marking its position rather than by zeroing its gradient.
+        let exact = kind == TreeUpdaterName::GrowColMaker;
+        let is_sampling = !exact && sampler.is_sampling(n_rows);
+
+        let param = &self.param;
+        let mut grower = if exact {
+            Grower::Exact(ColMaker::new(param, self.sorted.as_ref().expect("configured"), dtrain))
+        } else {
+            Grower::Hist(HistGrower::new(param, self.gindex.as_ref().expect("configured"), dtrain))
+        };
+        let mut first_tree = true;
 
         for gid in 0..n_groups {
             // One group's gradients, gathered out of the interleaved buffer.
@@ -302,17 +529,141 @@ impl GBTree {
 
                 let mut tree = RegTree::new(self.model.num_feature);
                 grower.grow(ctx, tree_gpair, &mut tree);
-                // Prediction cache update: the row sets already say which leaf
-                // each row reached, so no tree traversal is needed.
-                grower.update_predictions(&tree, preds, n_groups, gid, new_weight);
+
+                // The tree-modifying stages run after the grower, in the order
+                // the pipeline names them. They can move leaf values and
+                // renumber nodes, so the prediction cache is only safe to
+                // update from the grower's row sets when nothing changed.
+                let modified =
+                    run_modifiers(&mut tree, &self.param.updaters, &self.param, dtrain, tree_gpair);
+                if modified {
+                    add_tree_predictions(&tree, dtrain, preds, n_groups, gid, new_weight);
+                } else {
+                    // The row sets already say which leaf each row reached, so
+                    // no tree traversal is needed.
+                    grower.update_predictions(&tree, preds, n_groups, gid, new_weight);
+                }
                 self.model.trees.push(tree);
                 self.model.tree_info.push(gid as u32);
                 self.model.tree_weight.push(new_weight);
             }
         }
-
-        self.rescale_dropped(dtrain, preds, drop_factor);
         Ok(())
+    }
+
+    /// A `process_type=default` round under the `approx` tree method.
+    ///
+    /// The difference from [`grow_round`](Self::grow_round) is where the
+    /// quantile cuts come from: `approx` re-sketches the matrix each round,
+    /// weighting every row by its hessian, so the bins track wherever the
+    /// current model is least certain. That also fixes two smaller
+    /// differences, both of which upstream has too — the row sample is drawn
+    /// once per group rather than once per tree (the sketch has to be built
+    /// from *some* sample), and the binned matrix is rebuilt per group.
+    #[allow(clippy::too_many_arguments)]
+    fn grow_round_approx(
+        &mut self,
+        ctx: &mut Context,
+        dtrain: &DMatrix,
+        gpair: &[GradientPair],
+        preds: &mut [f32],
+        n_groups: usize,
+        n_rows: usize,
+        new_weight: f32,
+    ) -> crate::Result<()> {
+        let sampler = RowSampler::new(self.param.sampling_method, self.param.subsample);
+        let is_sampling = sampler.is_sampling(n_rows);
+
+        for gid in 0..n_groups {
+            let mut group_gpair: Vec<GradientPair> = if n_groups == 1 {
+                gpair.to_vec()
+            } else {
+                (0..n_rows).map(|r| gpair[r * n_groups + gid]).collect()
+            };
+            if is_sampling {
+                let seed = ctx.rng().next_u32() as u64;
+                sampler.sample(&mut group_gpair, seed, ctx.threads());
+            }
+
+            // Skipped once built when the objective's hessian is constant:
+            // re-sketching would give the same cuts, and upstream skips it too.
+            if !(self.constant_hessian && self.gindex.is_some()) {
+                self.gindex =
+                    Some(build_approx_index(dtrain, self.param.max_bin, &group_gpair)?);
+            }
+
+            let param = &self.param;
+            let mut grower =
+                HistGrower::new(param, self.gindex.as_ref().expect("rebuilt above"), dtrain);
+            for i in 0..self.param.num_parallel_tree {
+                if i > 0 {
+                    grower.reset();
+                }
+                let mut tree = RegTree::new(self.model.num_feature);
+                grower.grow(ctx, &group_gpair, &mut tree);
+
+                let modified = run_modifiers(
+                    &mut tree,
+                    &self.param.updaters,
+                    &self.param,
+                    dtrain,
+                    &group_gpair,
+                );
+                if modified {
+                    add_tree_predictions(&tree, dtrain, preds, n_groups, gid, new_weight);
+                } else {
+                    grower.update_predictions(&tree, preds, n_groups, gid, new_weight);
+                }
+                self.model.trees.push(tree);
+                self.model.tree_info.push(gid as u32);
+                self.model.tree_weight.push(new_weight);
+            }
+        }
+        Ok(())
+    }
+
+    /// A `process_type=update` round: move one round of the set-aside
+    /// ensemble back into the model, rewritten by the modifying stages.
+    ///
+    /// The gradients each round sees are the ones the *partially rebuilt*
+    /// model produces, not the full original ensemble's — which is what makes
+    /// `refresh` idempotent on an unchanged dataset: round `i` re-fits tree `i`
+    /// against exactly the residuals it was originally grown from.
+    fn update_round(
+        &mut self,
+        dtrain: &DMatrix,
+        gpair: &[GradientPair],
+        preds: &mut [f32],
+        n_groups: usize,
+        n_rows: usize,
+    ) {
+        let per_tree = self.param.num_parallel_tree.max(1) as usize;
+        let round = self.model.trees.len() / (per_tree * n_groups);
+
+        for gid in 0..n_groups {
+            let group_gpair: &[GradientPair] = if n_groups == 1 {
+                gpair
+            } else {
+                self.group_gpair.clear();
+                self.group_gpair.extend((0..n_rows).map(|r| gpair[r * n_groups + gid]));
+                &self.group_gpair
+            };
+
+            for i in 0..per_tree {
+                let slot = round * per_tree * n_groups + gid * per_tree + i;
+                let Some(tree) = self.trees_to_update.get_mut(slot) else {
+                    // Upstream refuses to run more update rounds than the base
+                    // model has; stopping leaves a valid, shorter ensemble.
+                    return;
+                };
+                let mut tree = std::mem::replace(tree, RegTree::new(0));
+                run_modifiers(&mut tree, &self.param.updaters, &self.param, dtrain, group_gpair);
+                add_tree_predictions(&tree, dtrain, preds, n_groups, gid, 1.0);
+                self.model.trees.push(tree);
+                self.model.tree_info.push(gid as u32);
+                self.model.tree_weight.push(1.0);
+            }
+        }
     }
 
     /// `Dart::NormalizeTrees`: the weight new trees take, and the factor the
@@ -355,6 +706,110 @@ impl GBTree {
             }
         }
         self.dropped.clear();
+    }
+}
+
+/// Sketch and bin the matrix from a round's hessians, which is what makes
+/// `approx` approximate: the bin boundaries follow the current model's
+/// uncertainty rather than the raw data distribution.
+///
+/// A row the sampler excluded has a zero hessian and so a zero sketch weight,
+/// which drops it from the quantiles as well as from the histograms.
+fn build_approx_index(
+    dtrain: &DMatrix,
+    max_bin: u32,
+    gpair: &[GradientPair],
+) -> crate::Result<GHistIndex> {
+    let info = dtrain.info();
+    let weights: Vec<f32> =
+        gpair.iter().enumerate().map(|(r, g)| g.hess * info.weight(r)).collect();
+    let cuts = crate::data::cuts::build_cuts_weighted(dtrain, max_bin, Some(&weights))?;
+    crate::data::gradient_index::build_gradient_index(dtrain, &cuts)
+}
+
+/// The grower a round runs, chosen by the pipeline's first non-modifying
+/// updater.
+enum Grower<'a> {
+    Hist(HistGrower<'a>),
+    Exact(ColMaker<'a>),
+}
+
+impl Grower<'_> {
+    fn reset(&mut self) {
+        match self {
+            Self::Hist(g) => g.reset(),
+            Self::Exact(g) => g.reset(),
+        }
+    }
+
+    fn grow(&mut self, ctx: &mut Context, gpair: &[GradientPair], tree: &mut RegTree) {
+        match self {
+            Self::Hist(g) => g.grow(ctx, gpair, tree),
+            Self::Exact(g) => g.grow(ctx, gpair, tree),
+        }
+    }
+
+    fn update_predictions(
+        &self,
+        tree: &RegTree,
+        preds: &mut [f32],
+        n_groups: usize,
+        group: usize,
+        weight: f32,
+    ) {
+        match self {
+            Self::Hist(g) => g.update_predictions(tree, preds, n_groups, group, weight),
+            Self::Exact(g) => g.update_predictions(tree, preds, n_groups, group, weight),
+        }
+    }
+}
+
+/// Run every tree-modifying stage of `updaters`, in order.
+///
+/// Returns whether any of them actually changed the tree, which is what tells
+/// the caller the grower's row sets are no longer a valid shortcut to the
+/// prediction update.
+fn run_modifiers(
+    tree: &mut RegTree,
+    updaters: &[TreeUpdaterName],
+    param: &TrainParam,
+    dtrain: &DMatrix,
+    gpair: &[GradientPair],
+) -> bool {
+    let mut modified = false;
+    for updater in updaters {
+        match updater {
+            TreeUpdaterName::Refresh => {
+                refresh(tree, dtrain, gpair, param, param.refresh_leaf);
+                modified = true;
+            }
+            TreeUpdaterName::Prune => {
+                let pruned =
+                    tree.prune(param.min_split_loss, param.max_depth, param.learning_rate);
+                modified |= pruned > 0;
+            }
+            _ => {}
+        }
+    }
+    modified
+}
+
+/// Add one tree's leaf values to `preds`, by traversal.
+///
+/// The slow path, used when the grower's row sets no longer describe the tree —
+/// after a modifying stage — and when a round has to take an existing tree's
+/// contribution back out.
+fn add_tree_predictions(
+    tree: &RegTree,
+    dmat: &DMatrix,
+    preds: &mut [f32],
+    n_groups: usize,
+    group: usize,
+    weight: f32,
+) {
+    for r in 0..dmat.num_row() {
+        let leaf = tree.leaf_index(|f| feature_value(dmat, r, f));
+        preds[r * n_groups + group] += weight * tree.nodes[leaf].value;
     }
 }
 

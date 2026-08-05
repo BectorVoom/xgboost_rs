@@ -8,6 +8,13 @@
 /// Marker for "no child", as upstream's `kInvalidNodeId`.
 pub const INVALID_NODE: i32 = -1;
 
+/// `kDeletedNodeMarker`: the split index a pruned-away node is stamped with.
+///
+/// Upstream writes `UINT32_MAX` into the packed `(default_left, split_index)`
+/// word, which reads back as split index `2^31 - 1` with the default-left flag
+/// set. Both halves are reproduced so a pruned tree serialises byte for byte.
+pub const DELETED_SPLIT_INDEX: u32 = (1 << 31) - 1;
+
 /// One entry of the TreeSHAP "unique path", upstream's `PathElement`.
 ///
 /// `zero_fraction` and `one_fraction` are the fractions of subsets in which the
@@ -135,6 +142,9 @@ pub struct RegTree {
     pub stats: Vec<NodeStat>,
     /// Depth of each node, indexed by node id.
     depths: Vec<i32>,
+    /// Whether a node has been pruned away. A deleted node keeps its slot so
+    /// the ids around it never move.
+    deleted: Vec<bool>,
     num_feature: usize,
 }
 
@@ -145,6 +155,7 @@ impl RegTree {
             nodes: vec![Node::default()],
             stats: vec![NodeStat::default()],
             depths: vec![0],
+            deleted: vec![false],
             num_feature,
         }
     }
@@ -161,9 +172,13 @@ impl RegTree {
         self.depths[nid]
     }
 
-    /// Number of leaves in the tree.
+    /// Number of leaves in the tree, ignoring the slots pruning retired.
     pub fn num_leaves(&self) -> usize {
-        self.nodes.iter().filter(|n| n.is_leaf()).count()
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(nid, n)| n.is_leaf() && !self.deleted[*nid])
+            .count()
     }
 
     /// Set a leaf's output value.
@@ -211,8 +226,109 @@ impl RegTree {
             NodeStat { loss_chg: 0.0, sum_hess: right_sum, base_weight: right_leaf_weight };
     }
 
+    /// `TreePruner::DoPrune`: collapse every split whose loss reduction is
+    /// below `min_split_loss`, or that sits deeper than `max_depth`.
+    ///
+    /// Pruning is bottom-up and repeats: collapsing a split can leave its own
+    /// parent with two leaf children, which may then be prunable in turn. The
+    /// return value is the number of nodes removed.
+    ///
+    /// A removed node keeps its slot, marked deleted, rather than being
+    /// renumbered away. That is what upstream does, and it is what keeps a
+    /// pruned tree's node ids — which the saved model records — identical to
+    /// the reference implementation's.
+    pub fn prune(&mut self, min_split_loss: f32, max_depth: i32, learning_rate: f32) -> usize {
+        let mut pruned = 0usize;
+        for nid in 0..self.nodes.len() {
+            if !self.deleted[nid] && self.nodes[nid].is_leaf() {
+                pruned +=
+                    self.try_prune_leaf(nid, self.depths[nid], min_split_loss, max_depth, learning_rate);
+            }
+        }
+        pruned
+    }
+
+    /// `TreePruner::TryPruneLeaf`, walking up from a leaf for as long as each
+    /// parent qualifies.
+    fn try_prune_leaf(
+        &mut self,
+        nid: usize,
+        depth: i32,
+        min_split_loss: f32,
+        max_depth: i32,
+        learning_rate: f32,
+    ) -> usize {
+        let mut nid = nid;
+        let mut depth = depth;
+        let mut pruned = 0usize;
+        loop {
+            let parent = self.nodes[nid].parent;
+            if parent < 0 {
+                return pruned;
+            }
+            let pid = parent as usize;
+            let (left, right) = (self.nodes[pid].left, self.nodes[pid].right);
+            // Only a parent whose *both* children are already leaves can go.
+            let balanced = left != INVALID_NODE
+                && right != INVALID_NODE
+                && self.nodes[left as usize].is_leaf()
+                && self.nodes[right as usize].is_leaf();
+            let stat = self.stats[pid];
+            let need_prune =
+                stat.loss_chg < min_split_loss || (max_depth != 0 && depth > max_depth);
+            if !(balanced && need_prune) {
+                return pruned;
+            }
+            self.delete_node(left as usize);
+            self.delete_node(right as usize);
+            self.nodes[pid].left = INVALID_NODE;
+            self.nodes[pid].right = INVALID_NODE;
+            self.nodes[pid].value = learning_rate * stat.base_weight;
+            pruned += 2;
+            nid = pid;
+            depth -= 1;
+        }
+    }
+
+    /// `RegTree::DeleteNode`: retire a node's slot without moving anything.
+    fn delete_node(&mut self, nid: usize) {
+        self.deleted[nid] = true;
+        self.nodes[nid].split_index = DELETED_SPLIT_INDEX;
+        self.nodes[nid].default_left = true;
+    }
+
+    /// Whether node `nid` has been pruned away.
+    #[inline]
+    pub fn is_deleted(&self, nid: usize) -> bool {
+        self.deleted[nid]
+    }
+
+    /// Nodes still occupying a slot but no longer part of the tree.
+    pub fn num_deleted(&self) -> usize {
+        self.deleted.iter().filter(|d| **d).count()
+    }
+
+    /// Mark every node unreachable from the root as deleted, which is how a
+    /// loaded model recovers the flags `num_deleted` only counts.
+    pub(crate) fn recompute_deleted(&mut self) {
+        let mut reachable = vec![false; self.nodes.len()];
+        let mut stack = vec![0usize];
+        while let Some(nid) = stack.pop() {
+            if nid >= self.nodes.len() || reachable[nid] {
+                continue;
+            }
+            reachable[nid] = true;
+            if !self.nodes[nid].is_leaf() {
+                stack.push(self.nodes[nid].left as usize);
+                stack.push(self.nodes[nid].right as usize);
+            }
+        }
+        self.deleted = reachable.into_iter().map(|r| !r).collect();
+    }
+
     /// Recompute node depths from the parent links, after loading a model.
     pub(crate) fn recompute_depths(&mut self) {
+        self.deleted.resize(self.nodes.len(), false);
         self.depths = vec![0; self.nodes.len()];
         for nid in 0..self.nodes.len() {
             let parent = self.nodes[nid].parent;
@@ -226,6 +342,7 @@ impl RegTree {
         let nid = self.nodes.len();
         self.nodes.push(Node { parent, ..Default::default() });
         self.stats.push(NodeStat::default());
+        self.deleted.push(false);
         let depth = if parent >= 0 { self.depths[parent as usize] + 1 } else { 0 };
         self.depths.push(depth);
         nid

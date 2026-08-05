@@ -6,8 +6,9 @@
 //! serialisation does.
 
 use crate::api::Booster;
-use crate::gbm::{GBTree, GBTreeModel};
+use crate::gbm::{Booster as GradientBooster, GBTree, GBTreeModel};
 use crate::learner::Learner;
+use crate::linear::{GBLinear, GBLinearModel};
 use crate::tree::model::{INVALID_NODE, Node, NodeStat, RegTree};
 use crate::tree::param::TrainParam;
 use crate::{Error, Result};
@@ -19,7 +20,52 @@ const ROOT_PARENT: i64 = 2147483647;
 /// Serialise a booster to XGBoost's JSON model format.
 pub fn save_model(booster: &Booster) -> String {
     let learner = booster.learner();
-    let model = &learner.gbm().model;
+    match learner.booster() {
+        GradientBooster::Tree(_) => save_tree_model(booster),
+        GradientBooster::Linear(linear) => save_linear_model(learner, linear),
+    }
+}
+
+/// Serialise a `gblinear` model. Its `gradient_booster` holds one flat weight
+/// array — features then the intercepts — rather than a tree list.
+fn save_linear_model(learner: &Learner, linear: &GBLinear) -> String {
+    let model = &linear.model;
+    let is_multiclass = learner.objective().name().starts_with("multi:");
+    let n_groups = model.num_output_group.max(1);
+    let (num_class, num_target) = if is_multiclass { (n_groups, 1) } else { (0, n_groups) };
+
+    let doc = json!({
+        "learner": {
+            "attributes": {},
+            "feature_names": [],
+            "feature_types": [],
+            "gradient_booster": {
+                "name": "gblinear",
+                "model": {
+                    "weights": model.weight,
+                    "boosted_rounds": model.num_boosted_rounds,
+                },
+            },
+            "learner_model_param": {
+                "base_score": format_base_score(learner.base_scores()),
+                "boost_from_average": "1",
+                "num_class": num_class.to_string(),
+                "num_feature": model.num_feature.to_string(),
+                "num_target": num_target.to_string(),
+            },
+            "objective": {
+                "name": learner.objective().name(),
+                "reg_loss_param": { "scale_pos_weight": "1" },
+            },
+        },
+        "version": [3, 0, 5],
+    });
+    doc.to_string()
+}
+
+fn save_tree_model(booster: &Booster) -> String {
+    let learner = booster.learner();
+    let model = &learner.gbm().expect("checked by the caller").model;
 
     let trees: Vec<Value> = model.trees.iter().enumerate().map(|(i, t)| tree_to_json(i, t)).collect();
     // One entry per boosting round, so a round contributes
@@ -36,7 +82,7 @@ pub fn save_model(booster: &Booster) -> String {
 
     // A DART model is a gbtree model plus the per-tree weights dropout left
     // behind, and it records itself under its own booster name.
-    let is_dart = learner.gbm().is_dart();
+    let is_dart = learner.gbm().expect("checked by the caller").is_dart();
     let booster_name = if is_dart { "dart" } else { "gbtree" };
     let weight_drop: Vec<f32> =
         if is_dart { model.tree_weight.clone() } else { Vec::new() };
@@ -117,7 +163,7 @@ fn tree_to_json(id: usize, tree: &RegTree) -> Value {
         "split_type": vec![0u8; n],
         "sum_hessian": sum_hessian,
         "tree_param": {
-            "num_deleted": "0",
+            "num_deleted": tree.num_deleted().to_string(),
             "num_feature": tree.num_feature().to_string(),
             "num_nodes": n.to_string(),
             "size_leaf_vector": "1",
@@ -138,6 +184,9 @@ pub fn load_model(text: &str) -> Result<Booster> {
         .and_then(Value::as_str)
         .ok_or_else(|| Error::ModelFormat("missing gradient_booster name".into()))?;
     // `dart` is a `gbtree` model plus per-tree weights, so both load here.
+    if booster_name == "gblinear" {
+        return load_linear_model(learner_json);
+    }
     if booster_name != "gbtree" && booster_name != "dart" {
         return Err(Error::ModelFormat(format!("unsupported booster `{booster_name}`")));
     }
@@ -208,7 +257,62 @@ pub fn load_model(text: &str) -> Result<Booster> {
     gbm.model =
         GBTreeModel { tree_weight, trees, tree_info, num_feature, num_parallel_tree, num_output_group };
 
-    let learner = Learner::from_model(obj, vec![metric], gbm, base_score)?;
+    let learner =
+        Learner::from_model(obj, vec![metric], GradientBooster::Tree(gbm), base_score)?;
+    Ok(Booster::from_learner(learner))
+}
+
+/// Parse a `gblinear` model.
+fn load_linear_model(learner_json: &Value) -> Result<Booster> {
+    let param = learner_json
+        .get("learner_model_param")
+        .ok_or_else(|| Error::ModelFormat("missing learner_model_param".into()))?;
+    let base_score = parse_base_score(param)?;
+    let num_feature = parse_str_usize(param, "num_feature")?;
+    let num_class = parse_str_usize(param, "num_class").unwrap_or(0);
+    let num_target = parse_str_usize(param, "num_target").unwrap_or(1);
+    let num_output_group = if num_class > 0 { num_class } else { num_target.max(1) };
+
+    let objective_name = learner_json
+        .pointer("/objective/name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::ModelFormat("missing objective name".into()))?;
+
+    let weight: Vec<f32> = learner_json
+        .pointer("/gradient_booster/model/weights")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::ModelFormat("missing gblinear weights".into()))?
+        .iter()
+        .map(|v| {
+            v.as_f64()
+                .map(|f| f as f32)
+                .ok_or_else(|| Error::ModelFormat("`weights` holds a non-number".into()))
+        })
+        .collect::<Result<Vec<f32>>>()?;
+    let expected = (num_feature + 1) * num_output_group;
+    if weight.len() != expected {
+        return Err(Error::ModelFormat(format!(
+            "gblinear has {} weights, expected ({num_feature} + 1) * {num_output_group} = \
+             {expected}",
+            weight.len()
+        )));
+    }
+
+    let num_boosted_rounds = learner_json
+        .pointer("/gradient_booster/model/boosted_rounds")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+
+    let obj = objective_from_model(objective_name, num_class)?;
+    let metric = crate::metric::create(&obj.default_metric())?;
+    let model =
+        GBLinearModel { weight, num_feature, num_output_group, num_boosted_rounds };
+    let learner = Learner::from_model(
+        obj,
+        vec![metric],
+        GradientBooster::Linear(Box::new(GBLinear::from_model(model))),
+        base_score,
+    )?;
     Ok(Booster::from_learner(learner))
 }
 
@@ -276,6 +380,10 @@ fn tree_from_json(t: &Value, num_feature: usize) -> Result<RegTree> {
         })
         .collect();
     tree.recompute_depths();
+    // `num_deleted` only counts the retired slots; which ones they are is
+    // recovered from the links, since nothing unreachable from the root is
+    // part of the tree.
+    tree.recompute_deleted();
     Ok(tree)
 }
 

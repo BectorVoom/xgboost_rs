@@ -161,6 +161,59 @@ def dump_case(name: str, dmat: xgb.DMatrix, params: dict, num_round: int, extra:
     print(f"wrote {path.relative_to(ROOT)}  ({path.stat().st_size / 1024:.0f} KiB)")
 
 
+def dump_method_case(
+    name: str,
+    dmat: xgb.DMatrix,
+    params: dict,
+    num_round: int,
+    extra: dict,
+    base: xgb.Booster | None = None,
+) -> xgb.Booster:
+    """A case for a tree method or booster other than plain `hist`.
+
+    Kept separate from `dump_case` because these cases are compared on
+    predictions, metrics and tree structure but not on quantile cuts: `approx`
+    re-sketches per round, `exact` never sketches at all, and `gblinear` has no
+    trees to compare.
+    """
+    params = dict(params)
+    params.setdefault("nthread", 1)
+    params.setdefault("objective", "reg:squarederror")
+    params.setdefault("seed", 0)
+    metric = params.setdefault("eval_metric", "rmse")
+
+    evals_result: dict = {}
+    booster = xgb.train(
+        params,
+        dmat,
+        num_boost_round=num_round,
+        evals=[(dmat, "train")],
+        evals_result=evals_result,
+        verbose_eval=False,
+        xgb_model=base,
+    )
+    model = json.loads(booster.save_raw(raw_format="json").decode("utf-8"))
+    gbm = model["learner"]["gradient_booster"]
+
+    case = {
+        "xgboost_version": xgb.__version__,
+        "params": params,
+        "num_round": num_round,
+        "base_score": float(model["learner"]["learner_model_param"]["base_score"]),
+        "metric": metric,
+        "metric_history": [float(v) for v in evals_result["train"][metric]],
+        "predictions": [float(v) for v in booster.predict(dmat)],
+        "margins": [float(v) for v in booster.predict(dmat, output_margin=True)],
+        "trees": gbm.get("model", {}).get("trees", []),
+        "weights": gbm.get("model", {}).get("weights", []),
+        **extra,
+    }
+    path = OUT / f"{name}.json"
+    path.write_text(json.dumps(case, separators=(",", ":")))
+    print(f"wrote {path.relative_to(ROOT)}  ({path.stat().st_size / 1024:.0f} KiB)")
+    return booster
+
+
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
 
@@ -226,6 +279,143 @@ def main() -> None:
     )
 
 
+def tree_method_cases() -> None:
+    """Cases for the tree methods, boosters and updaters beyond CPU `hist`."""
+    datasets: dict[str, xgb.DMatrix] = {}
+
+    x, y = dense_small()
+    datasets["dense_small"] = xgb.DMatrix(x, label=y)
+    x, y = dense_dup()
+    datasets["dense_dup"] = xgb.DMatrix(x, label=y)
+    x, y = dense_missing()
+    datasets["dense_missing"] = xgb.DMatrix(x, label=y)
+    x, y, w = weighted()
+    datasets["weighted"] = xgb.DMatrix(x, label=y, weight=w)
+    indptr, indices, values, labels, n_col = libsvm_to_csr(AGARICUS)
+    csr = scipy.sparse.csr_matrix(
+        (np.asarray(values, dtype=np.float32), np.asarray(indices), np.asarray(indptr)),
+        shape=(len(labels), n_col),
+    )
+    datasets["agaricus"] = xgb.DMatrix(csr, label=np.asarray(labels, dtype=np.float32))
+
+    shape = {
+        name: {"n_row": int(d.num_row()), "n_col": int(d.num_col())}
+        for name, d in datasets.items()
+    }
+
+    def case(name, data, params, rounds):
+        dump_method_case(
+            name, datasets[data], params, rounds, {"data": data, **shape[data]}
+        )
+
+    # --- exact ---
+    case("exact_dense_small", "dense_small", {"tree_method": "exact", "max_depth": 4, "eta": 0.3}, 5)
+    case(
+        "exact_missing",
+        "dense_missing",
+        {"tree_method": "exact", "max_depth": 5, "eta": 0.3, "alpha": 0.5},
+        4,
+    )
+    # `gamma` is applied by the `prune` stage of the exact pipeline, so this
+    # case pins the pruned tree — deleted node slots included.
+    case(
+        "exact_gamma",
+        "dense_dup",
+        {"tree_method": "exact", "max_depth": 4, "eta": 0.3, "gamma": 0.5},
+        4,
+    )
+    case("exact_sparse", "agaricus", {"tree_method": "exact", "max_depth": 4, "eta": 0.3}, 3)
+    case(
+        "exact_logistic",
+        "agaricus",
+        {
+            "tree_method": "exact",
+            "max_depth": 4,
+            "eta": 0.3,
+            "objective": "binary:logistic",
+            "eval_metric": "logloss",
+        },
+        4,
+    )
+    case(
+        "exact_weighted",
+        "weighted",
+        {"tree_method": "exact", "max_depth": 4, "eta": 0.3, "min_child_weight": 2.0},
+        4,
+    )
+
+    # --- approx ---
+    case(
+        "approx_dense_small",
+        "dense_small",
+        {"tree_method": "approx", "max_depth": 4, "eta": 0.3, "max_bin": 64},
+        5,
+    )
+    case("approx_missing", "dense_missing", {"tree_method": "approx", "max_depth": 5, "eta": 0.3}, 4)
+    case("approx_sparse", "agaricus", {"tree_method": "approx", "max_depth": 4, "eta": 0.3}, 3)
+    # A varying hessian is what makes `approx` re-sketch every round, so this
+    # is the case that actually exercises the weighted sketch.
+    case(
+        "approx_logistic",
+        "agaricus",
+        {
+            "tree_method": "approx",
+            "max_depth": 4,
+            "eta": 0.3,
+            "objective": "binary:logistic",
+            "eval_metric": "logloss",
+        },
+        4,
+    )
+    case(
+        "approx_weighted",
+        "weighted",
+        {"tree_method": "approx", "max_depth": 4, "eta": 0.3, "max_bin": 32},
+        4,
+    )
+
+    # --- gblinear ---
+    for updater in ("shotgun", "coord_descent"):
+        case(
+            f"linear_{updater}",
+            "dense_small",
+            {"booster": "gblinear", "updater": updater, "eta": 0.5, "lambda": 0.1},
+            30,
+        )
+
+    # --- continued training and process_type=update ---
+    base_params = {"tree_method": "hist", "max_depth": 4, "eta": 0.3}
+    base = dump_method_case(
+        "update_base",
+        datasets["dense_small"],
+        base_params,
+        4,
+        {"data": "dense_small", **shape["dense_small"]},
+    )
+    dump_method_case(
+        "update_continued",
+        datasets["dense_small"],
+        base_params,
+        3,
+        {"data": "dense_small", "base": "update_base", **shape["dense_small"]},
+        base=base,
+    )
+    for name, updater, gamma in [
+        ("update_refresh", "refresh", 0.0),
+        ("update_prune", "prune", 2.0),
+        ("update_refresh_prune", "refresh,prune", 2.0),
+    ]:
+        dump_method_case(
+            name,
+            datasets["dense_small"],
+            {**base_params, "process_type": "update", "updater": updater, "gamma": gamma},
+            4,
+            {"data": "dense_small", "base": "update_base", **shape["dense_small"]},
+            base=base,
+        )
+
+
 if __name__ == "__main__":
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     main()
+    tree_method_cases()

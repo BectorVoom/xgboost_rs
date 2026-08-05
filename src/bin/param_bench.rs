@@ -14,13 +14,52 @@
 //! Each configuration is timed best-of-`--repeats` whole fits, so every one
 //! pays its own quantile sketch and binning pass and none benefits from a
 //! cache another cannot use. `rel` is against the first row of the group.
+//!
+//! # Measured
+//!
+//! At `--rows 200000 --features 40 --rounds 10` on 8 threads, relative to the
+//! group's first row. Absolute times are machine-dependent; the ratios are the
+//! point, and they are what the implementation notes elsewhere refer to.
+//!
+//! | Group | What moves | Ratio |
+//! |---|---|---|
+//! | `tree_method` | `hist` -> `approx` (constant hessian) | 1.00x |
+//! | | `hist` -> `approx` (varying hessian) | 4.6x |
+//! | | `hist` -> `exact` | 10.5x |
+//! | `opt_dense_col` | `1.0` -> `0.5` on a 25%-sparse matrix | 0.57x |
+//! | `gblinear` | `cyclic` -> `thrifty` | 1.2x |
+//! | | `cyclic` -> `greedy` | 8.5x |
+//! | | `gbtree` -> `gblinear/cyclic` | 0.88x |
+//! | `max_depth` | 4 -> 10 | 3.2x |
+//! | `num_class` | 2 -> 8 | 2.9x |
+//! | `dart` | `rate_drop` 0 -> 0.5 | 5.1x |
+//! | `nthread` | 1 -> 8 | 0.48x |
+//!
+//! Three of those deserve a note, because the number is the *point* of the
+//! parameter rather than an artefact:
+//!
+//! * **`approx` costs nothing extra under a constant hessian.** Its sketch is
+//!   weighted by the hessian, and `reg:squarederror`'s hessian is `1` for
+//!   every row in every round — so the sketch is the one `hist` already built
+//!   and it is not rebuilt. Give the hessian something to vary and the full
+//!   per-round re-sketch and re-bin appears, at 4.6x.
+//! * **`exact` is an order of magnitude slower**, which is the trade it makes:
+//!   every distinct value is a split candidate instead of one per bin, and
+//!   there is no binned matrix to compress the scan.
+//! * **`greedy` is quadratic in the feature count.** It re-scans the whole
+//!   matrix once per feature it selects; `thrifty` ranks every feature in a
+//!   single pass and then cycles that order, which is why it lands at 1.2x
+//!   rather than 8.5x. (The `gblinear` group's `rel` column is against a
+//!   `gbtree` reference row, so read those two ratios off the `cyclic` row:
+//!   0.88x, 1.02x and 7.46x of the tree fit respectively.)
 
 use std::time::Instant;
 
 use xgboost_rs::parameters::{
-    BoosterParameters, BoosterType, DartParameters, EvalMetric, GeneralParameters, GrowPolicy,
-    LearningTaskParameters, MonotoneConstraint, Objective, SamplingMethod, TrainingParameters,
-    TreeBoosterParameters, VerboseEval, Verbosity,
+    BoosterParameters, BoosterType, DartParameters, EvalMetric, FeatureSelector,
+    GeneralParameters, GrowPolicy, LearningTaskParameters, LinearBoosterParameters, LinearUpdater,
+    MonotoneConstraint, Objective, SamplingMethod, TrainingParameters, TreeBoosterParameters,
+    TreeMethod, VerboseEval, Verbosity,
 };
 use xgboost_rs::{DMatrix, api};
 
@@ -99,6 +138,34 @@ fn unit_label_data(args: &Args) -> DMatrix {
     let mut d = make_data(args.rows, args.features);
     let labels: Vec<f32> = (0..args.rows).map(|i| f32::from(i % 3 == 0)).collect();
     d.set_labels(&labels).unwrap();
+    d
+}
+
+/// The same relationship with a quarter of the values missing.
+///
+/// `opt_dense_col` only bites on a column that *has* missing values, so the
+/// dense matrix the rest of the sweep uses would measure nothing there.
+fn sparse_data(args: &Args) -> DMatrix {
+    let mut rng = Rng(0x1234_5678_9abc_def0);
+    let (rows, features) = (args.rows, args.features);
+    let mut x: Vec<f32> = (0..rows * features).map(|_| rng.next_f32()).collect();
+    let y: Vec<f32> = (0..rows)
+        .map(|r| {
+            let row = &x[r * features..(r + 1) * features];
+            row[0] * 2.0 + row[1 % features] * row[1 % features] * 3.0
+        })
+        .collect();
+    // Drawn, not strided: a stride that shares a factor with the row length
+    // would blank whole columns and leave every other one fully dense, which
+    // is exactly the case `opt_dense_col` cannot distinguish.
+    let mut mask = Rng(0x9e37_79b9_7f4a_7c15);
+    for v in x.iter_mut() {
+        if mask.next_f32() < 0.25 {
+            *v = f32::NAN;
+        }
+    }
+    let mut d = DMatrix::from_dense(&x, rows, features, f32::NAN).unwrap();
+    d.set_labels(&y).unwrap();
     d
 }
 
@@ -448,6 +515,80 @@ fn groups(args: &Args) -> Vec<Group> {
         dart.push(Case::new(format!("dart/rate_drop={rate_drop}"), params));
     }
     groups.push(Group { name: "dart", cases: dart });
+
+    // Tree method. The three do fundamentally different amounts of work per
+    // level: `hist` bins once up front and reduces histograms, `approx`
+    // re-sketches and re-bins the whole matrix every round, and `exact` scans
+    // every distinct value of every column with no binning at all.
+    let mut methods = Vec::new();
+    for tree_method in [TreeMethod::Hist, TreeMethod::Approx, TreeMethod::Exact] {
+        methods.push(Case::new(
+            tree_method.to_string(),
+            base_params(TreeBoosterParameters { tree_method, ..tree() }, args),
+        ));
+    }
+    // `approx` only re-sketches when the hessian moves, so the same sweep on a
+    // logistic objective is the one that pays the full per-round cost.
+    for tree_method in [TreeMethod::Hist, TreeMethod::Approx] {
+        let mut params =
+            base_params(TreeBoosterParameters { tree_method, ..tree() }, args);
+        params.booster.learning.objective = Objective::RegLogistic;
+        methods.push(
+            Case::new(format!("{tree_method} (varying hessian)"), params)
+                .with_data(unit_label_data(args)),
+        );
+    }
+    groups.push(Group { name: "tree_method", cases: methods });
+
+    // `opt_dense_col` is the `exact` updater's one speed knob: a column
+    // sparser than this threshold gets a *second*, forward scan on top of the
+    // backward one, which is what lets the fit learn a per-split missing-value
+    // direction. Lowering it trades that freedom for half the column work, so
+    // it only measures anything on a matrix that has missing values — hence
+    // the sparse matrix here.
+    groups.push(Group {
+        name: "opt_dense_col",
+        cases: [1.0f32, 0.5, 0.0]
+            .into_iter()
+            .map(|opt_dense_col| {
+                Case::new(
+                    format!("exact/opt_dense_col={opt_dense_col}"),
+                    base_params(
+                        TreeBoosterParameters {
+                            tree_method: TreeMethod::Exact,
+                            opt_dense_col,
+                            ..tree()
+                        },
+                        args,
+                    ),
+                )
+                .with_data(sparse_data(args))
+            })
+            .collect(),
+    });
+
+    // The linear booster, and the feature selectors that decide how much work
+    // one coordinate sweep does. `greedy` re-scans the whole matrix per
+    // feature, so it is quadratic in the feature count; `thrifty` is its
+    // linear approximation.
+    let mut linear = vec![Case::new("gbtree (reference)", base_params(tree(), args))];
+    for (updater, selector) in [
+        (LinearUpdater::Shotgun, FeatureSelector::Cyclic),
+        (LinearUpdater::Shotgun, FeatureSelector::Shuffle),
+        (LinearUpdater::CoordDescent, FeatureSelector::Cyclic),
+        (LinearUpdater::CoordDescent, FeatureSelector::Random),
+        (LinearUpdater::CoordDescent, FeatureSelector::Thrifty),
+        (LinearUpdater::CoordDescent, FeatureSelector::Greedy),
+    ] {
+        let mut params = base_params(tree(), args);
+        params.booster.booster = BoosterType::Gblinear(LinearBoosterParameters {
+            updater,
+            feature_selector: selector,
+            ..Default::default()
+        });
+        linear.push(Case::new(format!("gblinear/{updater}/{selector}"), params));
+    }
+    groups.push(Group { name: "gblinear", cases: linear });
 
     // Thread scaling. Runs last: it is the only group that ignores `--threads`.
     groups.push(Group {

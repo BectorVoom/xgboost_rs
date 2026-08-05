@@ -467,6 +467,36 @@ impl HistogramCuts {
 /// feature. Each feature still sees its values in row order, exactly as the
 /// serial path does, so the cuts do not depend on the thread count.
 pub fn build_cuts(dmat: &DMatrix, max_bin: u32) -> Result<HistogramCuts> {
+    build_cuts_weighted(dmat, max_bin, None)
+}
+
+/// The same sketch, with an explicit per-row weight.
+///
+/// This is the `hessian` argument of upstream's `SketchOnDMatrix`, and it is
+/// what makes `approx` a different tree method from `hist`: `hist` sketches
+/// once with the matrix's own row weights, `approx` re-sketches every round
+/// with `hessian * row weight`, so the bin boundaries follow wherever the
+/// current model is least certain. A row whose weight is zero — which is what
+/// row sampling produces — contributes nothing, exactly as upstream's
+/// zero-weight skip does.
+pub fn build_cuts_weighted(
+    dmat: &DMatrix,
+    max_bin: u32,
+    row_weights: Option<&[f32]>,
+) -> Result<HistogramCuts> {
+    if let Some(w) = row_weights
+        && w.len() != dmat.num_row()
+    {
+        return Err(crate::Error::DataShape { expected: dmat.num_row(), got: w.len() });
+    }
+    build_cuts_impl(dmat, max_bin, row_weights)
+}
+
+fn build_cuts_impl(
+    dmat: &DMatrix,
+    max_bin: u32,
+    row_weights: Option<&[f32]>,
+) -> Result<HistogramCuts> {
     let n_features = dmat.num_col();
     let column_sizes = dmat.column_sizes();
     let max_bins = max_bin as usize;
@@ -491,7 +521,10 @@ pub fn build_cuts(dmat: &DMatrix, max_bin: u32) -> Result<HistogramCuts> {
             let first = c * chunk;
             let last = first + group.len();
             for r in 0..dmat.num_row() {
-                let w = dmat.info.weight(r);
+                let w = match row_weights {
+                    Some(weights) => weights[r],
+                    None => dmat.info.weight(r),
+                };
                 let (idx, val) = dmat.row(r);
                 for (&col, &v) in idx.iter().zip(val) {
                     let col = col as usize;
