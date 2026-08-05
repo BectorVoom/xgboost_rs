@@ -51,6 +51,9 @@ pub struct TrainParam {
     pub monotone_constraints: Vec<MonotoneConstraint>,
     /// Feature groups allowed to interact; `None` means unconstrained.
     pub interaction_constraints: Option<Vec<Vec<u32>>>,
+    /// Histogram buffers the grower may keep for reuse. Bounds the memory a
+    /// deep or wide tree holds; it changes speed, never the model.
+    pub max_cached_hist_node: u64,
 }
 
 impl Default for TrainParam {
@@ -74,6 +77,8 @@ impl Default for TrainParam {
             num_parallel_tree: 1,
             monotone_constraints: Vec::new(),
             interaction_constraints: None,
+            // `HistMakerTrainParam::CpuDefaultNodes`.
+            max_cached_hist_node: 1 << 16,
         }
     }
 }
@@ -165,7 +170,11 @@ pub fn calc_gain_given_weight(p: &TrainParam, stats: &GradStats, w: f32) -> f32 
 }
 
 /// A candidate split, mirroring `SplitEntry`.
-#[derive(Clone, Debug, Default)]
+///
+/// `Copy` because it is pure data that the split search moves around by the
+/// thousand: the per-task results of a wide level are merged one by one, and a
+/// memcpy beats a `clone` call there.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SplitEntry {
     pub loss_chg: f32,
     /// Feature index with the default-left flag in bit 31.
@@ -229,7 +238,7 @@ impl SplitEntry {
         if !self.need_replace(other.loss_chg, other.split_index()) {
             return false;
         }
-        self.clone_from(other);
+        *self = *other;
         true
     }
 }

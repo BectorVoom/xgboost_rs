@@ -22,12 +22,24 @@ pub fn save_model(booster: &Booster) -> String {
     let model = &learner.gbm().model;
 
     let trees: Vec<Value> = model.trees.iter().enumerate().map(|(i, t)| tree_to_json(i, t)).collect();
-    // One entry per boosting round, so a forest round contributes
-    // `num_parallel_tree` trees to a single interval.
-    let per_round = model.num_parallel_tree.max(1) as usize;
+    // One entry per boosting round, so a round contributes
+    // `num_parallel_tree * num_output_group` trees to a single interval.
+    let per_round = model.trees_per_round();
     let iteration_indptr: Vec<usize> =
         (0..=model.trees.len() / per_round).map(|i| i * per_round).collect();
-    let tree_info = vec![0u32; model.trees.len()];
+
+    // `num_class` and `num_target` split the output groups the way upstream
+    // does: a classification model records classes, anything else targets.
+    let is_multiclass = learner.objective().name().starts_with("multi:");
+    let n_groups = model.num_output_group.max(1);
+    let (num_class, num_target) = if is_multiclass { (n_groups, 1) } else { (0, n_groups) };
+
+    // A DART model is a gbtree model plus the per-tree weights dropout left
+    // behind, and it records itself under its own booster name.
+    let is_dart = learner.gbm().is_dart();
+    let booster_name = if is_dart { "dart" } else { "gbtree" };
+    let weight_drop: Vec<f32> =
+        if is_dart { model.tree_weight.clone() } else { Vec::new() };
 
     let doc = json!({
         "learner": {
@@ -41,17 +53,18 @@ pub fn save_model(booster: &Booster) -> String {
                         "num_trees": model.trees.len().to_string(),
                     },
                     "iteration_indptr": iteration_indptr,
-                    "tree_info": tree_info,
+                    "tree_info": model.tree_info,
                     "trees": trees,
                 },
-                "name": "gbtree",
+                "name": booster_name,
+                "weight_drop": weight_drop,
             },
             "learner_model_param": {
-                "base_score": format_f32(learner.base_score()),
+                "base_score": format_base_score(learner.base_scores()),
                 "boost_from_average": "1",
-                "num_class": "0",
+                "num_class": num_class.to_string(),
                 "num_feature": model.num_feature.to_string(),
-                "num_target": "1",
+                "num_target": num_target.to_string(),
             },
             "objective": {
                 "name": learner.objective().name(),
@@ -124,14 +137,15 @@ pub fn load_model(text: &str) -> Result<Booster> {
         .pointer("/gradient_booster/name")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::ModelFormat("missing gradient_booster name".into()))?;
-    if booster_name != "gbtree" {
+    // `dart` is a `gbtree` model plus per-tree weights, so both load here.
+    if booster_name != "gbtree" && booster_name != "dart" {
         return Err(Error::ModelFormat(format!("unsupported booster `{booster_name}`")));
     }
 
     let param = learner_json
         .get("learner_model_param")
         .ok_or_else(|| Error::ModelFormat("missing learner_model_param".into()))?;
-    let base_score = parse_str_f32(param, "base_score")?;
+    let base_score = parse_base_score(param)?;
     let num_feature = parse_str_usize(param, "num_feature")?;
 
     let objective_name = learner_json
@@ -155,12 +169,63 @@ pub fn load_model(text: &str) -> Result<Booster> {
         .unwrap_or(1)
         .max(1);
 
-    let obj = crate::objective::create(objective_name)?;
-    let metric = crate::metric::create(obj.default_metric())?;
-    let mut gbm = GBTree::new(num_feature, TrainParam::default());
-    gbm.model = GBTreeModel { trees, num_feature, num_parallel_tree };
+    // Output groups: `num_class` for a classifier, `num_target` otherwise.
+    let num_class = parse_str_usize(param, "num_class").unwrap_or(0);
+    let num_target = parse_str_usize(param, "num_target").unwrap_or(1);
+    let num_output_group = if num_class > 0 { num_class } else { num_target.max(1) };
 
-    Ok(Booster::from_learner(Learner::from_model(obj, metric, gbm, base_score)))
+    let tree_info: Vec<u32> = learner_json
+        .pointer("/gradient_booster/model/tree_info")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect())
+        .unwrap_or_else(|| vec![0; trees.len()]);
+    if tree_info.len() != trees.len() {
+        return Err(Error::ModelFormat(format!(
+            "tree_info has {} entries for {} trees",
+            tree_info.len(),
+            trees.len()
+        )));
+    }
+
+    // `dart` records one weight per tree; `gbtree` leaves them all at 1.
+    let tree_weight: Vec<f32> = learner_json
+        .pointer("/gradient_booster/weight_drop")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_f64).map(|v| v as f32).collect())
+        .filter(|w: &Vec<f32>| !w.is_empty())
+        .unwrap_or_else(|| vec![1.0; trees.len()]);
+    if tree_weight.len() != trees.len() {
+        return Err(Error::ModelFormat(format!(
+            "weight_drop has {} entries for {} trees",
+            tree_weight.len(),
+            trees.len()
+        )));
+    }
+
+    let obj = objective_from_model(objective_name, num_class)?;
+    let metric = crate::metric::create(&obj.default_metric())?;
+    let mut gbm = GBTree::new(num_feature, TrainParam::default());
+    gbm.model =
+        GBTreeModel { tree_weight, trees, tree_info, num_feature, num_parallel_tree, num_output_group };
+
+    let learner = Learner::from_model(obj, vec![metric], gbm, base_score)?;
+    Ok(Booster::from_learner(learner))
+}
+
+/// Rebuild the objective a saved model names, supplying the `num_class` the
+/// model header carries rather than the placeholder `from_str` would give.
+fn objective_from_model(
+    name: &str,
+    num_class: usize,
+) -> Result<Box<dyn crate::objective::Objective>> {
+    use crate::parameters::Objective as Spec;
+    let spec: Spec = name.parse()?;
+    let spec = match (spec, num_class) {
+        (Spec::MultiSoftmax { .. }, k) if k > 0 => Spec::MultiSoftmax { num_class: k as u32 },
+        (Spec::MultiSoftprob { .. }, k) if k > 0 => Spec::MultiSoftprob { num_class: k as u32 },
+        (other, _) => other,
+    };
+    crate::objective::create(&spec, 1.0)
 }
 
 fn tree_from_json(t: &Value, num_feature: usize) -> Result<RegTree> {
@@ -220,12 +285,35 @@ fn format_f32(v: f32) -> String {
     v.to_string()
 }
 
-fn parse_str_f32(v: &Value, key: &str) -> Result<f32> {
-    v.get(key)
+/// `base_score` as `LearnerModelParamLegacy` writes it: a bare number for a
+/// single-output model, and the `(a,b,c)` array form when a multi-output fit
+/// has one intercept per output.
+fn format_base_score(values: &[f32]) -> String {
+    match values {
+        [] => "0.5".to_owned(),
+        [single] => format_f32(*single),
+        many => {
+            let joined = many.iter().map(|v| format_f32(*v)).collect::<Vec<_>>().join(",");
+            format!("({joined})")
+        }
+    }
+}
+
+/// Parse either spelling of `base_score`.
+fn parse_base_score(v: &Value) -> Result<Vec<f32>> {
+    let text = v
+        .get("base_score")
         .and_then(Value::as_str)
-        .ok_or_else(|| Error::ModelFormat(format!("missing `{key}`")))?
-        .parse::<f32>()
-        .map_err(|e| Error::ModelFormat(format!("`{key}` is not a float: {e}")))
+        .ok_or_else(|| Error::ModelFormat("missing `base_score`".into()))?;
+    let body = text.trim();
+    let body = body.strip_prefix('(').and_then(|b| b.strip_suffix(')')).unwrap_or(body);
+    body.split(',')
+        .map(|part| {
+            part.trim()
+                .parse::<f32>()
+                .map_err(|e| Error::ModelFormat(format!("`base_score` is not a float: {e}")))
+        })
+        .collect()
 }
 
 fn parse_str_usize(v: &Value, key: &str) -> Result<usize> {

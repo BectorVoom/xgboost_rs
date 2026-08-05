@@ -27,6 +27,27 @@
 //! lane order. Both the block size and the lane count depend only on the data,
 //! never on the thread count, so a model trained on 1 core and on 32 cores is
 //! bit-identical.
+//!
+//! # Why `lossguide` scales worse than `depthwise`
+//!
+//! Measured on 200k x 40, 64 leaves: single-threaded the two policies are
+//! within ~12% of each other, but on 8 threads `depthwise` speeds up 2.4x and
+//! `lossguide` only 1.7x. The cause is the lane rule above. `depthwise`
+//! expands a whole level at once, so even when every node is too small for a
+//! second lane there are many nodes to build concurrently. `lossguide` expands
+//! one node at a time, and a node with fewer than `BLOCK_ROWS` rows gets a
+//! single lane — so its histogram is built on one thread while the rest idle.
+//! The effect shrinks as rows grow and nodes get big enough to earn lanes:
+//! the same fit speeds up 1.45x at 50k rows, 1.71x at 200k and 2.18x at 1M.
+//!
+//! Closing that gap means giving small nodes more lanes, which means changing
+//! the block size, which changes the order the `f64` bin sums accumulate in —
+//! and that is part of the model, not an implementation detail. It was tried:
+//! dropping `BLOCK_ROWS` to 512 bought only ~6% even with the model free to
+//! move, so the gap is mostly memory bandwidth rather than idle threads, and
+//! is not worth the bit-exactness. Two other attempts measured as no better
+//! or worse: chunking the split-evaluation task list into fatter rayon jobs,
+//! and spreading a single node's histogram zeroing across threads.
 
 use super::column_sampler::{ColumnSampler, FeatureSet};
 use super::evaluator::{InteractionConstraints, SplitEvaluator};
@@ -332,11 +353,15 @@ struct HistCollection {
     /// kilobytes and every level would otherwise allocate a fresh set.
     free: Vec<Vec<GradStats>>,
     total_bins: usize,
+    /// `max_cached_hist_node`: how many buffers may be held for reuse. Past
+    /// this the released ones are dropped instead, which trades allocator
+    /// traffic for a smaller resident set on a wide tree.
+    max_cached: usize,
 }
 
 impl HistCollection {
-    fn new(total_bins: usize) -> Self {
-        Self { data: Vec::new(), free: Vec::new(), total_bins }
+    fn new(total_bins: usize, max_cached: usize) -> Self {
+        Self { data: Vec::new(), free: Vec::new(), total_bins, max_cached }
     }
 
     /// Give node `nid` a buffer of the right size. Its contents are undefined;
@@ -358,7 +383,9 @@ impl HistCollection {
     fn release(&mut self, nid: usize) {
         if nid < self.data.len() && !self.data[nid].is_empty() {
             let buf = std::mem::take(&mut self.data[nid]);
-            self.free.push(buf);
+            if self.free.len() < self.max_cached {
+                self.free.push(buf);
+            }
         }
     }
 
@@ -477,7 +504,10 @@ impl<'a> HistGrower<'a> {
             param,
             gi,
             dmat,
-            hist: HistCollection::new(gi.total_bins()),
+            hist: HistCollection::new(
+                gi.total_bins(),
+                param.max_cached_hist_node.min(usize::MAX as u64) as usize,
+            ),
             partitioner: Partitioner::new(dmat.num_row()),
             snode: Vec::new(),
             lane_buf: Vec::new(),
@@ -569,14 +599,25 @@ impl<'a> HistGrower<'a> {
 
     /// Add each row's leaf value to `preds`, using the row sets rather than
     /// re-traversing the tree.
-    pub fn update_predictions(&self, tree: &RegTree, preds: &mut [f32]) {
+    ///
+    /// `preds` is row-major `(row, group)`, so a multi-output fit writes into
+    /// the column of the group this tree belongs to. `weight` is the tree's
+    /// own weight, which is `1` outside DART.
+    pub fn update_predictions(
+        &self,
+        tree: &RegTree,
+        preds: &mut [f32],
+        n_groups: usize,
+        group: usize,
+        weight: f32,
+    ) {
         for nid in 0..tree.num_nodes() {
             if !tree.nodes[nid].is_leaf() {
                 continue;
             }
-            let value = tree.nodes[nid].value;
+            let value = tree.nodes[nid].value * weight;
             for &rid in self.partitioner.rows(nid) {
-                preds[rid as usize] += value;
+                preds[rid as usize * n_groups + group] += value;
             }
         }
     }
@@ -881,6 +922,13 @@ impl<'a> HistGrower<'a> {
             nodes.iter().map(|&nid| std::mem::take(&mut self.hist.data[nid])).collect();
 
         // Single-lane nodes: zero and accumulate in one pass over the node set.
+        //
+        // Zeroing here is a bulk write with no ordering to preserve, so it
+        // could in principle be spread further when the batch is one node —
+        // that was measured and made `lossguide` slower, because the nested
+        // dispatch costs more than the memset it splits. Accumulation could not
+        // be spread further in any case: which rows land in which lane fixes
+        // the summation order, and that is part of the model.
         targets
             .par_iter_mut()
             .enumerate()
@@ -947,6 +995,10 @@ impl<'a> HistGrower<'a> {
     /// merged per node. The merge rule is a total order on `(loss change,
     /// smallest feature index)`, so the result does not depend on how the work
     /// was scheduled.
+    ///
+    /// Chunking the task list into fatter jobs was measured and made no
+    /// difference: rayon's adaptive splitting already stops well short of
+    /// costing more than it saves, on both growth policies.
     fn evaluate_splits(&self, nodes: &[usize], features: &[FeatureSet]) -> Vec<SplitEntry> {
         debug_assert_eq!(nodes.len(), features.len());
         // Flat task list: one entry per (node, candidate feature) pair.
@@ -958,24 +1010,7 @@ impl<'a> HistGrower<'a> {
 
         let per_task: Vec<SplitEntry> = tasks
             .par_iter()
-            .map(|&(node_idx, fidx)| {
-                let nid = nodes[node_idx];
-                let mut best = SplitEntry::default();
-                if !self.constraints.query(nid, fidx) {
-                    return best;
-                }
-                let hist = self.hist.get(nid);
-                let parent = self.snode[nid];
-                let non_missing = self.enumerate_forward(nid, fidx, hist, &parent, &mut best);
-                // A feature has missing values in this node exactly when its
-                // bins do not account for the node's whole gradient sum.
-                if non_missing.sum_grad != parent.stats.sum_grad
-                    || non_missing.sum_hess != parent.stats.sum_hess
-                {
-                    self.enumerate_backward(nid, fidx, hist, &parent, &mut best);
-                }
-                best
-            })
+            .map(|&(node_idx, fidx)| self.evaluate_one(nodes[node_idx], fidx))
             .collect();
 
         let mut out = vec![SplitEntry::default(); nodes.len()];
@@ -983,6 +1018,26 @@ impl<'a> HistGrower<'a> {
             out[*node_idx].update_entry(candidate);
         }
         out
+    }
+
+    /// The best split of one node on one feature.
+    #[inline]
+    fn evaluate_one(&self, nid: usize, fidx: u32) -> SplitEntry {
+        let mut best = SplitEntry::default();
+        if !self.constraints.query(nid, fidx) {
+            return best;
+        }
+        let hist = self.hist.get(nid);
+        let parent = self.snode[nid];
+        let non_missing = self.enumerate_forward(nid, fidx, hist, &parent, &mut best);
+        // A feature has missing values in this node exactly when its bins do
+        // not account for the node's whole gradient sum.
+        if non_missing.sum_grad != parent.stats.sum_grad
+            || non_missing.sum_hess != parent.stats.sum_hess
+        {
+            self.enumerate_backward(nid, fidx, hist, &parent, &mut best);
+        }
+        best
     }
 
     fn enumerate_forward(

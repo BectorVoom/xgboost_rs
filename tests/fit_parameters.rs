@@ -694,15 +694,29 @@ fn unimplemented_algorithm_choices_are_rejected_not_ignored() {
     let err = train_error(&gpu, &d, &[]);
     assert!(err.contains("device"), "{err}");
 
-    let mut objective = params(TreeBoosterParameters::default(), 1);
-    objective.booster.learning.objective = Objective::BinaryLogistic;
-    let err = train_error(&objective, &d, &[]);
-    assert!(err.contains("objective"), "{err}");
+    // `gblinear` has no tree updater at all, so it is named in the rejection.
+    let mut linear = params(TreeBoosterParameters::default(), 1);
+    linear.booster.booster =
+        BoosterType::Gblinear(xgboost_rs::parameters::LinearBoosterParameters::default());
+    let err = train_error(&linear, &d, &[]);
+    assert!(err.contains("gblinear"), "{err}");
+}
 
-    let mut metric = params(TreeBoosterParameters::default(), 1);
-    metric.booster.learning.eval_metric = vec![EvalMetric::Auc];
-    let err = train_error(&metric, &d, &[(&d, "train")]);
-    assert!(err.contains("eval_metric"), "{err}");
+/// The objectives and metrics that used to be rejected now train, so the
+/// rejection list must not silently grow back over them.
+#[test]
+fn implemented_objectives_and_metrics_are_accepted() {
+    let x: Vec<f32> = (0..200).map(|i| (i % 17) as f32 / 17.0).collect();
+    let y: Vec<f32> = (0..200).map(|i| f32::from(i % 3 == 0)).collect();
+    let mut d = DMatrix::from_dense(&x, 200, 1, f32::NAN).unwrap();
+    d.set_labels(&y).unwrap();
+
+    let mut p = params(TreeBoosterParameters::default(), 2);
+    p.booster.learning.objective = Objective::BinaryLogistic;
+    p.booster.learning.eval_metric = vec![EvalMetric::Auc, EvalMetric::Logloss];
+    let (_, history) = api::train(&p, &d, &[(&d, "train")]).expect("binary:logistic must train");
+    let names: Vec<&str> = history[0].iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["train-auc", "train-logloss"]);
 }
 
 /// `auto` and `hist` are the same algorithm, so both must be accepted and give

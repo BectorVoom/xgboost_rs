@@ -145,6 +145,68 @@ impl Lcg63 {
     }
 }
 
+impl Mt19937 {
+    /// `std::uniform_real_distribution<double>{0, 1}`, which the standard
+    /// defines as `generate_canonical<double, 53>`.
+    ///
+    /// A 32-bit engine needs `ceil(53 / 32) = 2` draws, combined
+    /// low-word-first; reproducing the draw count matters because it is what
+    /// keeps the engine's stream aligned with C++'s.
+    pub fn next_f64(&mut self) -> f64 {
+        let lo = self.next_u32() as u64;
+        let hi = self.next_u32() as u64;
+        let value = (lo as f64 + hi as f64 * 4_294_967_296.0) / 18_446_744_073_709_551_616.0;
+        // The division can round up to exactly 1, which the half-open range
+        // forbids; libstdc++ caps it at the predecessor of 1.
+        if value >= 1.0 { F64_JUST_BELOW_ONE } else { value }
+    }
+}
+
+/// `std::minstd_rand`, i.e.
+/// `linear_congruential_engine<uint_fast32_t, 48271, 0, 2147483647>`.
+///
+/// The pair sampler in the `mean` LambdaMART method is seeded per query group
+/// from this engine upstream, so the same generator is reproduced here rather
+/// than substituting a different one — the pairs a query trains on are part of
+/// what the model is.
+#[derive(Clone, Copy, Debug)]
+pub struct MinStdRand {
+    state: u32,
+}
+
+impl MinStdRand {
+    const MULTIPLIER: u64 = 48271;
+    const MODULUS: u64 = 2_147_483_647;
+
+    pub fn new(seed: u32) -> Self {
+        let state = (seed as u64 % Self::MODULUS) as u32;
+        // A zero state is absorbing, so the standard substitutes 1.
+        Self { state: if state == 0 { 1 } else { state } }
+    }
+
+    pub fn next_u32(&mut self) -> u32 {
+        self.state = ((self.state as u64 * Self::MULTIPLIER) % Self::MODULUS) as u32;
+        self.state
+    }
+
+    /// A uniform integer in `[0, n)`, following libstdc++'s
+    /// `uniform_int_distribution` rejection scheme. Returns `0` for `n == 0`.
+    pub fn next_below(&mut self, n: usize) -> usize {
+        if n <= 1 {
+            return 0;
+        }
+        let range = n as u64;
+        let engine_range = Self::MODULUS - 1;
+        let scaling = engine_range / range;
+        let past = range * scaling;
+        let mut draw = self.next_u32() as u64;
+        while draw >= past {
+            draw = self.next_u32() as u64;
+        }
+        (draw / scaling) as usize
+    }
+}
+
 /// The largest `f64` below 1, `std::nextafter(1.0, 0.0)`.
 const F64_JUST_BELOW_ONE: f64 = f64::from_bits(0x3fef_ffff_ffff_ffff);
 /// The largest `f32` below 1, `std::nextafterf(1.0f, 0.0f)`.

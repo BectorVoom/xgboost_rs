@@ -10,14 +10,41 @@ pub mod gradient_index;
 
 use crate::{Error, Result};
 
+/// Whether a column holds numbers or category codes.
+///
+/// Mirrors `xgboost::FeatureType`. A categorical column's values are integral
+/// category codes, and splits on it partition the categories rather than
+/// comparing against a threshold.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FeatureType {
+    /// Ordered numeric values; splits are `value < threshold`.
+    #[default]
+    Numerical,
+    /// Unordered category codes; splits are set membership.
+    Categorical,
+}
+
 /// Labels and per-row metadata attached to a [`DMatrix`].
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MetaInfo {
     pub num_row: usize,
     pub num_col: usize,
+    /// Row-major `num_row * num_target` labels.
     pub labels: Vec<f32>,
+    /// Outputs per row. `1` for the ordinary single-target case.
+    pub num_target: usize,
     pub weights: Option<Vec<f32>>,
+    /// Row-major `num_row * n_groups` initial margins.
     pub base_margin: Option<Vec<f32>>,
+    /// Lower censoring bound per row, for `survival:aft`.
+    pub label_lower_bound: Option<Vec<f32>>,
+    /// Upper censoring bound per row, for `survival:aft`.
+    pub label_upper_bound: Option<Vec<f32>>,
+    /// Query-group boundaries for the `rank:*` objectives, as `num_group + 1`
+    /// row offsets. Empty means "one group covering every row".
+    pub group_ptr: Vec<usize>,
+    /// Per-column feature type. Empty means "every column numerical".
+    pub feature_types: Vec<FeatureType>,
 }
 
 impl MetaInfo {
@@ -27,6 +54,61 @@ impl MetaInfo {
         match &self.weights {
             Some(w) => w[i],
             None => 1.0,
+        }
+    }
+
+    /// Outputs per row, treating an unset `num_target` as the single-target
+    /// case so a matrix built before labels were attached still reads sanely.
+    #[inline]
+    pub fn n_targets(&self) -> usize {
+        self.num_target.max(1)
+    }
+
+    /// Label of row `i`, output `t`.
+    #[inline]
+    pub fn label(&self, i: usize, t: usize) -> f32 {
+        self.labels[i * self.n_targets() + t]
+    }
+
+    /// Whether column `f` holds category codes.
+    #[inline]
+    pub fn is_categorical(&self, f: usize) -> bool {
+        matches!(self.feature_types.get(f), Some(FeatureType::Categorical))
+    }
+
+    /// Any categorical column at all — the flag that switches the split
+    /// enumerators onto their partition-based path.
+    pub fn has_categorical(&self) -> bool {
+        self.feature_types.iter().any(|t| *t == FeatureType::Categorical)
+    }
+
+    /// Query-group row ranges, defaulting to one group over every row.
+    ///
+    /// `LambdaRankObj` treats an unset group as a single query, which makes an
+    /// unset `group` a valid (if degenerate) ranking configuration rather than
+    /// an error.
+    pub fn groups(&self) -> Vec<(usize, usize)> {
+        if self.group_ptr.len() < 2 {
+            return vec![(0, self.num_row)];
+        }
+        self.group_ptr.windows(2).map(|w| (w[0], w[1])).collect()
+    }
+
+    /// Lower censoring bound of row `i`, falling back to the label.
+    #[inline]
+    pub fn lower_bound(&self, i: usize) -> f32 {
+        match &self.label_lower_bound {
+            Some(v) => v[i],
+            None => self.labels[i],
+        }
+    }
+
+    /// Upper censoring bound of row `i`, falling back to the label.
+    #[inline]
+    pub fn upper_bound(&self, i: usize) -> f32 {
+        match &self.label_upper_bound {
+            Some(v) => v[i],
+            None => self.labels[i],
         }
     }
 }
@@ -159,15 +241,103 @@ impl DMatrix {
             row_ptr,
             index,
             value,
-            info: MetaInfo { num_row, num_col: ncol, labels, ..Default::default() },
+            info: MetaInfo { num_row, num_col: ncol, labels, num_target: 1, ..Default::default() },
         })
     }
 
     pub fn set_labels(&mut self, y: &[f32]) -> Result<()> {
-        if y.len() != self.info.num_row {
-            return Err(Error::DataShape { expected: self.info.num_row, got: y.len() });
+        self.set_labels_multi(y, 1)
+    }
+
+    /// Attach `num_target` labels per row, laid out row-major.
+    ///
+    /// This is what makes `num_target > 1` a real configuration rather than a
+    /// declared one: the objective reads `num_target` from the label shape, as
+    /// `ObjFunction::Targets` does upstream.
+    pub fn set_labels_multi(&mut self, y: &[f32], num_target: usize) -> Result<()> {
+        if num_target == 0 {
+            return Err(Error::invalid("num_target", "must be at least 1"));
+        }
+        if y.len() != self.info.num_row * num_target {
+            return Err(Error::DataShape {
+                expected: self.info.num_row * num_target,
+                got: y.len(),
+            });
         }
         self.info.labels = y.to_vec();
+        self.info.num_target = num_target;
+        Ok(())
+    }
+
+    /// Attach the censoring interval `survival:aft` and
+    /// `interval-regression-accuracy` read. `+inf` upper bounds mark
+    /// right-censored rows, `0` lower bounds left-censored ones.
+    pub fn set_label_bounds(&mut self, lower: &[f32], upper: &[f32]) -> Result<()> {
+        for v in [lower, upper] {
+            if v.len() != self.info.num_row {
+                return Err(Error::DataShape { expected: self.info.num_row, got: v.len() });
+            }
+        }
+        for i in 0..lower.len() {
+            if !(lower[i] <= upper[i]) {
+                return Err(Error::invalid(
+                    "label_lower_bound",
+                    format!(
+                        "row {i} has lower bound {} above upper bound {}",
+                        lower[i], upper[i]
+                    ),
+                ));
+            }
+        }
+        self.info.label_lower_bound = Some(lower.to_vec());
+        self.info.label_upper_bound = Some(upper.to_vec());
+        Ok(())
+    }
+
+    /// Attach query-group sizes for the `rank:*` objectives, as XGBoost's
+    /// `set_group` takes them: one row count per query, in row order.
+    pub fn set_group(&mut self, sizes: &[usize]) -> Result<()> {
+        let mut ptr = Vec::with_capacity(sizes.len() + 1);
+        ptr.push(0usize);
+        let mut acc = 0usize;
+        for s in sizes {
+            acc += s;
+            ptr.push(acc);
+        }
+        if acc != self.info.num_row {
+            return Err(Error::DataShape { expected: self.info.num_row, got: acc });
+        }
+        self.info.group_ptr = ptr;
+        Ok(())
+    }
+
+    /// Attach a query id per row, the `qid` spelling of [`set_group`]. Rows of
+    /// one query must be contiguous, which is what upstream requires too.
+    pub fn set_qid(&mut self, qid: &[u64]) -> Result<()> {
+        if qid.len() != self.info.num_row {
+            return Err(Error::DataShape { expected: self.info.num_row, got: qid.len() });
+        }
+        let mut ptr = vec![0usize];
+        for i in 1..qid.len() {
+            if qid[i] == qid[i - 1] {
+                continue;
+            }
+            if qid[i] < qid[i - 1] {
+                return Err(Error::invalid("qid", "query ids must be non-decreasing"));
+            }
+            ptr.push(i);
+        }
+        ptr.push(qid.len());
+        self.info.group_ptr = ptr;
+        Ok(())
+    }
+
+    /// Mark which columns hold category codes rather than numbers.
+    pub fn set_feature_types(&mut self, types: &[FeatureType]) -> Result<()> {
+        if types.len() != self.info.num_col {
+            return Err(Error::DataShape { expected: self.info.num_col, got: types.len() });
+        }
+        self.info.feature_types = types.to_vec();
         Ok(())
     }
 
@@ -179,8 +349,10 @@ impl DMatrix {
         Ok(())
     }
 
+    /// Attach an initial margin per row, or per `(row, output)` for a
+    /// multi-output fit; boosting then starts from it instead of `base_score`.
     pub fn set_base_margin(&mut self, m: &[f32]) -> Result<()> {
-        if m.len() != self.info.num_row {
+        if self.info.num_row == 0 || !m.len().is_multiple_of(self.info.num_row) {
             return Err(Error::DataShape { expected: self.info.num_row, got: m.len() });
         }
         self.info.base_margin = Some(m.to_vec());

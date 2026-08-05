@@ -18,9 +18,9 @@
 use std::time::Instant;
 
 use xgboost_rs::parameters::{
-    BoosterParameters, BoosterType, GeneralParameters, GrowPolicy, LearningTaskParameters,
-    MonotoneConstraint, SamplingMethod, TrainingParameters, TreeBoosterParameters, VerboseEval,
-    Verbosity,
+    BoosterParameters, BoosterType, DartParameters, EvalMetric, GeneralParameters, GrowPolicy,
+    LearningTaskParameters, MonotoneConstraint, Objective, SamplingMethod, TrainingParameters,
+    TreeBoosterParameters, VerboseEval, Verbosity,
 };
 use xgboost_rs::{DMatrix, api};
 
@@ -93,6 +93,23 @@ fn make_data(rows: usize, features: usize) -> DMatrix {
     d
 }
 
+/// The same features, with labels in `[0, 1]` — the range the logistic and
+/// log-link objectives accept.
+fn unit_label_data(args: &Args) -> DMatrix {
+    let mut d = make_data(args.rows, args.features);
+    let labels: Vec<f32> = (0..args.rows).map(|i| f32::from(i % 3 == 0)).collect();
+    d.set_labels(&labels).unwrap();
+    d
+}
+
+/// The same features, with class indices in `[0, num_class)`.
+fn class_label_data(args: &Args, num_class: u32) -> DMatrix {
+    let mut d = make_data(args.rows, args.features);
+    let labels: Vec<f32> = (0..args.rows).map(|i| (i % num_class as usize) as f32).collect();
+    d.set_labels(&labels).unwrap();
+    d
+}
+
 fn base_params(tree: TreeBoosterParameters, args: &Args) -> TrainingParameters {
     TrainingParameters {
         booster: BoosterParameters {
@@ -124,10 +141,29 @@ fn time_fit(params: &TrainingParameters, d: &DMatrix, repeats: usize) -> (f64, f
     (best, rmse)
 }
 
+/// One configuration to time. `data` overrides the shared matrix for the
+/// objectives whose label range the shared one does not satisfy.
+struct Case {
+    label: String,
+    params: TrainingParameters,
+    data: Option<DMatrix>,
+}
+
+impl Case {
+    fn new(label: impl Into<String>, params: TrainingParameters) -> Self {
+        Self { label: label.into(), params, data: None }
+    }
+
+    fn with_data(mut self, data: DMatrix) -> Self {
+        self.data = Some(data);
+        self
+    }
+}
+
 /// One group of configurations, all compared against the group's first row.
 struct Group {
     name: &'static str,
-    cases: Vec<(String, TrainingParameters)>,
+    cases: Vec<Case>,
 }
 
 fn main() {
@@ -151,20 +187,23 @@ fn main() {
             continue;
         }
         println!("== {} ==", group.name);
-        println!("{:<28} {:>9} {:>9} {:>8}   train-rmse", "case", "s/fit", "ms/round", "rel");
+        // The score column is whatever metric the fit reports, which is the
+        // objective's default unless the case chose one.
+        println!("{:<28} {:>9} {:>9} {:>8}   train-metric", "case", "s/fit", "ms/round", "rel");
         let mut baseline = f64::NAN;
-        for (label, params) in &group.cases {
-            let (seconds, rmse) = time_fit(params, &d, args.repeats);
+        for case in &group.cases {
+            let matrix = case.data.as_ref().unwrap_or(&d);
+            let (seconds, score) = time_fit(&case.params, matrix, args.repeats);
             if baseline.is_nan() {
                 baseline = seconds;
             }
             println!(
                 "{:<28} {:>9.3} {:>9.1} {:>7.2}x   {:.6}",
-                label,
+                case.label,
                 seconds,
                 seconds * 1000.0 / args.rounds as f64,
                 seconds / baseline,
-                rmse
+                score
             );
         }
         println!();
@@ -182,7 +221,7 @@ fn groups(args: &Args) -> Vec<Group> {
         cases: [16u32, 64, 256, 512]
             .into_iter()
             .map(|max_bin| {
-                (
+                Case::new(
                     format!("max_bin={max_bin}"),
                     base_params(TreeBoosterParameters { max_bin, ..tree() }, args),
                 )
@@ -196,7 +235,7 @@ fn groups(args: &Args) -> Vec<Group> {
         cases: [4u32, 6, 8, 10]
             .into_iter()
             .map(|max_depth| {
-                (
+                Case::new(
                     format!("max_depth={max_depth}"),
                     base_params(TreeBoosterParameters { max_depth, ..tree() }, args),
                 )
@@ -212,7 +251,7 @@ fn groups(args: &Args) -> Vec<Group> {
             .into_iter()
             .flat_map(|grow_policy| {
                 [16u32, 64].into_iter().map(move |max_leaves| {
-                    (
+                    Case::new(
                         format!("{grow_policy}/max_leaves={max_leaves}"),
                         base_params(
                             TreeBoosterParameters {
@@ -232,10 +271,10 @@ fn groups(args: &Args) -> Vec<Group> {
     // Row sampling. Unsampled rows keep their place in the row set with a
     // zeroed gradient, so this measures what sampling *costs* rather than what
     // it saves — the histogram pass still visits every row.
-    let mut sampling = vec![("subsample=1.0 (none)".to_owned(), base_params(tree(), args))];
+    let mut sampling = vec![Case::new("subsample=1.0 (none)", base_params(tree(), args))];
     for method in [SamplingMethod::Uniform, SamplingMethod::GradientBased] {
         for subsample in [0.5f32, 0.1] {
-            sampling.push((
+            sampling.push(Case::new(
                 format!("{method}/subsample={subsample}"),
                 base_params(
                     TreeBoosterParameters { subsample, sampling_method: method, ..tree() },
@@ -248,17 +287,17 @@ fn groups(args: &Args) -> Vec<Group> {
 
     // Column sampling: fewer candidate features per node means less split
     // evaluation, though the histograms are still built over every column.
-    let mut colsample = vec![("no column sampling".to_owned(), base_params(tree(), args))];
+    let mut colsample = vec![Case::new("no column sampling", base_params(tree(), args))];
     for ratio in [0.5f32, 0.25] {
-        colsample.push((
+        colsample.push(Case::new(
             format!("colsample_bytree={ratio}"),
             base_params(TreeBoosterParameters { colsample_bytree: ratio, ..tree() }, args),
         ));
-        colsample.push((
+        colsample.push(Case::new(
             format!("colsample_bylevel={ratio}"),
             base_params(TreeBoosterParameters { colsample_bylevel: ratio, ..tree() }, args),
         ));
-        colsample.push((
+        colsample.push(Case::new(
             format!("colsample_bynode={ratio}"),
             base_params(TreeBoosterParameters { colsample_bynode: ratio, ..tree() }, args),
         ));
@@ -271,7 +310,7 @@ fn groups(args: &Args) -> Vec<Group> {
         cases: [1u32, 2, 4]
             .into_iter()
             .map(|num_parallel_tree| {
-                (
+                Case::new(
                     format!("num_parallel_tree={num_parallel_tree}"),
                     base_params(
                         TreeBoosterParameters {
@@ -287,9 +326,9 @@ fn groups(args: &Args) -> Vec<Group> {
     });
 
     // Constraints: both add a check per candidate split.
-    let mut constraints = vec![("unconstrained".to_owned(), base_params(tree(), args))];
-    constraints.push((
-        "monotone (all features)".to_owned(),
+    let mut constraints = vec![Case::new("unconstrained", base_params(tree(), args))];
+    constraints.push(Case::new(
+        "monotone (all features)",
         base_params(
             TreeBoosterParameters {
                 monotone_constraints: vec![MonotoneConstraint::Increasing; args.features],
@@ -301,8 +340,8 @@ fn groups(args: &Args) -> Vec<Group> {
     // Interleaved groups, so the signal features (0, 1, 2) land on both sides
     // and the constraint actually binds — a constraint that never rejects a
     // candidate would measure nothing.
-    constraints.push((
-        "interaction (2 groups)".to_owned(),
+    constraints.push(Case::new(
+        "interaction (2 groups)",
         base_params(
             TreeBoosterParameters {
                 interaction_constraints: Some(vec![
@@ -316,6 +355,100 @@ fn groups(args: &Args) -> Vec<Group> {
     ));
     groups.push(Group { name: "constraints", cases: constraints });
 
+    // Histogram cache size. Bounds how many released histogram buffers are
+    // held for reuse; below the tree's width every level re-allocates.
+    groups.push(Group {
+        name: "max_cached_hist_node",
+        cases: [65536u64, 64, 8, 1]
+            .into_iter()
+            .map(|nodes| {
+                Case::new(
+                    format!("max_cached_hist_node={nodes}"),
+                    base_params(
+                        TreeBoosterParameters {
+                            max_cached_hist_node: Some(nodes),
+                            max_depth: 12,
+                            max_bin: 512,
+                            ..TreeBoosterParameters::default()
+                        },
+                        args,
+                    ),
+                )
+            })
+            .collect(),
+    });
+
+    // The objective is the other half of a round: every one visits every row,
+    // but they do very different amounts of work there.
+    let mut objectives = Vec::new();
+    for objective in [
+        Objective::RegSquaredError,
+        Objective::RegAbsoluteError,
+        Objective::RegPseudoHuberError { huber_slope: 1.0 },
+        Objective::RegLogistic,
+        Objective::CountPoisson { max_delta_step: 0.7 },
+        Objective::RegTweedie { tweedie_variance_power: 1.5 },
+        Objective::RegQuantileError { quantile_alpha: vec![0.5] },
+        Objective::SurvivalCox,
+    ] {
+        let mut params = base_params(tree(), args);
+        params.booster.learning.objective = objective.clone();
+        // The shared labels are unbounded reals; the logistic and log-link
+        // objectives need their own range, so those cases bring their own
+        // matrix rather than being dropped from the sweep.
+        objectives.push(
+            Case::new(objective.name(), params).with_data(unit_label_data(args)),
+        );
+    }
+    groups.push(Group { name: "objective", cases: objectives });
+
+    // Output groups: a round grows one tree per class, so the cost is linear
+    // in `num_class` and this is the single most expensive knob a
+    // classification fit has.
+    groups.push(Group {
+        name: "num_class",
+        cases: [2u32, 4, 8]
+            .into_iter()
+            .map(|num_class| {
+                let mut params = base_params(tree(), args);
+                params.booster.learning.objective = Objective::MultiSoftprob { num_class };
+                Case::new(format!("num_class={num_class}"), params)
+                    .with_data(class_label_data(args, num_class))
+            })
+            .collect(),
+    });
+
+    // Metrics are evaluated once per round on the whole watchlist; the ones
+    // that sort or sweep the predictions cost more than the elementwise ones.
+    let mut metrics = Vec::new();
+    for metric in [
+        EvalMetric::Rmse,
+        EvalMetric::Mae,
+        EvalMetric::Logloss,
+        EvalMetric::Auc,
+        EvalMetric::Aucpr,
+        EvalMetric::Ndcg { top_n: None, minus: false },
+    ] {
+        let mut params = base_params(tree(), args);
+        params.booster.learning.eval_metric = vec![metric.clone()];
+        metrics.push(Case::new(metric.to_string(), params).with_data(unit_label_data(args)));
+    }
+    groups.push(Group { name: "eval_metric", cases: metrics });
+
+    // DART: every round drops trees, which costs a prediction pass over the
+    // dropped ones and grows with the ensemble.
+    let mut dart = vec![Case::new("gbtree (no dropout)", base_params(tree(), args))];
+    for rate_drop in [0.1f32, 0.5] {
+        let mut params = base_params(tree(), args);
+        params.booster.booster = BoosterType::Dart(DartParameters {
+            rate_drop,
+            tree: tree(),
+            ..Default::default()
+        });
+        dart.push(Case::new(format!("dart/rate_drop={rate_drop}"), params));
+    }
+    groups.push(Group { name: "dart", cases: dart });
+
     // Thread scaling. Runs last: it is the only group that ignores `--threads`.
     groups.push(Group {
         name: "nthread",
@@ -324,7 +457,7 @@ fn groups(args: &Args) -> Vec<Group> {
             .map(|nthread| {
                 let mut params = base_params(tree(), args);
                 params.booster.general.nthread = nthread;
-                (format!("nthread={nthread}"), params)
+                Case::new(format!("nthread={nthread}"), params)
             })
             .collect(),
     });

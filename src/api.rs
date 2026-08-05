@@ -5,15 +5,38 @@
 //! that trains here can also be emitted verbatim for a real XGBoost build.
 
 use crate::context::Context;
+use crate::gbm::DartConfig;
 use crate::data::DMatrix;
 use crate::learner::Learner;
 use crate::parameters::{
-    BoosterType, Device, EvalMetric, TrainingParameters, TreeBoosterParameters, TreeUpdaterName,
-    VerboseEval, Verbosity,
+    BoosterType, Device, EvalMetric, MultiStrategy, PredictParameters, PredictionType,
+    TrainingParameters, TreeBoosterParameters, TreeUpdaterName, VerboseEval, Verbosity,
 };
+use crate::predictor::TreeRange;
 use crate::tree::param::{GrowPolicy, TrainParam};
 use crate::{Error, Result};
 use std::collections::BTreeMap;
+
+/// A prediction plus the shape it should be read with.
+///
+/// The shape is what `strict_shape` controls: with it set, every prediction
+/// kind reports the full rank XGBoost documents (`(n_rows, n_groups)` for
+/// values, `(n_rows, n_groups, n_features + 1)` for contributions), so a caller
+/// does not have to know whether the model happened to be multi-class.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Prediction {
+    /// The values, row-major in `shape` order.
+    pub values: Vec<f32>,
+    /// Dimensions of `values`.
+    pub shape: Vec<usize>,
+}
+
+impl Prediction {
+    /// Values per row, i.e. the product of every dimension after the first.
+    pub fn row_stride(&self) -> usize {
+        self.shape.iter().skip(1).product::<usize>().max(1)
+    }
+}
 
 /// A trained model.
 pub struct Booster {
@@ -32,37 +55,131 @@ impl Booster {
 
     /// Predictions on the objective's output scale.
     pub fn predict(&self, dmat: &DMatrix) -> Vec<f32> {
-        self.learner.predict(dmat)
+        self.learner.predict(dmat, self.all_trees())
     }
 
     /// Raw margins, before any objective transform.
     pub fn predict_margin(&self, dmat: &DMatrix) -> Vec<f32> {
-        self.learner.predict_margin(dmat)
+        self.learner.predict_margin(dmat, self.all_trees())
     }
 
     /// Leaf index reached in every tree, one row per input row.
     pub fn predict_leaf(&self, dmat: &DMatrix) -> Vec<Vec<u32>> {
-        crate::predictor::predict_leaf(&self.learner.gbm().model, dmat)
+        crate::predictor::predict_leaf(&self.learner.gbm().model, dmat, self.all_trees())
+    }
+
+    /// Predict with the full [`PredictParameters`] surface.
+    ///
+    /// This is `Booster.predict`: the prediction *kind*, the round range, the
+    /// `training` flag and `strict_shape` all take effect here rather than
+    /// being accepted and ignored.
+    pub fn predict_with(&self, params: &PredictParameters, dmat: &DMatrix) -> Result<Prediction> {
+        params.validate()?;
+        if params.validate_features && dmat.num_col() != self.num_features() {
+            return Err(Error::invalid(
+                "validate_features",
+                format!(
+                    "the model has {} features, the matrix has {}",
+                    self.num_features(),
+                    dmat.num_col()
+                ),
+            ));
+        }
+        let model = &self.learner.gbm().model;
+        let (begin, end) = params.iteration_range.resolve(self.boosted_rounds() as u32)?;
+        let trees = TreeRange::from_rounds(model, begin, end);
+
+        let n_rows = dmat.num_row();
+        let n_groups = self.learner.num_output_group();
+        let n_features = self.num_features();
+        let base = self.learner.base_margin();
+
+        Ok(match params.predict_type {
+            PredictionType::Value => {
+                let mut values = self.learner.predict_margin(dmat, trees);
+                self.learner.objective().pred_transform(&mut values);
+                // `multi:softmax` collapses its groups into one class index.
+                let stride = values.len() / n_rows.max(1);
+                Prediction { values, shape: shape_for_value(n_rows, stride, params.strict_shape) }
+            }
+            PredictionType::Margin => {
+                let values = self.learner.predict_margin(dmat, trees);
+                Prediction {
+                    values,
+                    shape: shape_for_value(n_rows, n_groups, params.strict_shape),
+                }
+            }
+            PredictionType::Leaf => {
+                let leaves = crate::predictor::predict_leaf(model, dmat, trees);
+                let per_row = leaves.first().map_or(0, Vec::len);
+                let values: Vec<f32> =
+                    leaves.into_iter().flatten().map(|v| v as f32).collect();
+                let shape = if params.strict_shape {
+                    // (rows, rounds, groups, parallel trees)
+                    vec![
+                        n_rows,
+                        (end - begin) as usize,
+                        n_groups,
+                        model.num_parallel_tree.max(1) as usize,
+                    ]
+                } else {
+                    vec![n_rows, per_row]
+                };
+                Prediction { values, shape }
+            }
+            PredictionType::Contribution | PredictionType::ApproxContribution => {
+                let approximate = params.predict_type.approx_contribs();
+                let values =
+                    crate::predictor::predict_contribution(model, dmat, base, trees, approximate);
+                let shape = if params.strict_shape || n_groups > 1 {
+                    vec![n_rows, n_groups, n_features + 1]
+                } else {
+                    vec![n_rows, n_features + 1]
+                };
+                Prediction { values, shape }
+            }
+            PredictionType::Interaction | PredictionType::ApproxInteraction => {
+                let approximate = params.predict_type.approx_contribs();
+                let values =
+                    crate::predictor::predict_interaction(model, dmat, base, trees, approximate);
+                let shape = if params.strict_shape || n_groups > 1 {
+                    vec![n_rows, n_groups, n_features + 1, n_features + 1]
+                } else {
+                    vec![n_rows, n_features + 1, n_features + 1]
+                };
+                Prediction { values, shape }
+            }
+        })
+    }
+
+    fn all_trees(&self) -> TreeRange {
+        TreeRange::all(&self.learner.gbm().model)
     }
 
     /// Every configured metric evaluated on `dmat`, in configuration order.
-    pub fn eval(&self, dmat: &DMatrix) -> Vec<(&'static str, f64)> {
+    pub fn eval(&self, dmat: &DMatrix) -> Vec<(String, f64)> {
         self.learner.eval(dmat)
     }
 
-    /// Boosting rounds run. With `num_parallel_tree > 1` a round grows several
-    /// trees but still counts once, as it does upstream.
+    /// Boosting rounds run. With `num_parallel_tree > 1` or several output
+    /// groups a round grows many trees but still counts once, as upstream.
     pub fn boosted_rounds(&self) -> usize {
         self.learner.boosted_rounds()
     }
 
-    /// Trees in the ensemble: `boosted_rounds() * num_parallel_tree`.
+    /// Trees in the ensemble: `boosted_rounds() * num_parallel_tree *
+    /// num_output_group`.
     pub fn num_trees(&self) -> usize {
         self.learner.gbm().model.num_trees()
     }
 
     pub fn num_features(&self) -> usize {
         self.learner.gbm().model.num_feature
+    }
+
+    /// Outputs this model predicts per row.
+    pub fn num_output_group(&self) -> usize {
+        self.learner.num_output_group()
     }
 
     pub fn base_score(&self) -> f32 {
@@ -109,10 +226,7 @@ impl Booster {
         }
         let out = match importance_type {
             "weight" => counts.iter().map(|(f, c)| (format!("f{f}"), *c)).collect(),
-            "gain" => gains
-                .iter()
-                .map(|(f, g)| (format!("f{f}"), g / counts[f]))
-                .collect(),
+            "gain" => gains.iter().map(|(f, g)| (format!("f{f}"), g / counts[f])).collect(),
             "total_gain" => gains.iter().map(|(f, g)| (format!("f{f}"), *g)).collect(),
             other => {
                 return Err(Error::invalid(
@@ -135,6 +249,11 @@ impl Booster {
     }
 }
 
+/// The shape of a value/margin prediction.
+fn shape_for_value(n_rows: usize, stride: usize, strict: bool) -> Vec<usize> {
+    if strict || stride > 1 { vec![n_rows, stride] } else { vec![n_rows] }
+}
+
 /// One `(name, metric value)` pair per evaluation matrix and metric, per round.
 ///
 /// Names are `"{eval set}-{metric}"`, as XGBoost's `evals_result` keys them.
@@ -152,58 +271,70 @@ pub fn train(
 ) -> Result<(Booster, EvalHistory)> {
     params.validate()?;
     let general = &params.booster.general;
-    let tree = match &params.booster.booster {
-        BoosterType::Gbtree(tree) => tree,
+    let (tree, dart) = match &params.booster.booster {
+        BoosterType::Gbtree(tree) => (tree, None),
+        BoosterType::Dart(dart) => (&dart.tree, Some(DartConfig::from_parameters(dart))),
         other => {
             return Err(Error::invalid(
                 "booster",
                 format!(
-                    "`{}` is not implemented; Phase 1 supports `gbtree`",
+                    "`{}` is not implemented; this crate trains `gbtree` and `dart`",
                     other.name()
                 ),
             ));
         }
     };
     check_supported_updater(tree, general.device)?;
+    check_supported_tree_options(tree, dtrain)?;
     check_feature_constraints(tree, dtrain.num_col())?;
     let param = train_param(tree)?;
 
     let learning = &params.booster.learning;
-    let objective = learning.objective.name();
-    let obj = crate::objective::create_with(objective, learning.scale_pos_weight)?;
+    let obj = crate::objective::create(&learning.objective, learning.scale_pos_weight)?;
 
     // An unset `eval_metric` falls back to the objective's own default, as
     // XGBoost's `Learner::Configure` does — unless that default is disabled,
     // which leaves the fit with no metric at all.
-    let metric_names: Vec<String> = if learning.eval_metric.is_empty() {
+    let metrics = if learning.eval_metric.is_empty() {
         if general.disable_default_eval_metric {
             Vec::new()
         } else {
-            vec![obj.default_metric().to_owned()]
+            // The objective builds its own default so a parameterised metric
+            // (`tweedie-nloglik@1.5`, `aft-nloglik`) gets the objective's
+            // settings rather than the metric defaults.
+            let spec: EvalMetric = obj.default_metric().parse()?;
+            vec![obj.make_metric(&spec)?]
         }
     } else {
-        learning.eval_metric.iter().map(EvalMetric::to_string).collect()
+        learning
+            .eval_metric
+            .iter()
+            .map(|m| obj.make_metric(m))
+            .collect::<Result<Vec<_>>>()?
     };
-    let metrics = metric_names
-        .iter()
-        .map(|name| crate::metric::create(name))
-        .collect::<Result<Vec<_>>>()?;
+    let metric_names: Vec<String> = metrics.iter().map(|m| m.name().to_owned()).collect();
 
     let ctx = Context::new(general, learning);
     if ctx.logs(Verbosity::Warning) {
         for warning in params.booster.warnings() {
             eprintln!("[xgboost_rs] WARNING: {warning}");
         }
+        if general.validate_parameters {
+            for name in unused_parameters(params, tree) {
+                eprintln!(
+                    "[xgboost_rs] WARNING: parameter `{name}` was set but nothing in this \
+                     fit consumed it"
+                );
+            }
+        }
     }
 
-    let mut learner = Learner::new(
-        ctx,
-        obj,
-        metrics,
-        dtrain.num_col(),
-        param,
-        learning.base_score,
-    );
+    let mut learner =
+        Learner::new(ctx, obj, metrics, dtrain.num_col(), param, learning.base_score);
+    learner.set_boost_from_average(learning.boost_from_average);
+    if let Some(dart) = dart {
+        learner.set_dart(dart);
+    }
 
     let mut stopper = match params.early_stopping_rounds {
         Some(rounds) => Some(EarlyStopping::new(rounds, params.maximize, evals, &metric_names)?),
@@ -332,7 +463,8 @@ impl EarlyStopping {
 /// Whether a metric is better when larger, following the list
 /// `xgboost.callback.EarlyStopping` uses when `maximize` is unset.
 fn metric_is_maximised(metric: &str) -> bool {
-    const MAXIMISED: &[&str] = &["auc", "aucpr", "pre", "map", "ndcg"];
+    const MAXIMISED: &[&str] =
+        &["auc", "aucpr", "pre", "map", "ndcg", "ams", "interval-regression-accuracy"];
     if metric == "mape" {
         return false;
     }
@@ -394,8 +526,72 @@ fn check_supported_updater(tree: &TreeBoosterParameters, device: Device) -> Resu
     Ok(())
 }
 
-/// Translate the public tree parameters into the internal training parameters,
-/// rejecting anything the CPU `hist` path does not implement.
+/// Reject the tree-booster options this build cannot act on, so none of them is
+/// accepted and then silently ignored.
+fn check_supported_tree_options(tree: &TreeBoosterParameters, dtrain: &DMatrix) -> Result<()> {
+    if tree.multi_strategy != MultiStrategy::OneOutputPerTree {
+        return Err(Error::invalid(
+            "multi_strategy",
+            format!(
+                "`{}` needs vector-leaf trees, which are not implemented; use \
+                 `one_output_per_tree`",
+                tree.multi_strategy
+            ),
+        ));
+    }
+    if dtrain.info().has_categorical() {
+        return Err(Error::invalid(
+            "feature_types",
+            "categorical splits are not implemented; mark every column numerical, or \
+             one-hot encode the categories yourself",
+        ));
+    }
+    Ok(())
+}
+
+/// Warn about parameters this build accepts but cannot act on.
+///
+/// This is what `validate_parameters` asks for: XGBoost prints a warning for
+/// every configuration entry nothing consumed, and so does this — otherwise a
+/// caller has no way to tell a knob that did nothing from one that did.
+fn unused_parameters(params: &TrainingParameters, tree: &TreeBoosterParameters) -> Vec<String> {
+    let mut unused = Vec::new();
+    let default = TreeBoosterParameters::default();
+
+    // `exact`-only options, on a fit that runs `hist`.
+    if tree.default_direction != default.default_direction {
+        unused.push("default_direction".to_owned());
+    }
+    if tree.opt_dense_col != default.opt_dense_col {
+        unused.push("opt_dense_col".to_owned());
+    }
+    // `refresh`-only, and the refresh updater is not implemented.
+    if tree.refresh_leaf != default.refresh_leaf {
+        unused.push("refresh_leaf".to_owned());
+    }
+    // Categorical splits are rejected outright, so their knobs never apply.
+    if tree.max_cat_to_onehot != default.max_cat_to_onehot {
+        unused.push("max_cat_to_onehot".to_owned());
+    }
+    if tree.max_cat_threshold != default.max_cat_threshold {
+        unused.push("max_cat_threshold".to_owned());
+    }
+    // A single-process fit has no workers to synchronise.
+    if tree.debug_synchronize {
+        unused.push("debug_synchronize".to_owned());
+    }
+    // GPU-only settings, on a CPU fit.
+    let general = &params.booster.general;
+    if general.use_rmm {
+        unused.push("use_rmm".to_owned());
+    }
+    if general.fail_on_invalid_gpu_id {
+        unused.push("fail_on_invalid_gpu_id".to_owned());
+    }
+    unused
+}
+
+/// Translate the public tree parameters into the internal training parameters.
 fn train_param(tree: &TreeBoosterParameters) -> Result<TrainParam> {
     Ok(TrainParam {
         learning_rate: tree.eta,
@@ -419,5 +615,20 @@ fn train_param(tree: &TreeBoosterParameters) -> Result<TrainParam> {
         num_parallel_tree: tree.num_parallel_tree,
         monotone_constraints: tree.monotone_constraints.clone(),
         interaction_constraints: tree.interaction_constraints.clone(),
+        max_cached_hist_node: tree.max_cached_hist_nodes(Device::Cpu),
     })
+}
+
+/// Metrics named in a fit's `eval_metric`, for callers that want the resolved
+/// list without running a round.
+pub fn resolved_metric_names(params: &TrainingParameters) -> Result<Vec<String>> {
+    let learning = &params.booster.learning;
+    if learning.eval_metric.is_empty() {
+        let obj = crate::objective::create(&learning.objective, learning.scale_pos_weight)?;
+        if params.booster.general.disable_default_eval_metric {
+            return Ok(Vec::new());
+        }
+        return Ok(vec![obj.default_metric()]);
+    }
+    Ok(learning.eval_metric.iter().map(EvalMetric::to_string).collect())
 }
