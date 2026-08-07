@@ -1,4 +1,4 @@
-//! Training benchmark for the CPU `hist` path.
+//! Training benchmark for the `hist` path, on either device.
 //!
 //! Generates a deterministic synthetic dataset, trains, and reports wall clock
 //! time. `tools/bench_xgb.py` runs the identical configuration through the
@@ -8,6 +8,10 @@
 //! cargo run --release --no-default-features --bin train_bench -- \
 //!     --rows 100000 --features 50 --rounds 20 --depth 6 --max-bin 256
 //! ```
+//!
+//! `--device cuda` runs the same configuration through `grow_gpu_hist`, which
+//! needs the crate's default features (and `--features cuda` for a real CUDA
+//! device rather than the portable wgpu backend).
 
 use std::time::Instant;
 use xgboost_rs::parameters::{
@@ -57,6 +61,8 @@ struct Args {
     /// Growth order, and the leaf budget `lossguide` needs to be bounded by.
     lossguide: bool,
     max_leaves: u32,
+    /// `cpu` or `cuda[:ordinal]`.
+    device: String,
 }
 
 impl Default for Args {
@@ -76,6 +82,7 @@ impl Default for Args {
             breakdown: false,
             hash: false,
             lossguide: false,
+            device: "cpu".to_owned(),
             max_leaves: 0,
         }
     }
@@ -110,6 +117,7 @@ fn parse_args() -> Args {
                 i -= 1;
             }
             "--max-leaves" => args.max_leaves = value().parse().unwrap(),
+            "--device" => args.device = value(),
             "--lossguide" => {
                 args.lossguide = true;
                 i -= 1;
@@ -184,7 +192,11 @@ fn main() {
                 ..Default::default()
             }),
             learning: LearningTaskParameters::default(),
-            ..Default::default()
+            general: xgboost_rs::parameters::GeneralParameters {
+                device: args.device.parse().expect("device"),
+                verbosity: xgboost_rs::parameters::Verbosity::Silent,
+                ..Default::default()
+            },
         },
         num_boost_round: args.rounds,
         verbose_eval: VerboseEval::Silent,
@@ -193,7 +205,7 @@ fn main() {
 
     println!(
         "rows={} features={} rounds={} depth={} max_bin={} sparsity={} \
-         subsample={} colsample={} threads={}",
+         subsample={} colsample={} threads={} device={}",
         args.rows,
         args.features,
         args.rounds,
@@ -203,6 +215,7 @@ fn main() {
         args.subsample,
         args.colsample,
         xgboost_rs::num_threads(),
+        args.device,
     );
     println!("data build: {:.3}s", build.as_secs_f64());
 

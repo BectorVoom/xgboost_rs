@@ -33,6 +33,11 @@ def main() -> None:
     ap.add_argument("--max-leaves", type=int, default=0)
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--repeats", type=int, default=1)
+    ap.add_argument(
+        "--device",
+        default="cpu",
+        help="cpu, or cuda[:ordinal] to time gpu_hist against the Rust GPU path",
+    )
     args = ap.parse_args()
 
     raw = np.fromfile(args.path, dtype=np.float32)
@@ -49,13 +54,16 @@ def main() -> None:
         "max_bin": args.max_bin,
         "grow_policy": args.grow_policy,
         "max_leaves": args.max_leaves,
+        "device": args.device,
         "seed": 0,
     }
     if args.threads > 0:
         params["nthread"] = args.threads
 
     # DMatrix construction (binning included) is measured separately, matching
-    # how the Rust side reports data build vs train.
+    # how the Rust side reports data build vs train. QuantileDMatrix is what
+    # XGBoost's own GPU docs recommend, but DMatrix is used on both devices so
+    # the two timings measure the same thing.
     t = time.perf_counter()
     dtrain = xgb.DMatrix(x, label=y)
     build = time.perf_counter() - t
@@ -76,7 +84,7 @@ def main() -> None:
         best = min(best, time.perf_counter() - t)
         rmse = evals_result["train"]["rmse"][-1]
 
-    print(f"xgboost {xgb.__version__}  threads={args.threads or 'auto'}")
+    print(f"xgboost {xgb.__version__}  threads={args.threads or 'auto'}  device={args.device}")
     print(f"data build: {build:.3f}s")
     print(f"train: {best:.3f}s  final train-rmse: {rmse:.6f}")
 
