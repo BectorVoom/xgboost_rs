@@ -1,6 +1,7 @@
 //! GPU kernels for gradient-boosted tree training, ported from
 //! `xgboost/src/tree/gpu_hist/*.cu` to CubeCL.
 
+mod categorical;
 pub mod ellpack;
 pub mod evaluate_splits;
 pub mod grower;

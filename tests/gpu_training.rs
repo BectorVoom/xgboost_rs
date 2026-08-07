@@ -222,21 +222,74 @@ fn matches_with_num_parallel_tree() {
     compare_accuracy(&d, p, 2);
 }
 
-/// A categorical fit is refused rather than fitted as if the codes were
-/// ordered.
-#[test]
-fn rejects_categorical_features_on_the_gpu() {
+/// One categorical column (membership, not order, drives the label) plus a
+/// couple of ordinary numeric ones — enough to force column sampling and the
+/// numeric evaluator to run alongside the categorical one in the same batch.
+fn categorical_data(rows: usize, n_cats: u32, positive: &[u32], missing: f32, seed: u64) -> DMatrix {
     use xgboost_rs::FeatureType;
-    let mut d = data(400, 3, 0.0, 29);
+    let mut st = seed | 1;
+    let mut next = || {
+        st ^= st >> 12;
+        st ^= st << 25;
+        st ^= st >> 27;
+        ((st.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32) as f32 / u32::MAX as f32
+    };
+    let cols = 3;
+    let mut x = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        x[r * cols] = if next() < missing { f32::NAN } else { (r as u32 % n_cats) as f32 };
+        x[r * cols + 1] = next() * 4.0 - 2.0;
+        x[r * cols + 2] = next() * 4.0 - 2.0;
+    }
+    let y: Vec<f32> = (0..rows)
+        .map(|r| {
+            let cat = x[r * cols];
+            let base = if cat.is_finite() && positive.contains(&(cat as u32)) { 1.0 } else { -1.0 };
+            base + 0.1 * (x[r * cols + 1] + x[r * cols + 2])
+        })
+        .collect();
+    let mut d = DMatrix::from_dense(&x, rows, cols, f32::NAN).unwrap();
+    d.set_labels(&y).unwrap();
     d.set_feature_types(&[FeatureType::Categorical, FeatureType::Numerical, FeatureType::Numerical])
         .unwrap();
+    d
+}
 
-    let err = match api::train(&params(Device::cuda(0), TreeBoosterParameters::default(), 2), &d, &[])
-    {
-        Err(e) => e,
-        Ok(_) => panic!("a categorical fit on the GPU must be refused"),
-    };
-    assert!(err.to_string().contains("categorical"), "{err}");
+/// Few enough categories that `UseOneHot` picks the one-hot enumerator on
+/// both devices.
+#[test]
+fn categorical_splits_match_the_cpu_fit_one_hot() {
+    let d = categorical_data(800, 3, &[1], 0.0, 41);
+    let p = TreeBoosterParameters::builder().max_depth(3).max_cat_to_onehot(64).build().unwrap();
+    compare_exact(&d, p.clone());
+    compare_accuracy(&d, p, 4);
+}
+
+/// Enough categories, with `max_cat_to_onehot` forced down, that the
+/// partition enumerator runs instead.
+#[test]
+fn categorical_splits_match_the_cpu_fit_partition() {
+    let d = categorical_data(800, 12, &[1, 3, 5, 7, 9], 0.0, 43);
+    let p = TreeBoosterParameters::builder().max_depth(4).max_cat_to_onehot(1).build().unwrap();
+    compare_exact(&d, p.clone());
+    compare_accuracy(&d, p, 4);
+}
+
+/// Missing values in the categorical column exercise both `enumerate_one_hot`
+/// scans (missing grouped left vs. grouped with the chosen category), and
+/// `lossguide` gives the last-ulp-sensitive queue a categorical split to
+/// reorder around.
+#[test]
+fn categorical_splits_match_the_cpu_fit_with_missing_values_and_lossguide() {
+    let d = categorical_data(900, 6, &[0, 2, 4], 0.2, 47);
+    let p = TreeBoosterParameters::builder()
+        .grow_policy(GrowPolicy::LossGuide)
+        .max_depth(0)
+        .max_leaves(12)
+        .build()
+        .unwrap();
+    compare_exact(&d, p.clone());
+    compare_accuracy(&d, p, 4);
 }
 
 /// SYCL has no updater here, and must say so rather than fall back.

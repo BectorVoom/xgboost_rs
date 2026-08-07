@@ -24,6 +24,7 @@ use std::collections::{BinaryHeap, VecDeque};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 
+use super::categorical;
 use super::ellpack::{DeviceEllpack, build_ellpack};
 use super::evaluate_splits::{DeviceSplitCandidate, NodeInput, SplitConfig, SplitEvaluatorGpu};
 use super::histogram::{HistogramBuilder, HistogramEngine, NodeHistJob};
@@ -60,6 +61,9 @@ struct ExpandEntry {
     split: DeviceSplitCandidate,
     left_stats: GradStats,
     right_stats: GradStats,
+    /// Categories the split sends right, as a bit set over feature-local
+    /// bins. Empty until `split.is_cat` — set only for a categorical winner.
+    cat_bits: Vec<u32>,
 }
 
 impl ExpandEntry {
@@ -389,6 +393,7 @@ impl<R: Runtime> GpuHistGrower<R> {
             split: DeviceSplitCandidate::default(),
             left_stats: GradStats::default(),
             right_stats: GradStats::default(),
+            cat_bits: Vec::new(),
         };
         let evaluated = self.evaluate(&[entry], evaluator, rng)?;
         Ok(evaluated.into_iter().next().expect("one node in, one node out"))
@@ -414,12 +419,22 @@ impl<R: Runtime> GpuHistGrower<R> {
         // Column samples are drawn here, one per node, because with
         // `colsample_bynode < 1` each draw advances the engine and the order of
         // those draws is part of what the model is.
+        //
+        // A categorical feature is left out of `mask` — the device kernel
+        // scans a feature's bins in ascending order, which is meaningless for
+        // a category code — and collected in `cat_features` instead, so it can
+        // be scored host-side below.
         let mut mask = vec![0u32; nodes.len() * self.n_features];
+        let mut cat_features: Vec<Vec<u32>> = vec![Vec::new(); nodes.len()];
         for (i, node) in nodes.iter().enumerate() {
             let features = self.column_sampler.feature_set(node.depth, rng);
             for &f in features.iter() {
                 if self.constraints.query(node.nid, f) {
-                    mask[i * self.n_features + f as usize] = 1;
+                    if self.cuts.is_cat(f as usize) {
+                        cat_features[i].push(f);
+                    } else {
+                        mask[i * self.n_features + f as usize] = 1;
+                    }
                 }
             }
         }
@@ -439,7 +454,7 @@ impl<R: Runtime> GpuHistGrower<R> {
             })
             .collect();
 
-        let candidates = self.split_eval.evaluate(
+        let mut candidates = self.split_eval.evaluate(
             &hist,
             hist_bins,
             &inputs,
@@ -448,18 +463,88 @@ impl<R: Runtime> GpuHistGrower<R> {
             self.to_float_hess,
         )?;
 
+        let mut cat_bits = vec![Vec::new(); nodes.len()];
+        if cat_features.iter().any(|f| !f.is_empty()) {
+            let all_bins = self.read_histogram(&hist, hist_bins)?;
+            for (i, node) in nodes.iter().enumerate() {
+                if cat_features[i].is_empty() {
+                    continue;
+                }
+                let node_bins = &all_bins[node.slot as usize..node.slot as usize + self.n_bins];
+                let mut best = candidates[i];
+                for &f in &cat_features[i] {
+                    let (ib, ie) = (
+                        self.cuts.cut_ptrs[f as usize] as usize,
+                        self.cuts.cut_ptrs[f as usize + 1] as usize,
+                    );
+                    let (cand, bits) = categorical::enumerate(
+                        evaluator,
+                        &self.param,
+                        node.nid,
+                        f,
+                        &self.cuts.cut_values[ib..ie],
+                        &node_bins[ib..ie],
+                        node.sum,
+                        node.root_gain,
+                        self.to_float_grad,
+                        self.to_float_hess,
+                    );
+                    if categorical::replaces(cand.loss_chg, f, best.loss_chg, best.split_index()) {
+                        best = DeviceSplitCandidate {
+                            loss_chg: cand.loss_chg,
+                            sindex: if cand.default_left { f | (1 << 31) } else { f },
+                            split_value: cand.split_value,
+                            left_grad: cand.left.grad,
+                            left_hess: cand.left.hess,
+                            is_cat: true,
+                        };
+                        cat_bits[i] = bits;
+                    }
+                }
+                candidates[i] = best;
+            }
+        }
+
         Ok(nodes
             .iter()
             .zip(candidates)
-            .map(|(node, split)| {
+            .zip(cat_bits)
+            .map(|((node, split), bits)| {
                 let left = GradientPairInt64 { grad: split.left_grad, hess: split.left_hess };
                 let right = node.sum - left;
                 ExpandEntry {
                     split,
                     left_stats: self.decode(left),
                     right_stats: self.decode(right),
+                    cat_bits: bits,
                     ..node.clone()
                 }
+            })
+            .collect())
+    }
+
+    /// Read a shared frontier buffer back to host, decoding the accumulator's
+    /// 4 `u32` words per bin into quantised `[grad, hess]` pairs.
+    ///
+    /// Only called when a batch has at least one categorical feature to
+    /// evaluate — the common all-numeric case never pays for this readback.
+    /// Mirrors [`HistogramEngine::read`](super::histogram::HistogramEngine::read),
+    /// checked rather than debug-asserted for the same reason it is: a wrong
+    /// bin count here would otherwise index the per-node slice out of bounds.
+    fn read_histogram(&self, hist: &Handle, hist_bins: usize) -> Result<Vec<GradientPairInt64>> {
+        let bytes = self.client.read_one_unchecked(hist.clone());
+        let words: &[u32] = bytemuck::cast_slice(&bytes);
+        if words.len() != hist_bins * 4 {
+            return Err(crate::error::Error::HistogramBins {
+                expected: hist_bins,
+                got: words.len() / 4,
+            });
+        }
+        Ok(words
+            .chunks_exact(4)
+            .map(|w| GradientPairInt64 {
+                grad: (w[0] as i64) | ((w[1] as i64) << 32),
+                hess: (w[2] as i64) | ((w[3] as i64) << 32),
             })
             .collect())
     }
@@ -534,6 +619,7 @@ impl<R: Runtime> GpuHistGrower<R> {
                     split: DeviceSplitCandidate::default(),
                     left_stats: GradStats::default(),
                     right_stats: GradStats::default(),
+                    cat_bits: Vec::new(),
                 });
             }
         }
@@ -588,19 +674,35 @@ impl<R: Runtime> GpuHistGrower<R> {
         let right_weight = evaluator.calc_weight(nid, p, &entry.right_stats);
         let lr = p.learning_rate;
 
-        tree.expand_node(
-            nid,
-            entry.split.split_index(),
-            entry.split.split_value,
-            entry.split.default_left(),
-            base_weight,
-            left_weight * lr,
-            right_weight * lr,
-            entry.split.loss_chg,
-            parent_sum.sum_hess as f32,
-            entry.left_stats.sum_hess as f32,
-            entry.right_stats.sum_hess as f32,
-        );
+        if entry.split.is_cat {
+            tree.expand_categorical(
+                nid,
+                entry.split.split_index(),
+                &entry.cat_bits,
+                entry.split.default_left(),
+                base_weight,
+                left_weight * lr,
+                right_weight * lr,
+                entry.split.loss_chg,
+                parent_sum.sum_hess as f32,
+                entry.left_stats.sum_hess as f32,
+                entry.right_stats.sum_hess as f32,
+            );
+        } else {
+            tree.expand_node(
+                nid,
+                entry.split.split_index(),
+                entry.split.split_value,
+                entry.split.default_left(),
+                base_weight,
+                left_weight * lr,
+                right_weight * lr,
+                entry.split.loss_chg,
+                parent_sum.sum_hess as f32,
+                entry.left_stats.sum_hess as f32,
+                entry.right_stats.sum_hess as f32,
+            );
+        }
 
         let node = tree.nodes[nid];
         let (left, right) = (node.left as usize, node.right as usize);
@@ -627,13 +729,15 @@ impl<R: Runtime> GpuHistGrower<R> {
     fn segment_split(&self, entry: &ExpandEntry, tree: &RegTree) -> SegmentSplit {
         let node = tree.nodes[entry.nid];
         let fidx = node.split_index;
-        let global_cond = self.find_split_condition(fidx, node.value);
-        // `-1` (no matching cut) stays negative, so every present row goes
-        // right and only the missing ones follow `default_left`.
-        let cond = if global_cond < 0 {
+        // A categorical split ignores `cond` entirely — the partitioner tests
+        // `cat_bits` instead — so there is no threshold to derive.
+        let cond = if entry.split.is_cat {
             -1
         } else {
-            global_cond - self.cuts.cut_ptrs[fidx as usize] as i64
+            let global_cond = self.find_split_condition(fidx, node.value);
+            // `-1` (no matching cut) stays negative, so every present row goes
+            // right and only the missing ones follow `default_left`.
+            if global_cond < 0 { -1 } else { global_cond - self.cuts.cut_ptrs[fidx as usize] as i64 }
         };
         SegmentSplit {
             begin: entry.seg_begin,
@@ -641,7 +745,7 @@ impl<R: Runtime> GpuHistGrower<R> {
             fidx,
             cond,
             default_left: node.default_left,
-            cat_bits: Vec::new(),
+            cat_bits: if entry.split.is_cat { entry.cat_bits.clone() } else { Vec::new() },
         }
     }
 

@@ -1,51 +1,40 @@
 # What the GPU path still does not do
 
 `device=cuda` trains and matches the CPU fit bit-for-bit on a single round
-(`tests/gpu_training.rs`). Three things are still refused or absent. Each is
+(`tests/gpu_training.rs`). Two things are still refused or absent. Each is
 refused by name at the API boundary rather than silently mis-fitted, so nothing
 here is a correctness risk — only missing capability.
 
-## 1. Categorical splits (refused)
-
-`src/api.rs` rejects a categorical `DMatrix` on `device=cuda`:
-
-> categorical splits are not implemented on the GPU; fit on `device=cpu`, or
-> one-hot encode the categories yourself
+## 1. Categorical splits (implemented)
 
 The device evaluator scans a feature's bins in ascending order, which is
-meaningless for category codes. The CPU reference is `HistGrower::
-enumerate_one_hot` and `enumerate_partition` (`src/tree/hist.rs`).
+meaningless for category codes, so a categorical feature is masked out of
+`evaluate_feature_kernel` (`GpuHistGrower::evaluate`, `src/gpu/grower.rs`) the
+same way column sampling masks out a feature the node may not use. It is
+scored instead by `src/gpu/categorical.rs`, the host-side readback route this
+doc used to describe as the cheap alternative to a device-side sort:
 
-**What it needs.** `common::UseOneHot` picks between two algorithms on
-`n_bins_feature < max_cat_to_onehot` (default 4):
+- The node's histogram is read back once per batch — only when the batch has
+  at least one categorical candidate — and decoded into the same
+  `GradientPairInt64` pairs `HistogramEngine::read` produces.
+- `categorical::enumerate` dispatches `common::UseOneHot` exactly as
+  `HistGrower::evaluate_one` does (`n_bins_feature < max_cat_to_onehot`,
+  default 4) to `enumerate_one_hot` or `enumerate_partition` — line-for-line
+  ports of the CPU functions of the same name (`src/tree/hist.rs`), except the
+  running sums stay in the histogram's native quantised `i64` form and are
+  decoded only where the gain formula needs a float, matching how the numeric
+  kernel path is already exact.
+- The winning categorical candidate is merged against the device's
+  numeric-only winner with the same tie-break `SplitEntry::need_replace` uses
+  (`categorical::replaces`), then carried through `ExpandEntry::cat_bits` to
+  `RegTree::expand_categorical` and to the row partitioner's `SegmentSplit`.
 
-- *One-hot* — for each category bin, two candidates: the category alone goes
-  right with the feature's missing rows left, then again with missing right.
-  The chosen category rides in `split_value`, and `cat::set_bit` turns it into
-  a one-bit set. Straightforward to port: no sort, and the existing
-  `consider_split` already does the scoring.
-- *Partition* — sort the feature's bins by `CalcWeightCat` (the *unconstrained*
-  weight; categories carry no monotonicity), then scan that order both
-  directions, capped at `max_cat_threshold` (default 64) steps. The head of the
-  order is the right-hand side either way. The winning split's bit set names
-  the first `partition` categories of the sorted order.
-
-The partition path is the hard part: it needs the sort on device. A bitonic
-sort in shared memory covers `n_bins_feature <= block`; beyond that it needs
-multiple elements per thread. Two cheaper routes, if the full port is not
-wanted:
-
-- Evaluate *only* the categorical features host-side — read back those
-  features' bins for the node, reuse the CPU enumeration, and merge the result
-  with the device's numeric best via `SplitEntry::update_entry`. Correct, and
-  the readback is proportional to the categorical bins only.
-- Keep the sort on device but let the host rebuild the bit set: the kernel
-  returns `(forward, partition_count)` and the host re-sorts that node's
-  feature slice once per *applied* categorical split, which is rare.
-
-The row partitioner already handles categorical splits
-(`goes_left` tests the bit set, `tests/gpu_row_partition.rs` covers it), so only
-the evaluator and the bit-set plumbing are missing.
+The row partitioner already handled categorical splits before this
+(`goes_left` tests the bit set, `tests/gpu_row_partition.rs` covers it); the
+gap was only the evaluator and the bit-set plumbing feeding it, both now
+covered by `tests/gpu_training.rs`'s `categorical_splits_match_the_cpu_fit_*`
+tests, which check bit-for-bit parity with the CPU fit the same way every
+other GPU training test does.
 
 ## 2. `multi_strategy=multi_output_tree` (refused)
 

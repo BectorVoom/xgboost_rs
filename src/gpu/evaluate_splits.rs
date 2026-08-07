@@ -641,6 +641,10 @@ pub struct DeviceSplitCandidate {
     /// Quantised left-child sum; the right child is the parent minus this.
     pub left_grad: i64,
     pub left_hess: i64,
+    /// Whether this split names a set of categories rather than a threshold.
+    /// Always `false` out of the device kernel itself — it has no categorical
+    /// path — and set only by [`super::grower`]'s host-side merge.
+    pub is_cat: bool,
 }
 
 impl DeviceSplitCandidate {
@@ -837,6 +841,7 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
                 sindex: ints[3 * i] as u32,
                 left_grad: ints[3 * i + 1],
                 left_hess: ints[3 * i + 2],
+                is_cat: false,
             })
             .collect())
     }

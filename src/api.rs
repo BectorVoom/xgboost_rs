@@ -769,18 +769,6 @@ fn check_supported_tree_options(
             ));
         }
     }
-    // The device split evaluator has no categorical path yet: it scans a
-    // feature's bins in order, which is meaningless for category codes. Refuse
-    // rather than fit something that silently treats categories as ordered.
-    if dtrain.info().has_categorical()
-        && tree.resolved_updaters(device)?.contains(&TreeUpdaterName::GrowGpuHist)
-    {
-        return Err(Error::invalid(
-            "device",
-            "categorical splits are not implemented on the GPU; fit on `device=cpu`, \
-             or one-hot encode the categories yourself",
-        ));
-    }
     // Only the histogram updaters bin by category. `exact` enumerates a
     // column's values in ascending order, which would read the category codes
     // as an ordering they do not have, so it is refused rather than quietly
