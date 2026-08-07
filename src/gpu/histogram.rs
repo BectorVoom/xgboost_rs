@@ -107,6 +107,8 @@ fn add_gpair_global(
 ///   `native_i64` is false; 1-word dummy otherwise).
 /// * `hist_i64` — global histogram as 2 `i64` words per bin (used when
 ///   `native_i64` is true; 1-word dummy otherwise). Same byte layout.
+/// * `hist_offset` — bin offset of this node's slot in `hist`, so a whole
+///   frontier of nodes can share one allocation.
 /// * `dense` / `compressed` — comptime layout flags (`kDense`/`kCompressed`).
 /// * `use_shared` — comptime `kSharedMem`: privatise the group's bins in
 ///   shared memory, then flush to global.
@@ -129,6 +131,7 @@ pub fn hist_kernel(
     base_rowid: u32,
     null_value: u32,
     n_ridx: u32,
+    hist_offset: u32,
     #[comptime] dense: bool,
     #[comptime] compressed: bool,
     #[comptime] use_shared: bool,
@@ -193,7 +196,14 @@ pub fn hist_kernel(
                         atomic_add_i64_as_u32_shared(&smem, local * 4, grad);
                         atomic_add_i64_as_u32_shared(&smem, local * 4 + 2, hess);
                     } else {
-                        add_gpair_global(hist, hist_i64, global_bin, grad, hess, native_i64);
+                        add_gpair_global(
+                            hist,
+                            hist_i64,
+                            hist_offset + global_bin,
+                            grad,
+                            hess,
+                            native_i64,
+                        );
                     }
                 }
             }
@@ -213,7 +223,7 @@ pub fn hist_kernel(
                 | (i64::cast_from(smem[src + 1].load()) << 32);
             let hess = i64::cast_from(smem[src + 2].load())
                 | (i64::cast_from(smem[src + 3].load()) << 32);
-            add_gpair_global(hist, hist_i64, start_bin + bin, grad, hess, native_i64);
+            add_gpair_global(hist, hist_i64, hist_offset + start_bin + bin, grad, hess, native_i64);
             bin += CUBE_DIM_X;
         }
     }
@@ -354,6 +364,26 @@ impl<'a, R: Runtime> HistogramBuilder<'a, R> {
     /// Validate the matrix, decide the shared/global dispatch, and upload the
     /// matrix to the device.
     pub fn build(self, matrix: &EllpackMatrix) -> Result<HistogramEngine<R>> {
+        self.build_impl(matrix, None)
+    }
+
+    /// [`build`](Self::build) against a matrix already on device.
+    ///
+    /// `gidx` is the largest buffer a fit holds, and the row partitioner reads
+    /// the same one, so a grower uploads it once and hands it to both.
+    pub fn build_shared(
+        self,
+        matrix: &EllpackMatrix,
+        shared: &super::ellpack::DeviceEllpack,
+    ) -> Result<HistogramEngine<R>> {
+        self.build_impl(matrix, Some(shared))
+    }
+
+    fn build_impl(
+        self,
+        matrix: &EllpackMatrix,
+        shared: Option<&super::ellpack::DeviceEllpack>,
+    ) -> Result<HistogramEngine<R>> {
         if matrix.cut_ptrs.len() < 2 {
             return Err(Error::InvalidCuts { got: matrix.cut_ptrs.len() });
         }
@@ -408,8 +438,13 @@ impl<'a, R: Runtime> HistogramBuilder<'a, R> {
             self.native_i64_atomics.unwrap_or_else(|| supports_native_i64_atomics(self.client));
 
         let client = self.client.clone();
-        let gidx = client.create_from_slice(bytemuck::cast_slice(&matrix.gidx));
-        let cut_ptrs = client.create_from_slice(bytemuck::cast_slice(&matrix.cut_ptrs));
+        let (gidx, cut_ptrs) = match shared {
+            Some(ell) => (ell.gidx.clone(), ell.cut_ptrs.clone()),
+            None => (
+                client.create_from_slice(bytemuck::cast_slice(&matrix.gidx)),
+                client.create_from_slice(bytemuck::cast_slice(&matrix.cut_ptrs)),
+            ),
+        };
         let groups_dev = client.create_from_slice(bytemuck::cast_slice(&groups_flat));
         // 1-word placeholders for whichever histogram view the comptime
         // `native_i64` flag leaves unused.
@@ -515,6 +550,23 @@ impl<R: Runtime> HistogramEngine<R> {
         // Zero-initialised accumulator: 4 u32 words per bin.
         let hist_words = vec![0u32; self.n_bins * 4];
         let hist = self.client.create_from_slice(bytemuck::cast_slice(&hist_words));
+        self.build_into(gpairs, rows, &hist, self.n_bins, 0);
+        DeviceHistogram { handle: hist, n_bins: self.n_bins }
+    }
+
+    /// Accumulate one node's histogram into `dst` at bin offset `slot`.
+    ///
+    /// `dst` must already be zeroed over that slot; the kernel only adds. This
+    /// is how a whole frontier shares one allocation, which is what lets the
+    /// split evaluator read every node of a level in a single launch.
+    pub fn build_into(
+        &self,
+        gpairs: &DeviceGpairs,
+        rows: &DeviceRows,
+        dst: &Handle,
+        dst_bins: usize,
+        slot: u32,
+    ) {
 
         // Grid sizing, mirroring the `launch` lambda in DispatchHistShmem:
         // enough tiles for (rows x features-per-group) items, occupancy-capped.
@@ -526,9 +578,9 @@ impl<R: Runtime> HistogramEngine<R> {
         // Exactly one of the two histogram views is the real buffer; the
         // other is a 1-word dummy never touched by the comptime-elided branch.
         let (hist32, hist32_len, hist64, hist64_len) = if self.native_i64 {
-            (self.dummy_u32.clone(), 1, hist.clone(), self.n_bins * 2)
+            (self.dummy_u32.clone(), 1, dst.clone(), dst_bins * 2)
         } else {
-            (hist.clone(), hist_words.len(), self.dummy_i64.clone(), 1)
+            (dst.clone(), dst_bins * 4, self.dummy_i64.clone(), 1)
         };
 
         hist_kernel::launch::<R>(
@@ -546,14 +598,13 @@ impl<R: Runtime> HistogramEngine<R> {
             self.base_rowid,
             self.null_value,
             rows.n as u32,
+            slot,
             self.dense,
             self.compressed,
             self.use_shared,
             self.native_i64,
             self.smem_words,
         );
-
-        DeviceHistogram { handle: hist, n_bins: self.n_bins }
     }
 
     /// Subtraction trick (`sibling = parent - built`), on device.

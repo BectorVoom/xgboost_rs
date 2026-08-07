@@ -12,6 +12,10 @@
 //! * [`EllpackLayout::Sparse`] — bins are global (cut pointers already added),
 //!   missing entries hold `null_value` (`!kDense && !kCompressed`).
 
+use rayon::prelude::*;
+
+use crate::data::cuts::HistogramCuts;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EllpackLayout {
     Dense,
@@ -34,6 +38,57 @@ pub struct EllpackMatrix {
     /// Sentinel for a missing entry (compared against the *stored* value).
     pub null_value: u32,
     pub layout: EllpackLayout,
+}
+
+/// Build an ELLPACK from a matrix and its quantile cuts.
+///
+/// The analogue of `EllpackPageImpl`'s constructor, and the GPU counterpart of
+/// [`crate::data::gradient_index::build_gradient_index`]: it bins with the same
+/// [`HistogramCuts::bin_of`], so a GPU fit and a CPU fit see the same bins.
+///
+/// The result always has `row_stride == n_features`, which is what lets the
+/// partitioner index a row's feature directly instead of searching. A value
+/// that has no bin — an unseen category — is stored as missing, exactly as the
+/// CPU index treats it.
+pub fn build_ellpack(dmat: &crate::data::DMatrix, cuts: &HistogramCuts) -> EllpackMatrix {
+    let n_rows = dmat.num_row();
+    let n_features = dmat.num_col();
+
+    // A single sentinel has to be invalid for *every* feature, so it sits
+    // above the widest feature's local bin count.
+    let null_value = (0..n_features).map(|f| cuts.feature_bins(f)).max().unwrap_or(0) as u32;
+
+    let mut gidx = vec![null_value; n_rows * n_features];
+    gidx.par_chunks_mut(n_features).enumerate().for_each(|(r, row_out)| {
+        let (indices, values) = dmat.row(r);
+        for (&f, &v) in indices.iter().zip(values) {
+            let f = f as usize;
+            if let Some(bin) = cuts.bin_of(v, f) {
+                // Feature-local, which is what the `compressed` layouts store.
+                row_out[f] = bin - cuts.cut_ptrs[f];
+            }
+        }
+    });
+
+    // `Dense` is the layout with no missing entry at all, which is a property
+    // of the filled matrix — not of how the `DMatrix` chose to store it. A
+    // `DMatrix` elides zeros as well as NaNs, and an unseen category has no
+    // bin, so both leave a hole here.
+    let layout = if gidx.iter().any(|&v| v == null_value) {
+        EllpackLayout::DenseCompressed
+    } else {
+        EllpackLayout::Dense
+    };
+
+    EllpackMatrix {
+        gidx,
+        row_stride: n_features,
+        base_rowid: 0,
+        n_rows,
+        cut_ptrs: cuts.cut_ptrs.clone(),
+        null_value,
+        layout,
+    }
 }
 
 /// An [`EllpackMatrix`] resident on device.

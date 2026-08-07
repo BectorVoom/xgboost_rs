@@ -56,3 +56,8 @@ required-features = ["gpu"]
 name = "gpu_row_partition"
 path = "tests/gpu_row_partition.rs"
 required-features = ["gpu"]
+
+[[test]]
+name = "gpu_frontier"
+path = "tests/gpu_frontier.rs"
+required-features = ["gpu"]
