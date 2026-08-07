@@ -49,18 +49,44 @@ impl GradientQuantiser {
     /// rounding factor is `max(sum of positive values, |sum of negative values|)`
     /// per channel, rather than `max|v| * n`, to avoid outlier sensitivity.
     pub fn new(gpairs: &[GradientPair], total_rows: u64) -> Self {
+        Self::new_multi(&[gpairs], total_rows)
+    }
+
+    /// The quantiser a vector-leaf tree shares across its targets.
+    ///
+    /// One scale has to serve every target, because a histogram bin is decoded
+    /// by a single pair of factors whichever target it belongs to.
+    ///
+    /// The bound is the *sum* of the per-column bounds, not the largest of
+    /// them, even though a bin only ever accumulates one target's gradients.
+    /// That is what keeps the fixed point addable across targets, which a
+    /// vector-leaf tree needs: the bookkeeping it still states per node — the
+    /// node's cover, the summed child sums a candidate carries — adds the
+    /// targets together in `i64`, and each target on its own is already scaled
+    /// to fill the 62 bits below the sign. Bounding by the largest column
+    /// overflows that sum from three targets up. The cost is `log2(n_targets)`
+    /// bits of a 62-bit fixed point.
+    ///
+    /// With one column this is exactly [`Self::new`], which is why that is
+    /// written in terms of it.
+    pub fn new_multi(columns: &[&[GradientPair]], total_rows: u64) -> Self {
         // Port of the `Clip` functor reduction (positive / negative sums).
-        let mut pos = GradientPairPrecise::default();
-        let mut neg = GradientPairPrecise::default();
-        for g in gpairs {
-            pos.grad += f64::from(g.grad.max(0.0));
-            pos.hess += f64::from(g.hess.max(0.0));
-            neg.grad += f64::from((-g.grad).max(0.0));
-            neg.hess += f64::from((-g.hess).max(0.0));
+        let mut bound = GradientPairPrecise::default();
+        for gpairs in columns {
+            let mut pos = GradientPairPrecise::default();
+            let mut neg = GradientPairPrecise::default();
+            for g in *gpairs {
+                pos.grad += f64::from(g.grad.max(0.0));
+                pos.hess += f64::from(g.hess.max(0.0));
+                neg.grad += f64::from((-g.grad).max(0.0));
+                neg.hess += f64::from((-g.hess).max(0.0));
+            }
+            bound.grad += pos.grad.max(neg.grad);
+            bound.hess += pos.hess.max(neg.hess);
         }
 
-        let rounding_grad = create_rounding_factor(pos.grad.max(neg.grad), total_rows);
-        let rounding_hess = create_rounding_factor(pos.hess.max(neg.hess), total_rows);
+        let rounding_grad = create_rounding_factor(bound.grad, total_rows);
+        let rounding_hess = create_rounding_factor(bound.hess, total_rows);
 
         // Keep 1 bit for the sign: scale the rounding factor down by 2^62.
         let divisor = (1i64 << 62) as f64;

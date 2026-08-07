@@ -751,10 +751,13 @@ fn check_supported_tree_options(
 ) -> Result<()> {
     if tree.multi_strategy == MultiStrategy::MultiOutputTree {
         // A vector leaf is grown from one histogram per target, which only the
-        // `hist` updater builds here. The others would silently fall back to
-        // one tree per target, which is the opposite of what was asked for.
+        // `hist` updaters build here — on either device. The others would
+        // silently fall back to one tree per target, which is the opposite of
+        // what was asked for.
         let updaters = tree.resolved_updaters(device)?;
-        if updaters != [TreeUpdaterName::GrowQuantileHistMaker] {
+        let hist = updaters == [TreeUpdaterName::GrowQuantileHistMaker]
+            || (cfg!(feature = "gpu") && updaters == [TreeUpdaterName::GrowGpuHist]);
+        if !hist {
             return Err(Error::invalid(
                 "multi_strategy",
                 "`multi_output_tree` is implemented for the `hist` tree method only; \

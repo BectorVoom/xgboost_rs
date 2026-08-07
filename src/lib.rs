@@ -94,9 +94,10 @@
 //!
 //! A parameter that selects an algorithm this crate does not have is an error
 //! from [`train`], never a silent fallback: `multi_strategy =
-//! multi_output_tree` (vector leaves) and categorical feature types on the GPU,
-//! a `sycl` device, and — in a build without the `gpu` feature — any non-CPU
-//! device at all. Parameters that only steer one of those — `max_cat_to_onehot`,
+//! multi_output_tree` (vector leaves) under any tree method but `hist`,
+//! categorical feature types under `exact` or alongside a vector leaf, a `sycl`
+//! device, and — in a build without the `gpu` feature — any non-CPU device at
+//! all. Parameters that only steer one of those — `max_cat_to_onehot`,
 //! `max_cat_threshold`, `use_rmm`, `fail_on_invalid_gpu_id` — are accepted but
 //! inert, as are the ones whose stage this fit does not run
 //! (`default_direction` and `opt_dense_col` outside `exact`, `refresh_leaf`

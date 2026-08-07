@@ -344,11 +344,20 @@ impl GBTree {
                 if self.gpu_grower.is_none() {
                     let cuts = crate::data::cuts::build_cuts(dtrain, self.param.max_bin)?;
                     let client = crate::gpu::default_client(self.param.device.ordinal().unwrap_or(0).max(0) as usize);
-                    self.gpu_grower = Some(crate::gpu::grower::GpuHistGrower::new(
+                    // A vector-leaf fit grows one tree covering every output,
+                    // so the device grower needs the target count up front:
+                    // it sizes the per-`(node, target)` histograms.
+                    let n_targets = if self.param.multi_output_tree {
+                        self.model.num_output_group.max(1)
+                    } else {
+                        1
+                    };
+                    self.gpu_grower = Some(crate::gpu::grower::GpuHistGrower::new_multi(
                         client,
                         dtrain,
                         cuts,
                         self.param.clone(),
+                        n_targets,
                     )?);
                 }
             }
@@ -649,13 +658,28 @@ impl GBTree {
     ) -> crate::Result<()> {
         let sampler = RowSampler::new(self.param.sampling_method, self.param.subsample);
         let is_sampling = sampler.is_sampling(n_rows);
+        #[cfg(feature = "gpu")]
+        let gpu = self.gpu_grower.take();
         let param = &self.param;
-        let mut grower = HistGrower::new_multi(
-            param,
-            self.gindex.as_ref().expect("configured"),
-            dtrain,
-            n_groups,
-        );
+        let mut grower = {
+            #[cfg(feature = "gpu")]
+            match gpu {
+                Some(g) => Grower::Gpu(Box::new(g), None),
+                None => Grower::Hist(HistGrower::new_multi(
+                    param,
+                    self.gindex.as_ref().expect("configured"),
+                    dtrain,
+                    n_groups,
+                )),
+            }
+            #[cfg(not(feature = "gpu"))]
+            Grower::Hist(HistGrower::new_multi(
+                param,
+                self.gindex.as_ref().expect("configured"),
+                dtrain,
+                n_groups,
+            ))
+        };
 
         for i in 0..self.param.num_parallel_tree {
             if i > 0 {
@@ -704,6 +728,12 @@ impl GBTree {
             // under group 0 and prediction reads its leaf vector instead.
             self.model.tree_info.push(0);
             self.model.tree_weight.push(new_weight);
+        }
+        // Put the device grower back, so the next round reuses the uploaded
+        // ELLPACK rather than binning and uploading the matrix again.
+        #[cfg(feature = "gpu")]
+        if let Grower::Gpu(g, _) = grower {
+            self.gpu_grower = Some(*g);
         }
         Ok(())
     }

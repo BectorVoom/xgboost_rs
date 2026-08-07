@@ -13,7 +13,7 @@
 
 use xgboost_rs::parameters::{
     BoosterParameters, BoosterType, Device, GeneralParameters, GrowPolicy, LearningTaskParameters,
-    Objective, TrainingParameters, TreeBoosterParameters, VerboseEval, Verbosity,
+    MultiStrategy, Objective, TrainingParameters, TreeBoosterParameters, VerboseEval, Verbosity,
 };
 use xgboost_rs::{DMatrix, api};
 
@@ -290,6 +290,139 @@ fn categorical_splits_match_the_cpu_fit_with_missing_values_and_lossguide() {
         .unwrap();
     compare_exact(&d, p.clone());
     compare_accuracy(&d, p, 4);
+}
+
+// ------------------------------------------ multi_strategy=multi_output_tree
+
+/// Regression on `n_targets` outputs that share a driver and each have one of
+/// their own, so a split all of them share is useful but never sufficient —
+/// which is what makes a vector leaf a different fit from one tree per output.
+fn multi_target_data(rows: usize, n_targets: usize, missing: f32, seed: u64) -> DMatrix {
+    let cols = 5usize;
+    let mut st = seed | 1;
+    let mut next = || {
+        st ^= st >> 12;
+        st ^= st << 25;
+        st ^= st >> 27;
+        ((st.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32) as f32 / u32::MAX as f32
+    };
+    let x: Vec<f32> = (0..rows * cols)
+        .map(|_| if next() < missing { f32::NAN } else { next() * 4.0 - 2.0 })
+        .collect();
+    let value = |v: f32| if v.is_finite() { v } else { 0.0 };
+    let y: Vec<f32> = (0..rows * n_targets)
+        .map(|i| {
+            let (r, t) = (i / n_targets, i % n_targets);
+            let row = &x[r * cols..(r + 1) * cols];
+            value(row[0]) + 0.5 * (t + 1) as f32 * value(row[1 + t % (cols - 1)])
+        })
+        .collect();
+    let mut d = DMatrix::from_dense(&x, rows, cols, f32::NAN).unwrap();
+    d.set_labels_multi(&y, n_targets).unwrap();
+    d
+}
+
+fn vector_leaf(mut tree: TreeBoosterParameters) -> TreeBoosterParameters {
+    tree.multi_strategy = MultiStrategy::MultiOutputTree;
+    tree
+}
+
+#[test]
+fn multi_output_tree_matches_the_cpu_fit() {
+    let d = multi_target_data(1200, 3, 0.0, 5);
+    compare_exact(&d, vector_leaf(TreeBoosterParameters::default()));
+    compare_accuracy(&d, vector_leaf(TreeBoosterParameters::default()), 4);
+}
+
+/// The backward scan is only taken when a feature has missing rows in the node,
+/// and a vector leaf decides that over the targets together.
+#[test]
+fn multi_output_tree_matches_with_missing_values() {
+    let d = multi_target_data(1200, 2, 0.3, 17);
+    compare_exact(&d, vector_leaf(TreeBoosterParameters::default()));
+    compare_accuracy(&d, vector_leaf(TreeBoosterParameters::default()), 4);
+}
+
+/// `lossguide` batches one node at a time and `depthwise` a whole level, so the
+/// two exercise different frontier layouts over the per-target histograms.
+#[test]
+fn multi_output_tree_matches_across_depth_and_grow_policy() {
+    let d = multi_target_data(900, 4, 0.1, 23);
+    for depth in [1u32, 3, 6] {
+        let p = vector_leaf(
+            TreeBoosterParameters::builder().max_depth(depth).build().unwrap(),
+        );
+        compare_exact(&d, p);
+    }
+    let p = vector_leaf(
+        TreeBoosterParameters::builder()
+            .grow_policy(GrowPolicy::LossGuide)
+            .max_leaves(12)
+            .max_depth(0)
+            .build()
+            .unwrap(),
+    );
+    compare_exact(&d, p);
+}
+
+/// `min_child_weight` is tested against the children's *mean* hessian, and the
+/// monotone box shapes every target's weight; both have to travel to the device.
+#[test]
+fn multi_output_tree_matches_with_regularisation_and_constraints() {
+    use xgboost_rs::parameters::MonotoneConstraint::{Increasing, Unconstrained};
+    let d = multi_target_data(900, 3, 0.05, 29);
+    let p = vector_leaf(
+        TreeBoosterParameters::builder()
+            .lambda(2.5)
+            .alpha(0.4)
+            .min_child_weight(8.0)
+            .max_delta_step(0.7)
+            .eta(0.4)
+            .build()
+            .unwrap(),
+    );
+    compare_exact(&d, p.clone());
+    compare_accuracy(&d, p, 3);
+
+    let p = vector_leaf(
+        TreeBoosterParameters::builder()
+            .monotone_constraints(
+                [Increasing, Unconstrained, Unconstrained, Unconstrained, Increasing].to_vec(),
+            )
+            .build()
+            .unwrap(),
+    );
+    compare_exact(&d, p);
+}
+
+/// Column sampling draws per node, and the draw order is part of the model, so
+/// the device path has to mask the same features the CPU path does.
+#[test]
+fn multi_output_tree_matches_with_sampling() {
+    let d = multi_target_data(1200, 2, 0.0, 37);
+    let p = vector_leaf(
+        TreeBoosterParameters::builder()
+            .subsample(0.7)
+            .colsample_bytree(0.8)
+            .colsample_bynode(0.7)
+            .num_parallel_tree(2)
+            .build()
+            .unwrap(),
+    );
+    compare_exact(&d, p.clone());
+    compare_accuracy(&d, p, 3);
+}
+
+/// A vector leaf has no categorical split on either device, and must say so.
+#[test]
+fn multi_output_tree_rejects_categorical_features() {
+    let d = categorical_data(300, 6, &[1, 3], 0.0, 41);
+    let p = vector_leaf(TreeBoosterParameters::default());
+    let err = match api::train(&params(Device::cuda(0), p, 1), &d, &[]) {
+        Err(e) => e,
+        Ok(_) => panic!("a categorical vector-leaf fit must be refused"),
+    };
+    assert!(err.to_string().contains("multi_output_tree"), "{err}");
 }
 
 /// SYCL has no updater here, and must say so rather than fall back.

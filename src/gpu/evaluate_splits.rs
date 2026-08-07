@@ -37,6 +37,7 @@
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 
+use super::GradientPairInt64;
 use crate::error::Result;
 
 /// Threads per split-evaluation workgroup.
@@ -625,6 +626,478 @@ pub fn reduce_candidates_kernel(
     }
 }
 
+// ------------------------------------------------- vector-leaf kernels ----
+//
+// `multi_strategy=multi_output_tree` grows one tree whose leaves carry a value
+// per target. The split is a single decision shared by every target, scored
+// from one histogram per `(node, target)` — the shape `HistGrower` uses on the
+// CPU, where the scalar accumulation kernel is simply run once per target.
+//
+// The scalar evaluator scans a feature and accumulates as it goes, so its
+// running sum is the candidate. That does not carry over: a vector-leaf
+// candidate needs `n_targets` running sums at once, and holding them in shared
+// memory would blow the 16 KiB workgroup budget the portable backends allow.
+// So the scan is split out into [`prefix_scan_kernel`], which materialises the
+// inclusive prefix sums once per `(node, feature, target)`, and
+// [`evaluate_feature_multi_kernel`] then reads whichever sums a candidate bin
+// needs. The prefix sums are exact `i64`, so — exactly as for the scalar path —
+// the result does not depend on how the work was split across threads.
+//
+// The backward scan needs no second pass: the suffix sum at bin `i` is
+// `total - prefix[i - 1]`, in fixed point, which is bit-identical to
+// accumulating it from the top.
+
+/// Inclusive prefix sums over each `(node, feature, target)` run of bins.
+///
+/// Grid is `(n_nodes, n_features, n_targets)`. `out` has the same layout as
+/// `hist`: bin `b` of target `t` of the node at `node_hist_base[node]` lives at
+/// `node_hist_base[node] + t * node_bins + b`.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn prefix_scan_kernel(
+    hist: &Array<i64>,
+    cut_ptrs: &Array<u32>,
+    node_hist_base: &Array<u32>,
+    out: &mut Array<i64>,
+    node_bins: u32,
+    #[comptime] block: usize,
+) {
+    let node = CUBE_POS_X;
+    let fidx = CUBE_POS_Y;
+    let target = CUBE_POS_Z;
+
+    let mut s_scan = SharedMemory::<i64>::new(block * 2usize);
+    let mut s_carry = SharedMemory::<i64>::new(2usize);
+
+    let t = UNIT_POS_X as usize;
+    let ibegin = cut_ptrs[fidx as usize];
+    let n_bins_feature = cut_ptrs[(fidx + 1u32) as usize] - ibegin;
+    let base = node_hist_base[node as usize] + target * node_bins;
+
+    if UNIT_POS_X == 0u32 {
+        s_carry[0usize] = 0i64;
+        s_carry[1usize] = 0i64;
+    }
+    sync_cube();
+
+    let tile = RuntimeCell::<u32>::new(0u32);
+    while tile.read() < n_bins_feature {
+        let i = tile.read() + UNIT_POS_X;
+        let live = i < n_bins_feature;
+        let cell = (base + ibegin + i) as usize;
+        s_scan[t * 2usize] = if live { hist[cell * 2usize] } else { 0i64.into() };
+        s_scan[t * 2usize + 1] = if live { hist[cell * 2usize + 1] } else { 0i64.into() };
+        sync_cube();
+
+        scan_tile(&mut s_scan, block);
+
+        if live {
+            out[cell * 2usize] = s_carry[0usize] + s_scan[t * 2usize];
+            out[cell * 2usize + 1] = s_carry[1usize] + s_scan[t * 2usize + 1];
+        }
+
+        sync_cube();
+        if UNIT_POS_X == block as u32 - 1u32 {
+            s_carry[0usize] += s_scan[t * 2usize];
+            s_carry[1usize] += s_scan[t * 2usize + 1];
+        }
+        sync_cube();
+        tile.store(tile.read() + block as u32);
+    }
+}
+
+/// Score one vector-leaf candidate split and keep it if it beats this thread's
+/// best; the multi-target [`consider_split`].
+///
+/// Port of `HistGrower::multi_split_gain`: every target contributes its own
+/// regularised gain at its own bounded weight, and the whole candidate is
+/// rejected when the children's *mean* hessian fails `tree::IsValidSplit` —
+/// the split is one decision for all the outputs, so `min_child_weight` is a
+/// statement about the node rather than about any single target.
+///
+/// The monotone *direction* check that `CalcSplitGain` folds in is absent for
+/// the same reason it is a no-op on the CPU: it is applied to the mean-hessian
+/// children, whose gradient sum is zero, so both weights are `CalcWeight(0, h)`
+/// clipped into the node's box — always equal, and so always passing whichever
+/// direction is asked for. The bounds still shape the *gain*, through
+/// [`child_weight`] on each target's real sums.
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn consider_split_multi(
+    s_gain: &mut SharedMemory<f32>,
+    s_rank: &mut SharedMemory<u32>,
+    s_bin: &mut SharedMemory<u32>,
+    s_dir: &mut SharedMemory<u32>,
+    s_left: &mut SharedMemory<i64>,
+    prefix: &Array<i64>,
+    parent_sum: &Array<i64>,
+    node: u32,
+    node_base: u32,
+    node_bins: u32,
+    n_targets: u32,
+    ibegin: u32,
+    n_bins_feature: u32,
+    bin_local: u32,
+    dir: u32,
+    rank: u32,
+    parent_gain: f32,
+    lower: f32,
+    upper: f32,
+    to_float_grad: f64,
+    to_float_hess: f64,
+    lambda: f32,
+    alpha: f32,
+    max_delta_step: f32,
+    min_child_weight: f32,
+    #[comptime] has_constraint: bool,
+    #[comptime] has_mds: bool,
+) {
+    let t = UNIT_POS_X as usize;
+    let backward = dir == 1u32;
+
+    let sum_lg = RuntimeCell::<i64>::new(0i64);
+    let sum_lh = RuntimeCell::<i64>::new(0i64);
+    let hess_l = RuntimeCell::<f64>::new(0.0f64);
+    let hess_r = RuntimeCell::<f64>::new(0.0f64);
+    let gain = RuntimeCell::<f32>::new(0.0f32);
+
+    let tt = RuntimeCell::<u32>::new(0u32);
+    while tt.read() < n_targets {
+        let target = tt.read();
+        let tbase = node_base + target * node_bins;
+        let psum = ((node * n_targets + target) * 2u32) as usize;
+        let pg = parent_sum[psum];
+        let ph = parent_sum[psum + 1];
+
+        let cell = (tbase + ibegin + bin_local) as usize;
+        let last = (tbase + ibegin + n_bins_feature - 1u32) as usize;
+        // Bin `bin_local - 1`, or the bin itself when there is no predecessor;
+        // the value is then discarded, so it only has to stay in bounds.
+        let head = if bin_local == 0u32 { cell } else { cell - 1usize };
+        let head_g = if bin_local == 0u32 { 0i64.into() } else { prefix[head * 2usize] };
+        let head_h = if bin_local == 0u32 { 0i64.into() } else { prefix[head * 2usize + 1] };
+
+        // Forward, the accumulator is the left child. Backward, it is the right
+        // one: the suffix sum `total - prefix[bin - 1]`, subtracted from the
+        // parent in fixed point exactly as `EvaluateFeature` does.
+        let lg_i = if backward {
+            pg - (prefix[last * 2usize] - head_g)
+        } else {
+            prefix[cell * 2usize]
+        };
+        let lh_i = if backward {
+            ph - (prefix[last * 2usize + 1] - head_h)
+        } else {
+            prefix[cell * 2usize + 1]
+        };
+        let rg_i = pg - lg_i;
+        let rh_i = ph - lh_i;
+
+        sum_lg.store(sum_lg.read() + lg_i);
+        sum_lh.store(sum_lh.read() + lh_i);
+
+        let lgf = f64::cast_from(lg_i) * to_float_grad;
+        let lhf = f64::cast_from(lh_i) * to_float_hess;
+        let rgf = f64::cast_from(rg_i) * to_float_grad;
+        let rhf = f64::cast_from(rh_i) * to_float_hess;
+        hess_l.store(hess_l.read() + lhf);
+        hess_r.store(hess_r.read() + rhf);
+
+        let wl = child_weight(
+            lgf, lhf, lower, upper, lambda, alpha, max_delta_step, has_constraint, has_mds,
+        );
+        let wr = child_weight(
+            rgf, rhf, lower, upper, lambda, alpha, max_delta_step, has_constraint, has_mds,
+        );
+        // One `f32` accumulator, left term then right term per target, which is
+        // the order `multi_split_gain` sums them in.
+        gain.store(
+            gain.read()
+                + calc_gain_given_weight(lgf, lhf, wl, lambda, alpha, has_mds)
+                + calc_gain_given_weight(rgf, rhf, wr, lambda, alpha, has_mds),
+        );
+
+        tt.store(target + 1u32);
+    }
+
+    let k = f64::cast_from(n_targets);
+    let mean_l = hess_l.read() / k;
+    let mean_r = hess_r.read() / k;
+    let mcw = f64::cast_from(min_child_weight);
+    if mean_l > 0.0 && mean_r > 0.0 && mean_l >= mcw && mean_r >= mcw {
+        let chg = gain.read() - parent_gain;
+        if better(chg, rank, s_gain[t], s_rank[t]) {
+            s_gain[t] = chg;
+            s_rank[t] = rank;
+            s_bin[t] = ibegin + bin_local;
+            s_dir[t] = dir;
+            s_left[t * 2usize] = sum_lg.read();
+            s_left[t * 2usize + 1] = sum_lh.read();
+        }
+    }
+}
+
+/// [`evaluate_feature_kernel`] for a vector-leaf tree.
+///
+/// Same grid, same candidate ordering, same outputs — `out_left` holds the
+/// left child's sum *added over the targets*, which is what
+/// [`crate::tree::param::SplitEntry`] carries on the CPU too. The per-target
+/// child sums the applied split needs are recovered afterwards by
+/// [`multi_child_sums_kernel`], for the same reason `multi_child_sums` exists:
+/// a per-target vector cannot ride along on a candidate that is copied by the
+/// thousand.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_feature_multi_kernel(
+    prefix: &Array<i64>,
+    cut_ptrs: &Array<u32>,
+    cut_values: &Array<f32>,
+    min_values: &Array<f32>,
+    node_hist_base: &Array<u32>,
+    parent_sum: &Array<i64>,
+    root_gain: &Array<f32>,
+    node_lower: &Array<f32>,
+    node_upper: &Array<f32>,
+    feature_mask: &Array<u32>,
+    out_loss_chg: &mut Array<f32>,
+    out_sindex: &mut Array<u32>,
+    out_split_value: &mut Array<f32>,
+    out_left: &mut Array<i64>,
+    to_float_grad: f64,
+    to_float_hess: f64,
+    lambda: f32,
+    alpha: f32,
+    max_delta_step: f32,
+    min_child_weight: f32,
+    n_features: u32,
+    n_targets: u32,
+    node_bins: u32,
+    #[comptime] has_constraint: bool,
+    #[comptime] has_mds: bool,
+    #[comptime] block: usize,
+) {
+    let node = CUBE_POS_X;
+    let fidx = CUBE_POS_Y;
+    let cand = (node * n_features + fidx) as usize;
+
+    let mut s_gain = SharedMemory::<f32>::new(block);
+    let mut s_rank = SharedMemory::<u32>::new(block);
+    let mut s_bin = SharedMemory::<u32>::new(block);
+    let mut s_dir = SharedMemory::<u32>::new(block);
+    let mut s_left = SharedMemory::<i64>::new(block * 2usize);
+
+    let t = UNIT_POS_X as usize;
+    s_gain[t] = 0.0f32;
+    s_rank[t] = 0u32;
+    s_bin[t] = 0u32;
+    s_dir[t] = 0u32;
+    s_left[t * 2usize] = 0i64;
+    s_left[t * 2usize + 1] = 0i64;
+
+    let masked = feature_mask[cand] == 0u32;
+    let ibegin = cut_ptrs[fidx as usize];
+    let iend = cut_ptrs[(fidx + 1u32) as usize];
+    let n_bins_feature = if masked { 0u32.into() } else { iend - ibegin };
+    let node_base = node_hist_base[node as usize];
+    let parent_gain = root_gain[node as usize];
+    let lower = node_lower[node as usize];
+    let upper = node_upper[node as usize];
+
+    // ---- forward: the head of the feature's bins goes left ----
+    //
+    // No `sync_cube` inside either scan — the prefix sums are already on
+    // device — so the threads may stride through the bins independently.
+    let step = RuntimeCell::<u32>::new(UNIT_POS_X);
+    while step.read() < n_bins_feature {
+        let i = step.read();
+        consider_split_multi(
+            &mut s_gain,
+            &mut s_rank,
+            &mut s_bin,
+            &mut s_dir,
+            &mut s_left,
+            prefix,
+            parent_sum,
+            node,
+            node_base,
+            node_bins,
+            n_targets,
+            ibegin,
+            n_bins_feature,
+            i,
+            0u32,
+            i,
+            parent_gain,
+            lower,
+            upper,
+            to_float_grad,
+            to_float_hess,
+            lambda,
+            alpha,
+            max_delta_step,
+            min_child_weight,
+            has_constraint,
+            has_mds,
+        );
+        step.store(i + block as u32);
+    }
+
+    // The feature has missing rows in this node exactly when its bins do not
+    // account for the node's whole sum — stated over the targets together, as
+    // `evaluate_one_multi` states it.
+    let tot_g = RuntimeCell::<i64>::new(0i64);
+    let tot_h = RuntimeCell::<i64>::new(0i64);
+    let par_g = RuntimeCell::<i64>::new(0i64);
+    let par_h = RuntimeCell::<i64>::new(0i64);
+    let tt = RuntimeCell::<u32>::new(0u32);
+    while tt.read() < n_targets {
+        let target = tt.read();
+        if n_bins_feature > 0u32 {
+            let last = (node_base + target * node_bins + ibegin + n_bins_feature - 1u32) as usize;
+            tot_g.store(tot_g.read() + prefix[last * 2usize]);
+            tot_h.store(tot_h.read() + prefix[last * 2usize + 1]);
+        }
+        let psum = ((node * n_targets + target) * 2u32) as usize;
+        par_g.store(par_g.read() + parent_sum[psum]);
+        par_h.store(par_h.read() + parent_sum[psum + 1]);
+        tt.store(target + 1u32);
+    }
+    let has_missing = (tot_g.read() != par_g.read() || tot_h.read() != par_h.read()) && !masked;
+
+    // ---- backward: only needed when there are missing rows ----
+    if has_missing {
+        let bstep = RuntimeCell::<u32>::new(UNIT_POS_X);
+        while bstep.read() < n_bins_feature {
+            let s = bstep.read();
+            consider_split_multi(
+                &mut s_gain,
+                &mut s_rank,
+                &mut s_bin,
+                &mut s_dir,
+                &mut s_left,
+                prefix,
+                parent_sum,
+                node,
+                node_base,
+                node_bins,
+                n_targets,
+                ibegin,
+                n_bins_feature,
+                // Descending bin order; backward candidates rank after every
+                // forward one, so a tie keeps the forward split.
+                n_bins_feature - 1u32 - s,
+                1u32,
+                n_bins_feature + s,
+                parent_gain,
+                lower,
+                upper,
+                to_float_grad,
+                to_float_hess,
+                lambda,
+                alpha,
+                max_delta_step,
+                min_child_weight,
+                has_constraint,
+                has_mds,
+            );
+            bstep.store(s + block as u32);
+        }
+    }
+
+    reduce_best(&mut s_gain, &mut s_rank, &mut s_bin, &mut s_dir, &mut s_left, block);
+
+    if UNIT_POS_X == 0u32 {
+        let bin = s_bin[0usize];
+        let default_left = s_dir[0usize] == 1u32;
+        let value = if default_left {
+            if bin == ibegin {
+                min_values[fidx as usize]
+            } else {
+                cut_values[(bin - 1u32) as usize]
+            }
+        } else {
+            cut_values[bin as usize]
+        };
+
+        out_loss_chg[cand] = s_gain[0usize];
+        out_sindex[cand] = if default_left { fidx | (1u32 << 31u32) } else { fidx };
+        out_split_value[cand] = value;
+        out_left[cand * 2usize] = s_left[0usize];
+        out_left[cand * 2usize + 1] = s_left[1usize];
+    }
+}
+
+/// Recover a chosen split's per-target child sums from the prefix sums.
+///
+/// Port of `HistGrower::multi_child_sums`, down to how `node_cond` is read:
+/// `-1` (the threshold matched no cut) means the whole feature run is the
+/// accumulated side, which leaves the other child holding only the rows with
+/// no value for the feature.
+///
+/// One thread per `(node, target)`; `out` holds `[left, right]` interleaved
+/// `[grad, hess]` per pair, so four `i64` each.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn multi_child_sums_kernel(
+    prefix: &Array<i64>,
+    cut_ptrs: &Array<u32>,
+    node_hist_base: &Array<u32>,
+    parent_sum: &Array<i64>,
+    node_fidx: &Array<u32>,
+    node_cond: &Array<i32>,
+    node_default_left: &Array<u32>,
+    out: &mut Array<i64>,
+    n_targets: u32,
+    node_bins: u32,
+    n: u32,
+) {
+    let idx = ABSOLUTE_POS as u32;
+    if idx < n {
+        let node = idx / n_targets;
+        let target = idx % n_targets;
+        let fidx = node_fidx[node as usize];
+        let ibegin = cut_ptrs[fidx as usize];
+        let iend = cut_ptrs[(fidx + 1u32) as usize];
+        let tbase = node_hist_base[node as usize] + target * node_bins;
+
+        let last = (tbase + iend - 1u32) as usize;
+        let total_g = prefix[last * 2usize];
+        let total_h = prefix[last * 2usize + 1];
+
+        let cond = node_cond[node as usize];
+        let below = cond < i32::cast_from(ibegin);
+        // Clamped so both arms of the reads below stay in bounds; the value is
+        // discarded when `below`.
+        let at = (tbase + if below { ibegin } else { u32::cast_from(cond) }) as usize;
+        let pfx_g = if below { 0i64.into() } else { prefix[at * 2usize] };
+        let pfx_h = if below { 0i64.into() } else { prefix[at * 2usize + 1] };
+
+        let dl = node_default_left[node as usize] == 1u32;
+        // `default_left` accumulates the bins *above* the threshold — the right
+        // child; otherwise the run at or below it, the left child.
+        let acc_g = if dl {
+            total_g - pfx_g
+        } else {
+            if below { total_g } else { pfx_g }
+        };
+        let acc_h = if dl {
+            total_h - pfx_h
+        } else {
+            if below { total_h } else { pfx_h }
+        };
+
+        let pg = parent_sum[(idx * 2u32) as usize];
+        let ph = parent_sum[(idx * 2u32 + 1u32) as usize];
+        let lg = if dl { pg - acc_g } else { acc_g };
+        let lh = if dl { ph - acc_h } else { acc_h };
+
+        out[(idx * 4u32) as usize] = lg;
+        out[(idx * 4u32 + 1u32) as usize] = lh;
+        out[(idx * 4u32 + 2u32) as usize] = pg - lg;
+        out[(idx * 4u32 + 3u32) as usize] = ph - lh;
+    }
+}
+
 // ------------------------------------------------------------- host API ----
 
 /// One node's chosen split, read back from the device.
@@ -684,6 +1157,32 @@ pub struct NodeInput {
     pub root_gain: f32,
     pub lower: f32,
     pub upper: f32,
+}
+
+/// Per-node inputs for the vector-leaf evaluator.
+///
+/// The difference from [`NodeInput`] is that a node holds one histogram and one
+/// parent sum *per target*, and that `root_gain` is their summed gain rather
+/// than one node's.
+#[derive(Clone, Debug)]
+pub struct MultiNodeInput {
+    /// Bin offset of this node's first target histogram within `hist`; target
+    /// `t` follows at `hist_base + t * node_bins`.
+    pub hist_base: u32,
+    /// `Σ_t CalcGain(parent_t)` — `HistGrower::multi_gain` of the parent.
+    pub root_gain: f32,
+    pub lower: f32,
+    pub upper: f32,
+    /// Quantised parent sum, one per target.
+    pub parent: Vec<GradientPairInt64>,
+}
+
+/// A batch's prefix sums, held on device between the split search that produced
+/// them and the per-target child sums read out of them afterwards.
+pub struct MultiScan {
+    prefix: Handle,
+    /// Length in bins, matching the histogram the scan was taken over.
+    bins: usize,
 }
 
 /// Device-resident split evaluator: uploads the cut layout once, then answers
@@ -844,6 +1343,199 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
                 is_cat: false,
             })
             .collect())
+    }
+
+    /// [`evaluate`](Self::evaluate) for a vector-leaf tree.
+    ///
+    /// `node_bins` is the bin count of one target's histogram — the fit's total
+    /// bin count — and a node's `n_targets` histograms sit side by side from
+    /// its `hist_base`. The returned [`MultiScan`] holds the prefix sums the
+    /// search ran over; feed it to [`multi_child_sums`](Self::multi_child_sums)
+    /// to recover the chosen split's per-target child sums.
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_multi(
+        &self,
+        hist: &Handle,
+        hist_bins: usize,
+        node_bins: usize,
+        n_targets: usize,
+        nodes: &[MultiNodeInput],
+        feature_mask: &[u32],
+        to_float_grad: f64,
+        to_float_hess: f64,
+    ) -> Result<(Vec<DeviceSplitCandidate>, MultiScan)> {
+        let n_nodes = nodes.len();
+        debug_assert!(n_nodes > 0, "an empty batch has nothing to scan");
+        debug_assert_eq!(feature_mask.len(), n_nodes * self.n_features);
+        debug_assert!(nodes.iter().all(|n| n.parent.len() == n_targets));
+
+        let c = &self.client;
+        let base: Vec<u32> = nodes.iter().map(|n| n.hist_base).collect();
+        let parent: Vec<i64> =
+            nodes.iter().flat_map(|n| n.parent.iter().flat_map(|p| [p.grad, p.hess])).collect();
+        let gain: Vec<f32> = nodes.iter().map(|n| n.root_gain).collect();
+        let lower: Vec<f32> = nodes.iter().map(|n| n.lower).collect();
+        let upper: Vec<f32> = nodes.iter().map(|n| n.upper).collect();
+
+        let base_d = c.create_from_slice(bytemuck::cast_slice(&base));
+        let parent_d = c.create_from_slice(bytemuck::cast_slice(&parent));
+        let gain_d = c.create_from_slice(bytemuck::cast_slice(&gain));
+        let lower_d = c.create_from_slice(bytemuck::cast_slice(&lower));
+        let upper_d = c.create_from_slice(bytemuck::cast_slice(&upper));
+        let mask_d = c.create_from_slice(bytemuck::cast_slice(feature_mask));
+
+        // Same shape as the histogram it scans: one inclusive prefix per bin.
+        let prefix = c.empty(hist_bins * 2 * size_of::<i64>());
+        prefix_scan_kernel::launch::<R>(
+            c,
+            CubeCount::Static(n_nodes as u32, self.n_features as u32, n_targets as u32),
+            CubeDim::new_1d(EVAL_BLOCK),
+            unsafe { ArrayArg::from_raw_parts(hist.clone(), hist_bins * 2) },
+            unsafe { ArrayArg::from_raw_parts(self.cut_ptrs.clone(), self.n_features + 1) },
+            unsafe { ArrayArg::from_raw_parts(base_d.clone(), n_nodes) },
+            unsafe { ArrayArg::from_raw_parts(prefix.clone(), hist_bins * 2) },
+            node_bins as u32,
+            EVAL_BLOCK as usize,
+        );
+
+        let n_cand = n_nodes * self.n_features;
+        let cand_chg = c.empty(n_cand * size_of::<f32>());
+        let cand_sindex = c.empty(n_cand * size_of::<u32>());
+        let cand_value = c.empty(n_cand * size_of::<f32>());
+        let cand_left = c.empty(n_cand * 2 * size_of::<i64>());
+
+        let has_mds = self.cfg.max_delta_step != 0.0;
+
+        evaluate_feature_multi_kernel::launch::<R>(
+            c,
+            CubeCount::Static(n_nodes as u32, self.n_features as u32, 1),
+            CubeDim::new_1d(EVAL_BLOCK),
+            unsafe { ArrayArg::from_raw_parts(prefix.clone(), hist_bins * 2) },
+            unsafe { ArrayArg::from_raw_parts(self.cut_ptrs.clone(), self.n_features + 1) },
+            unsafe { ArrayArg::from_raw_parts(self.cut_values.clone(), self.n_bins) },
+            unsafe { ArrayArg::from_raw_parts(self.min_values.clone(), self.n_features) },
+            unsafe { ArrayArg::from_raw_parts(base_d, n_nodes) },
+            unsafe { ArrayArg::from_raw_parts(parent_d, n_nodes * n_targets * 2) },
+            unsafe { ArrayArg::from_raw_parts(gain_d, n_nodes) },
+            unsafe { ArrayArg::from_raw_parts(lower_d, n_nodes) },
+            unsafe { ArrayArg::from_raw_parts(upper_d, n_nodes) },
+            unsafe { ArrayArg::from_raw_parts(mask_d, n_cand) },
+            unsafe { ArrayArg::from_raw_parts(cand_chg.clone(), n_cand) },
+            unsafe { ArrayArg::from_raw_parts(cand_sindex.clone(), n_cand) },
+            unsafe { ArrayArg::from_raw_parts(cand_value.clone(), n_cand) },
+            unsafe { ArrayArg::from_raw_parts(cand_left.clone(), n_cand * 2) },
+            to_float_grad,
+            to_float_hess,
+            self.cfg.lambda,
+            self.cfg.alpha,
+            self.cfg.max_delta_step,
+            self.cfg.min_child_weight,
+            self.n_features as u32,
+            n_targets as u32,
+            node_bins as u32,
+            self.has_constraint,
+            has_mds,
+            EVAL_BLOCK as usize,
+        );
+
+        let best_f32 = c.empty(n_nodes * 2 * size_of::<f32>());
+        let best_i64 = c.empty(n_nodes * 3 * size_of::<i64>());
+
+        // The per-feature reduction is target-blind: a candidate is already one
+        // number by the time it gets here.
+        reduce_candidates_kernel::launch::<R>(
+            c,
+            CubeCount::Static(n_nodes as u32, 1, 1),
+            CubeDim::new_1d(EVAL_BLOCK),
+            unsafe { ArrayArg::from_raw_parts(cand_chg, n_cand) },
+            unsafe { ArrayArg::from_raw_parts(cand_sindex, n_cand) },
+            unsafe { ArrayArg::from_raw_parts(cand_value, n_cand) },
+            unsafe { ArrayArg::from_raw_parts(cand_left, n_cand * 2) },
+            unsafe { ArrayArg::from_raw_parts(best_f32.clone(), n_nodes * 2) },
+            unsafe { ArrayArg::from_raw_parts(best_i64.clone(), n_nodes * 3) },
+            self.n_features as u32,
+            EVAL_BLOCK as usize,
+        );
+
+        let floats: Vec<f32> = read_vec(c, best_f32);
+        let ints: Vec<i64> = read_vec(c, best_i64);
+
+        let candidates = (0..n_nodes)
+            .map(|i| DeviceSplitCandidate {
+                loss_chg: floats[2 * i],
+                split_value: floats[2 * i + 1],
+                sindex: ints[3 * i] as u32,
+                left_grad: ints[3 * i + 1],
+                left_hess: ints[3 * i + 2],
+                is_cat: false,
+            })
+            .collect();
+        Ok((candidates, MultiScan { prefix, bins: hist_bins }))
+    }
+
+    /// Per-target child sums of the splits `evaluate_multi` chose.
+    ///
+    /// `splits` gives `(feature, condition bin, default_left)` per node, with
+    /// the condition derived from the chosen threshold exactly as the CPU
+    /// grower's `find_split_condition` derives it. The result is `n_targets`
+    /// `(left, right)` pairs per node, in node order.
+    pub fn multi_child_sums(
+        &self,
+        scan: &MultiScan,
+        node_bins: usize,
+        n_targets: usize,
+        nodes: &[MultiNodeInput],
+        splits: &[(u32, i64, bool)],
+    ) -> Vec<(GradientPairInt64, GradientPairInt64)> {
+        debug_assert_eq!(nodes.len(), splits.len());
+        let n_nodes = nodes.len();
+        let n = n_nodes * n_targets;
+        if n == 0 {
+            return Vec::new();
+        }
+
+        let c = &self.client;
+        let base: Vec<u32> = nodes.iter().map(|n| n.hist_base).collect();
+        let parent: Vec<i64> =
+            nodes.iter().flat_map(|n| n.parent.iter().flat_map(|p| [p.grad, p.hess])).collect();
+        let fidx: Vec<u32> = splits.iter().map(|s| s.0).collect();
+        let cond: Vec<i32> = splits.iter().map(|s| s.1 as i32).collect();
+        let default_left: Vec<u32> = splits.iter().map(|s| u32::from(s.2)).collect();
+
+        let base_d = c.create_from_slice(bytemuck::cast_slice(&base));
+        let parent_d = c.create_from_slice(bytemuck::cast_slice(&parent));
+        let fidx_d = c.create_from_slice(bytemuck::cast_slice(&fidx));
+        let cond_d = c.create_from_slice(bytemuck::cast_slice(&cond));
+        let dl_d = c.create_from_slice(bytemuck::cast_slice(&default_left));
+        let out = c.empty(n * 4 * size_of::<i64>());
+
+        multi_child_sums_kernel::launch::<R>(
+            c,
+            CubeCount::Static((n as u32).div_ceil(EVAL_BLOCK).max(1), 1, 1),
+            CubeDim::new_1d(EVAL_BLOCK),
+            unsafe { ArrayArg::from_raw_parts(scan.prefix.clone(), scan.bins * 2) },
+            unsafe { ArrayArg::from_raw_parts(self.cut_ptrs.clone(), self.n_features + 1) },
+            unsafe { ArrayArg::from_raw_parts(base_d, n_nodes) },
+            unsafe { ArrayArg::from_raw_parts(parent_d, n * 2) },
+            unsafe { ArrayArg::from_raw_parts(fidx_d, n_nodes) },
+            unsafe { ArrayArg::from_raw_parts(cond_d, n_nodes) },
+            unsafe { ArrayArg::from_raw_parts(dl_d, n_nodes) },
+            unsafe { ArrayArg::from_raw_parts(out.clone(), n * 4) },
+            n_targets as u32,
+            node_bins as u32,
+            n as u32,
+        );
+
+        let words: Vec<i64> = read_vec(c, out);
+        words
+            .chunks_exact(4)
+            .map(|w| {
+                (
+                    GradientPairInt64 { grad: w[0], hess: w[1] },
+                    GradientPairInt64 { grad: w[2], hess: w[3] },
+                )
+            })
+            .collect()
     }
 }
 

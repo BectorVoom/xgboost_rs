@@ -43,6 +43,44 @@ fn quantise_preserves_positive_curvature() {
     assert!(device[3].hess >= 1);
 }
 
+/// A vector-leaf fit adds the targets' fixed-point sums together — a node's
+/// cover, and the summed child sums a candidate carries — so one shared scale
+/// has to leave room for all of them at once.
+///
+/// Bounding by the heaviest single target instead would fill the 62 bits below
+/// the sign per target and overflow from three targets up, silently on device
+/// and as a panic on the host.
+#[test]
+fn multi_target_quantiser_leaves_room_for_the_summed_sums() {
+    let n_rows = 4096;
+    // Same magnitude in every column, which is the worst case for the bound.
+    let columns: Vec<Vec<GradientPair>> =
+        (0..8).map(|t| random_gpairs(n_rows, 17 + t as u64)).collect();
+    let views: Vec<&[GradientPair]> = columns.iter().map(Vec::as_slice).collect();
+    let quantiser = GradientQuantiser::new_multi(&views, n_rows as u64);
+
+    let mut total = GradientPairInt64::default();
+    for column in &columns {
+        let sum = column
+            .iter()
+            .map(|g| quantiser.to_fixed_point(*g))
+            .fold(GradientPairInt64::default(), |a, b| a + b);
+        // Checked, because the point of the bound is that this cannot wrap.
+        total = GradientPairInt64 {
+            grad: total.grad.checked_add(sum.grad).expect("summed gradient overflowed i64"),
+            hess: total.hess.checked_add(sum.hess).expect("summed hessian overflowed i64"),
+        };
+    }
+    assert!(total.hess > 0, "the summed hessian must survive quantisation");
+
+    // One column is exactly the scalar quantiser, so a single-target fit keeps
+    // every bit it had.
+    let single = GradientQuantiser::new(&columns[0], n_rows as u64);
+    let from_multi = GradientQuantiser::new_multi(&views[..1], n_rows as u64);
+    assert_eq!(single.to_floating_point.grad, from_multi.to_floating_point.grad);
+    assert_eq!(single.to_floating_point.hess, from_multi.to_floating_point.hess);
+}
+
 fn run_histogram_case(layout: EllpackLayout, sparsity: f32, force_global: bool) {
     let client = client();
     let (n_rows, n_features, bins) = (2048, 8, 24);

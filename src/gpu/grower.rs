@@ -26,7 +26,9 @@ use cubecl::server::Handle;
 
 use super::categorical;
 use super::ellpack::{DeviceEllpack, build_ellpack};
-use super::evaluate_splits::{DeviceSplitCandidate, NodeInput, SplitConfig, SplitEvaluatorGpu};
+use super::evaluate_splits::{
+    DeviceSplitCandidate, MultiNodeInput, NodeInput, SplitConfig, SplitEvaluatorGpu,
+};
 use super::histogram::{HistogramBuilder, HistogramEngine, NodeHistJob};
 use super::quantiser::GradientQuantiser;
 use super::row_partitioner::{RowPartitioner, SegmentSplit};
@@ -64,6 +66,12 @@ struct ExpandEntry {
     /// Categories the split sends right, as a bit set over feature-local
     /// bins. Empty until `split.is_cat` — set only for a categorical winner.
     cat_bits: Vec<u32>,
+    /// This node's sum and its children's sums, one entry per target. Empty
+    /// outside a vector-leaf tree, where [`Self::sum`] and the two `_stats`
+    /// already say everything: they are the same numbers added over targets.
+    target_sums: Vec<GradientPairInt64>,
+    left_target_sums: Vec<GradientPairInt64>,
+    right_target_sums: Vec<GradientPairInt64>,
 }
 
 impl ExpandEntry {
@@ -186,6 +194,10 @@ pub struct GpuHistGrower<R: Runtime> {
     constraints: InteractionConstraints,
     /// Built once: the cut layout it uploads is fixed for the fit.
     split_eval: SplitEvaluatorGpu<R>,
+    /// Outputs a leaf carries. `1` is the ordinary one-tree-per-target fit;
+    /// more makes this a vector-leaf grower, the device counterpart of
+    /// `HistGrower::new_multi`.
+    n_targets: usize,
     /// Quantiser factors of the tree currently being grown.
     to_float_grad: f64,
     to_float_hess: f64,
@@ -199,6 +211,33 @@ impl<R: Runtime> GpuHistGrower<R> {
         cuts: HistogramCuts,
         param: TrainParam,
     ) -> Result<Self> {
+        Self::new_multi(client, dmat, cuts, param, 1)
+    }
+
+    /// A grower for vector-leaf trees: one tree covering `n_targets` outputs.
+    ///
+    /// Categorical features are refused rather than mis-fitted. The vector-leaf
+    /// evaluator scans a feature's bins in ascending order — meaningless for
+    /// category codes — and the host-side route [`super::categorical`] provides
+    /// for the scalar path scores one target at a time, which is not the
+    /// decision a vector leaf makes. `multi_strategy=multi_output_tree` has no
+    /// categorical split on the CPU either, and [`crate::api::train`] rejects
+    /// the combination before it ever reaches here; this is the backstop.
+    pub fn new_multi(
+        client: ComputeClient<R>,
+        dmat: &DMatrix,
+        cuts: HistogramCuts,
+        param: TrainParam,
+        n_targets: usize,
+    ) -> Result<Self> {
+        let n_targets = n_targets.max(1);
+        if n_targets > 1 && cuts.has_categorical() {
+            return Err(crate::error::Error::invalid(
+                "multi_strategy",
+                "`multi_output_tree` has no categorical split; one-hot encode the \
+                 categories, or use `one_output_per_tree`",
+            ));
+        }
         let matrix = build_ellpack(dmat, &cuts);
         let ell = DeviceEllpack::upload(&client, &matrix);
         let engine = HistogramBuilder::new(&client).build_shared(&matrix, &ell)?;
@@ -235,11 +274,25 @@ impl<R: Runtime> GpuHistGrower<R> {
                 param.interaction_constraints.as_ref(),
                 n_features,
             ),
+            n_targets,
             to_float_grad: 1.0,
             to_float_hess: 1.0,
             cuts,
             param,
         })
+    }
+
+    /// Whether this grower produces vector leaves.
+    #[inline]
+    fn is_multi(&self) -> bool {
+        self.n_targets > 1
+    }
+
+    /// Bins in a frontier of `slots` nodes: a node holds one histogram per
+    /// target, laid out side by side from its own slot.
+    #[inline]
+    fn frontier_bins(&self, slots: usize) -> usize {
+        self.n_bins * self.n_targets * slots
     }
 
     /// Grow one tree from `gpair`.
@@ -259,26 +312,44 @@ impl<R: Runtime> GpuHistGrower<R> {
         self.constraints.reset();
         let mut evaluator = SplitEvaluator::new(&self.param.monotone_constraints, self.n_features);
 
+        // One gradient column per target, which is what makes the vector-leaf
+        // path reuse the scalar histogram kernel unchanged: it takes a gradient
+        // per row, so a round hands it one column at a time rather than
+        // teaching it a stride. `HistGrower::split_gpair` does the same.
+        //
         // Fixed point, so histogram sums are exact whatever order they commit.
         // The quantiser works in the GPU module's own pair type; it is the
         // same two floats, so this is a view, not a conversion of meaning.
-        let device_pairs: Vec<super::GradientPair> = gpair
-            .iter()
-            .map(|g| super::GradientPair { grad: g.grad, hess: g.hess })
+        let k = self.n_targets;
+        let columns: Vec<Vec<super::GradientPair>> = (0..k)
+            .map(|t| {
+                (0..self.n_rows)
+                    .map(|r| {
+                        let g = gpair[r * k + t];
+                        super::GradientPair { grad: g.grad, hess: g.hess }
+                    })
+                    .collect()
+            })
             .collect();
-        let quantiser = GradientQuantiser::new(&device_pairs, self.n_rows as u64);
+        let views: Vec<&[super::GradientPair]> = columns.iter().map(Vec::as_slice).collect();
+        let quantiser = GradientQuantiser::new_multi(&views, self.n_rows as u64);
         self.to_float_grad = quantiser.to_floating_point.grad;
         self.to_float_hess = quantiser.to_floating_point.hess;
-        let qpairs: Vec<GradientPairInt64> =
-            device_pairs.iter().map(|g| quantiser.to_fixed_point(*g)).collect();
-        let dev_gpairs = self.engine.upload_gpairs(&qpairs)?;
+        let qcolumns: Vec<Vec<GradientPairInt64>> = columns
+            .iter()
+            .map(|c| c.iter().map(|g| quantiser.to_fixed_point(*g)).collect())
+            .collect();
+        let dev_gpairs: Vec<DeviceGpairs> = qcolumns
+            .iter()
+            .map(|q| self.engine.upload_gpairs(q))
+            .collect::<Result<Vec<_>>>()?;
 
         let mut partitioner = RowPartitioner::<R>::all_rows(self.client.clone(), self.n_rows);
         let mut num_leaves: i32 = 1;
         let mut leaf_segments: Vec<(usize, u32, u32)> = Vec::new();
 
         let root =
-            self.init_root(&dev_gpairs, &qpairs,  &evaluator, tree, rng, &partitioner)?;
+            self.init_root(&dev_gpairs, &qcolumns, &evaluator, tree, rng, &partitioner)?;
 
         let mut queue = ExpandQueue::new(self.param.grow_policy);
         if root.split.loss_chg > RT_EPS {
@@ -357,28 +428,49 @@ impl<R: Runtime> GpuHistGrower<R> {
     #[allow(clippy::too_many_arguments)]
     fn init_root(
         &mut self,
-        dev_gpairs: &DeviceGpairs,
-        qpairs: &[GradientPairInt64],
+        dev_gpairs: &[DeviceGpairs],
+        qcolumns: &[Vec<GradientPairInt64>],
         evaluator: &SplitEvaluator,
         tree: &mut RegTree,
         rng: &mut Mt19937,
         partitioner: &RowPartitioner<R>,
     ) -> Result<ExpandEntry> {
         let hist = self.zeroed_frontier(1);
+        let hist_bins = self.frontier_bins(1);
         let rows = DeviceRows::slice(partitioner.ridx().clone(), 0, self.n_rows);
-        self.engine.build_into(dev_gpairs, &rows, &hist, self.n_bins, 0);
+        for (t, gpairs) in dev_gpairs.iter().enumerate() {
+            self.engine.build_into(gpairs, &rows, &hist, hist_bins, (t * self.n_bins) as u32);
+        }
 
         // Exact in fixed point, so — unlike the CPU grower — there is no need
         // to choose between summing the first feature's bins and summing the
         // gradients. Both give this.
-        let sum = qpairs.iter().fold(GradientPairInt64::default(), |a, b| a + *b);
+        let target_sums: Vec<GradientPairInt64> = qcolumns
+            .iter()
+            .map(|q| q.iter().fold(GradientPairInt64::default(), |a, b| a + *b))
+            .collect();
+        let sum = target_sums.iter().fold(GradientPairInt64::default(), |a, b| a + *b);
         let stats = self.decode(sum);
-        let root_gain = evaluator.calc_gain(0, &self.param, &stats);
         let weight = evaluator.calc_weight(0, &self.param, &stats);
 
+        // The scalar bookkeeping — node cover and the tree's own statistics —
+        // is stated over the targets together, as `sum_targets` states it.
         tree.stats[0].sum_hess = stats.sum_hess as f32;
         tree.stats[0].base_weight = weight;
-        tree.set_leaf(0, self.param.learning_rate * weight);
+        let root_gain = if self.is_multi() {
+            let weights: Vec<f32> = target_sums
+                .iter()
+                .map(|s| {
+                    self.param.learning_rate * evaluator.calc_weight(0, &self.param, &self.decode(*s))
+                })
+                .collect();
+            tree.set_leaf_vector(0, &weights);
+            // `HistGrower::multi_gain`: every target's own regularised gain.
+            target_sums.iter().map(|s| evaluator.calc_gain(0, &self.param, &self.decode(*s))).sum()
+        } else {
+            tree.set_leaf(0, self.param.learning_rate * weight);
+            evaluator.calc_gain(0, &self.param, &stats)
+        };
 
         let entry = ExpandEntry {
             nid: 0,
@@ -386,7 +478,7 @@ impl<R: Runtime> GpuHistGrower<R> {
             seg_begin: 0,
             seg_len: self.n_rows as u32,
             hist,
-            hist_bins: self.n_bins,
+            hist_bins,
             slot: 0,
             sum,
             root_gain,
@@ -394,6 +486,9 @@ impl<R: Runtime> GpuHistGrower<R> {
             left_stats: GradStats::default(),
             right_stats: GradStats::default(),
             cat_bits: Vec::new(),
+            target_sums: if self.is_multi() { target_sums } else { Vec::new() },
+            left_target_sums: Vec::new(),
+            right_target_sums: Vec::new(),
         };
         let evaluated = self.evaluate(&[entry], evaluator, rng)?;
         Ok(evaluated.into_iter().next().expect("one node in, one node out"))
@@ -437,6 +532,13 @@ impl<R: Runtime> GpuHistGrower<R> {
                     }
                 }
             }
+        }
+
+        if self.is_multi() {
+            // A vector-leaf fit has no categorical feature — `new_multi`
+            // refuses one — so `mask` already names every candidate.
+            debug_assert!(cat_features.iter().all(Vec::is_empty));
+            return self.evaluate_multi(nodes, &hist, hist_bins, &mask, evaluator);
         }
 
         let inputs: Vec<NodeInput> = nodes
@@ -523,6 +625,92 @@ impl<R: Runtime> GpuHistGrower<R> {
             .collect())
     }
 
+    /// [`evaluate`](Self::evaluate) for a vector-leaf tree.
+    ///
+    /// The split search itself is one device call, as it is for a scalar tree.
+    /// What it cannot return is the winner's per-target child sums — a
+    /// candidate carries one `(grad, hess)` pair, summed over targets, and is
+    /// copied by the thousand — so they are read out of the same prefix sums
+    /// afterwards, which is exactly why `HistGrower::multi_child_sums` exists.
+    fn evaluate_multi(
+        &mut self,
+        nodes: &[ExpandEntry],
+        hist: &Handle,
+        hist_bins: usize,
+        mask: &[u32],
+        evaluator: &SplitEvaluator,
+    ) -> Result<Vec<ExpandEntry>> {
+        let inputs: Vec<MultiNodeInput> = nodes
+            .iter()
+            .map(|n| {
+                let (lower, upper) = evaluator.bounds(n.nid);
+                MultiNodeInput {
+                    hist_base: n.slot,
+                    root_gain: n.root_gain,
+                    lower,
+                    upper,
+                    parent: n.target_sums.clone(),
+                }
+            })
+            .collect();
+
+        let (candidates, scan) = self.split_eval.evaluate_multi(
+            hist,
+            hist_bins,
+            self.n_bins,
+            self.n_targets,
+            &inputs,
+            mask,
+            self.to_float_grad,
+            self.to_float_hess,
+        )?;
+
+        // The chosen threshold back to a bin, by the same rule the row
+        // partitioner uses, so the sums and the partition name the same split.
+        let splits: Vec<(u32, i64, bool)> = candidates
+            .iter()
+            .map(|c| {
+                let fidx = c.split_index();
+                (fidx, self.find_split_condition(fidx, c.split_value), c.default_left())
+            })
+            .collect();
+        let sums = self.split_eval.multi_child_sums(
+            &scan,
+            self.n_bins,
+            self.n_targets,
+            &inputs,
+            &splits,
+        );
+
+        Ok(nodes
+            .iter()
+            .zip(candidates)
+            .enumerate()
+            .map(|(i, (node, split))| {
+                let pairs = &sums[i * self.n_targets..(i + 1) * self.n_targets];
+                let left_target_sums: Vec<GradientPairInt64> = pairs.iter().map(|p| p.0).collect();
+                let right_target_sums: Vec<GradientPairInt64> = pairs.iter().map(|p| p.1).collect();
+                let left = GradientPairInt64 { grad: split.left_grad, hess: split.left_hess };
+                debug_assert!(
+                    split.loss_chg <= RT_EPS
+                        || left
+                            == left_target_sums
+                                .iter()
+                                .fold(GradientPairInt64::default(), |a, b| a + *b),
+                    "the per-target child sums must add up to the candidate's own"
+                );
+                ExpandEntry {
+                    split,
+                    left_stats: self.decode(left),
+                    right_stats: self.decode(node.sum - left),
+                    left_target_sums,
+                    right_target_sums,
+                    ..node.clone()
+                }
+            })
+            .collect())
+    }
+
     /// Read a shared frontier buffer back to host, decoding the accumulator's
     /// 4 `u32` words per bin into quantised `[grad, hess]` pairs.
     ///
@@ -556,7 +744,7 @@ impl<R: Runtime> GpuHistGrower<R> {
         expandable: &[Expandable],
         batch: &[ExpandEntry],
         left_counts: &[u32],
-        dev_gpairs: &DeviceGpairs,
+        dev_gpairs: &[DeviceGpairs],
         partitioner: &RowPartitioner<R>,
         evaluator: &SplitEvaluator,
     ) -> Vec<ExpandEntry> {
@@ -564,8 +752,11 @@ impl<R: Runtime> GpuHistGrower<R> {
             return Vec::new();
         }
         let frontier = self.zeroed_frontier(expandable.len() * 2);
-        let frontier_bins = self.n_bins * expandable.len() * 2;
+        let frontier_bins = self.frontier_bins(expandable.len() * 2);
         let n_bins = self.n_bins as u32;
+        // Bins between one node's slot and the next: a node holds one histogram
+        // per target, side by side.
+        let stride = n_bins * self.n_targets as u32;
         let mut out = Vec::with_capacity(expandable.len() * 2);
         // Collected across the batch so the level costs one histogram launch
         // and one subtraction launch, not two per node.
@@ -583,27 +774,37 @@ impl<R: Runtime> GpuHistGrower<R> {
 
             // Build the child with the smaller hessian sum; subtract the other.
             let fewer_right = parent.right_stats.sum_hess < parent.left_stats.sum_hess;
-            let (build_slot, sub_slot) = ((i * 2) as u32, (i * 2 + 1) as u32);
+            let (build_slot, sub_slot) = ((i * 2) as u32 * stride, (i * 2 + 1) as u32 * stride);
+            let left_side =
+                (e.left, left_seg, left_sum, parent.left_stats, &parent.left_target_sums);
+            let right_side =
+                (e.right, right_seg, right_sum, parent.right_stats, &parent.right_target_sums);
             let (build, subtract) = if fewer_right {
-                (
-                    (e.right, right_seg, right_sum, parent.right_stats, build_slot),
-                    (e.left, left_seg, left_sum, parent.left_stats, sub_slot),
-                )
+                (right_side, left_side)
             } else {
-                (
-                    (e.left, left_seg, left_sum, parent.left_stats, build_slot),
-                    (e.right, right_seg, right_sum, parent.right_stats, sub_slot),
-                )
+                (left_side, right_side)
             };
 
             hist_jobs.push(NodeHistJob {
                 ridx_base: build.1.0,
                 n_ridx: build.1.1,
-                slot: build_slot * n_bins,
+                slot: build_slot,
             });
-            sub_slots.push((parent.slot, build_slot * n_bins, sub_slot * n_bins));
+            sub_slots.push((parent.slot, build_slot, sub_slot));
 
-            for (nid, seg, sum, stats, slot) in [build, subtract] {
+            for ((nid, seg, sum, stats, targets), slot) in
+                [(build, build_slot), (subtract, sub_slot)]
+            {
+                // Upstream evaluates a child's gain against the *parent's* node
+                // id, so the parent's weight box applies here.
+                let root_gain = if self.is_multi() {
+                    targets
+                        .iter()
+                        .map(|s| evaluator.calc_gain(parent.nid, &self.param, &self.decode(*s)))
+                        .sum()
+                } else {
+                    evaluator.calc_gain(parent.nid, &self.param, &stats)
+                };
                 out.push(ExpandEntry {
                     nid,
                     depth: parent.depth + 1,
@@ -611,15 +812,16 @@ impl<R: Runtime> GpuHistGrower<R> {
                     seg_len: seg.1,
                     hist: frontier.clone(),
                     hist_bins: frontier_bins,
-                    slot: slot * n_bins,
+                    slot,
                     sum,
-                    // Upstream evaluates a child's gain against the *parent's*
-                    // node id, so the parent's weight box applies here.
-                    root_gain: evaluator.calc_gain(parent.nid, &self.param, &stats),
+                    root_gain,
                     split: DeviceSplitCandidate::default(),
                     left_stats: GradStats::default(),
                     right_stats: GradStats::default(),
                     cat_bits: Vec::new(),
+                    target_sums: targets.clone(),
+                    left_target_sums: Vec::new(),
+                    right_target_sums: Vec::new(),
                 });
             }
         }
@@ -633,21 +835,41 @@ impl<R: Runtime> GpuHistGrower<R> {
             expandable.iter().all(|e| batch[e.batch_pos].hist_bins == parent_bins),
             "a batch's parents must share one histogram allocation"
         );
-        self.engine.build_into_batch(
-            dev_gpairs,
-            partitioner.ridx(),
-            partitioner.n_rows(),
-            &hist_jobs,
-            &frontier,
-            frontier_bins,
-        );
-        self.engine.subtract_batch(
-            &parent_hist,
-            parent_bins,
-            &frontier,
-            frontier_bins,
-            &sub_slots,
-        );
+        //
+        // A vector-leaf level runs the same two launches once per target, over
+        // the same row sets and into the target's own slice of each node's
+        // slot — the device counterpart of `HistGrower::build_hists` running
+        // its scalar kernel once per column.
+        for (t, gpairs) in dev_gpairs.iter().enumerate() {
+            let offset = t as u32 * n_bins;
+            let jobs: Vec<NodeHistJob> = if offset == 0 {
+                hist_jobs.clone()
+            } else {
+                hist_jobs.iter().map(|j| NodeHistJob { slot: j.slot + offset, ..*j }).collect()
+            };
+            self.engine.build_into_batch(
+                gpairs,
+                partitioner.ridx(),
+                partitioner.n_rows(),
+                &jobs,
+                &frontier,
+                frontier_bins,
+            );
+        }
+        // The subtraction is per `(node, target)`: each target's histogram is
+        // `parent - built` in its own right.
+        let slots: Vec<(u32, u32, u32)> = if self.is_multi() {
+            sub_slots
+                .iter()
+                .flat_map(|&(p, b, o)| {
+                    (0..self.n_targets as u32)
+                        .map(move |t| (p + t * n_bins, b + t * n_bins, o + t * n_bins))
+                })
+                .collect()
+        } else {
+            sub_slots
+        };
+        self.engine.subtract_batch(&parent_hist, parent_bins, &frontier, frontier_bins, &slots);
 
         // The depth-wise queue expects ascending node ids, and the smaller
         // child is not always the left one.
@@ -662,6 +884,9 @@ impl<R: Runtime> GpuHistGrower<R> {
         tree: &mut RegTree,
         evaluator: &mut SplitEvaluator,
     ) -> (usize, usize) {
+        if self.is_multi() {
+            return self.apply_split_multi(entry, tree, evaluator);
+        }
         let mut parent_sum = entry.left_stats;
         parent_sum.add_stats(&entry.right_stats);
         let nid = entry.nid;
@@ -707,6 +932,65 @@ impl<R: Runtime> GpuHistGrower<R> {
         let node = tree.nodes[nid];
         let (left, right) = (node.left as usize, node.right as usize);
         evaluator.add_split(nid, left, right, node.split_index, left_weight, right_weight);
+        self.constraints.split(nid, node.split_index, left, right);
+        (left, right)
+    }
+
+    /// [`apply_split`](Self::apply_split) for a vector-leaf tree: one shared
+    /// split decision, one leaf value per target.
+    ///
+    /// Port of `HistGrower::apply_split_multi`, including where the summed
+    /// statistics are used instead of the per-target ones — the node's cover,
+    /// the tree's recorded gain, and the monotone box handed to the children,
+    /// which is stated per feature rather than per target.
+    fn apply_split_multi(
+        &mut self,
+        entry: &ExpandEntry,
+        tree: &mut RegTree,
+        evaluator: &mut SplitEvaluator,
+    ) -> (usize, usize) {
+        let mut parent_sum = entry.left_stats;
+        parent_sum.add_stats(&entry.right_stats);
+        let nid = entry.nid;
+        let p = &self.param;
+        let lr = p.learning_rate;
+
+        let base_weight = evaluator.calc_weight(nid, p, &parent_sum);
+        let left_weights: Vec<f32> = entry
+            .left_target_sums
+            .iter()
+            .map(|s| lr * evaluator.calc_weight(nid, p, &self.decode(*s)))
+            .collect();
+        let right_weights: Vec<f32> = entry
+            .right_target_sums
+            .iter()
+            .map(|s| lr * evaluator.calc_weight(nid, p, &self.decode(*s)))
+            .collect();
+
+        tree.expand_node_multi(
+            nid,
+            entry.split.split_index(),
+            entry.split.split_value,
+            entry.split.default_left(),
+            base_weight,
+            &left_weights,
+            &right_weights,
+            entry.split.loss_chg,
+            parent_sum.sum_hess as f32,
+            entry.left_stats.sum_hess as f32,
+            entry.right_stats.sum_hess as f32,
+        );
+
+        let node = tree.nodes[nid];
+        let (left, right) = (node.left as usize, node.right as usize);
+        evaluator.add_split(
+            nid,
+            left,
+            right,
+            node.split_index,
+            evaluator.calc_weight(nid, p, &entry.left_stats),
+            evaluator.calc_weight(nid, p, &entry.right_stats),
+        );
         self.constraints.split(nid, node.split_index, left, right);
         (left, right)
     }
@@ -770,7 +1054,7 @@ impl<R: Runtime> GpuHistGrower<R> {
         // Four u32 accumulator words per bin, which is also two i64 words.
         // Zeroed on device: filling it host-side and uploading would move the
         // whole frontier across the bus once per level.
-        self.engine.zeroed(self.n_bins * 4 * slots)
+        self.engine.zeroed(self.frontier_bins(slots) * 4)
     }
 }
 
