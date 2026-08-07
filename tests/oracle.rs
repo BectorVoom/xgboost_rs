@@ -18,8 +18,18 @@ fn quantile_cuts_match_xgboost_exactly() {
         let cuts = build_cuts(&dmat, max_bin).unwrap();
         // `get_quantile_cut()` reports each feature as `[min_value, ...cuts]`,
         // whereas `HistogramCuts` keeps the min values in their own array.
+        //
+        // From 3.4.0 that leading slot is `-inf`: upstream dropped
+        // `HistogramCuts::min_vals_` and a first bin's lower bound is now
+        // unbounded. JSON has no infinity literal, so the generator writes
+        // `null` for it.
         let want_ptrs = u32_array(&fixture["cut_ptrs"]);
-        let want_values = f32_array(&fixture["cut_values"]);
+        let want_values: Vec<f32> = fixture["cut_values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().map(|f| f as f32).unwrap_or(f32::NEG_INFINITY))
+            .collect();
 
         assert_eq!(
             cuts.num_features(),

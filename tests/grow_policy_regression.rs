@@ -79,29 +79,55 @@ fn model(grow_policy: GrowPolicy, max_depth: u32, max_leaves: u32) -> String {
     api::train(&params, &d, &[]).expect("training failed").0.save_model()
 }
 
+/// Compare a policy's digests, reporting every mismatch at once.
+///
+/// These pins move whenever the *binning* changes, because different cut values
+/// put rows in different bins. That is legitimate — the digests were last taken
+/// against the XGBoost 3.4.0 quantile sketch — so a wholesale mismatch here
+/// wants re-pinning, while a single one moving means the scheduling claim above
+/// has been broken. Reporting all of them is what tells those two apart.
+fn assert_digests(policy: GrowPolicy, cases: &[(u32, u32, &str)]) {
+    let mut wrong = Vec::new();
+    for &(max_depth, max_leaves, expected) in cases {
+        let got = digest(&model(policy, max_depth, max_leaves));
+        if got != expected {
+            wrong.push(format!(
+                "  depth={max_depth:<3} leaves={max_leaves:<4} got {got}, pinned {expected}"
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{policy} models changed ({} of {} pins):\n{}",
+        wrong.len(),
+        cases.len(),
+        wrong.join("\n")
+    );
+}
+
 #[test]
 fn depthwise_models_are_unchanged() {
-    for (max_depth, max_leaves, expected) in [
-        (6u32, 0u32, "f3dd2c94663b81b8"),
-        (0, 32, "20c52842a9329002"),
-        (8, 64, "7d88de5acacc1246"),
-    ] {
-        let got = digest(&model(GrowPolicy::DepthWise, max_depth, max_leaves));
-        assert_eq!(got, expected, "depthwise depth={max_depth} leaves={max_leaves}");
-    }
+    assert_digests(
+        GrowPolicy::DepthWise,
+        &[
+            (6, 0, "ce3c5fa0be9c7b33"),
+            (0, 32, "a3eb379392b890b6"),
+            (8, 64, "34359fa302cc0567"),
+        ],
+    );
 }
 
 #[test]
 fn lossguide_models_are_unchanged() {
-    for (max_depth, max_leaves, expected) in [
-        (0u32, 16u32, "68aaf5131424dc52"),
-        (0, 64, "211d6c73e74dc0d4"),
-        (0, 256, "66c9527d1b53c2e4"),
-        (6, 64, "e3dd3764cba26a52"),
-    ] {
-        let got = digest(&model(GrowPolicy::LossGuide, max_depth, max_leaves));
-        assert_eq!(got, expected, "lossguide depth={max_depth} leaves={max_leaves}");
-    }
+    assert_digests(
+        GrowPolicy::LossGuide,
+        &[
+            (0, 16, "224e7c05017f4455"),
+            (0, 64, "288e696e9f9161a5"),
+            (0, 256, "8c12ab3048eb4dee"),
+            (6, 64, "7d225dbf494d1445"),
+        ],
+    );
 }
 
 /// The chunking reads the thread count to size its jobs, so the thread count

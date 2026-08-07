@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
 """Generate golden fixtures from a pinned XGBoost for the Rust oracle tests.
 
+Pinned to **xgboost 3.4.0**, the upstream reference SPEC.md names. (These were
+pinned to 3.0.5 until the 3.4.0 quantile sketch was ported; regenerating under a
+different version will move every cut and therefore every tree.)
+
 Run with the pinned interpreter:
 
     .venv-oracle/bin/python tools/gen_fixtures.py
+
+The agaricus cases read `xgboost-master/demo/data/agaricus.txt.train`, which is
+gitignored rather than vendored. Fetch it first:
+
+    mkdir -p xgboost-master/demo/data && curl -fsSL -o \\
+      xgboost-master/demo/data/agaricus.txt.train \\
+      https://raw.githubusercontent.com/dmlc/xgboost/v3.4.0/demo/data/agaricus.txt.train
 
 Everything written under tests/fixtures/ is committed; Python is a fixture
 generator only, never a runtime dependency of the crate.
@@ -116,6 +127,26 @@ def dump_csr(
     print(f"wrote {path.relative_to(ROOT)}  ({path.stat().st_size / 1024:.0f} KiB)")
 
 
+def parse_base_score(raw) -> float:
+    """`base_score` is a scalar string on a single-output model and a bracketed
+    vector (`"[-8.2e-2]"`) from 3.4.0 onwards."""
+    text = str(raw).strip()
+    if text.startswith("["):
+        inner = text.strip("[]").strip()
+        return float(inner.split(",")[0]) if inner else 0.0
+    return float(text)
+
+
+def json_floats(values) -> list:
+    """Encode a float sequence for JSON, mapping non-finite to null.
+
+    3.4.0 reports each feature's leading "min value" cut as `-inf` (it dropped
+    `HistogramCuts::min_vals_` and the lower bound of a first bin is now
+    unbounded). JSON has no infinity literal.
+    """
+    return [float(v) if np.isfinite(v) else None for v in values]
+
+
 def dump_case(name: str, dmat: xgb.DMatrix, params: dict, num_round: int, extra: dict) -> None:
     params = dict(params)
     params.setdefault("nthread", 1)
@@ -145,8 +176,8 @@ def dump_case(name: str, dmat: xgb.DMatrix, params: dict, num_round: int, extra:
         "params": params,
         "num_round": num_round,
         "cut_ptrs": [int(p) for p in ptrs],
-        "cut_values": [float(v) for v in vals],
-        "base_score": float(model["learner"]["learner_model_param"]["base_score"]),
+        "cut_values": json_floats(vals),
+        "base_score": parse_base_score(model["learner"]["learner_model_param"]["base_score"]),
         "rmse": [float(v) for v in evals_result["train"]["rmse"]],
         "predictions": [float(v) for v in preds],
         "margins": [float(v) for v in margins],
@@ -199,7 +230,7 @@ def dump_method_case(
         "xgboost_version": xgb.__version__,
         "params": params,
         "num_round": num_round,
-        "base_score": float(model["learner"]["learner_model_param"]["base_score"]),
+        "base_score": parse_base_score(model["learner"]["learner_model_param"]["base_score"]),
         "metric": metric,
         "metric_history": [float(v) for v in evals_result["train"][metric]],
         "predictions": [float(v) for v in booster.predict(dmat)],
