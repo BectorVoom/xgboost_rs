@@ -46,3 +46,8 @@ required-features = ["gpu"]
 [[test]]
 name = "parameters"
 path = "tests/parameters.rs"
+
+[[test]]
+name = "gpu_split_eval"
+path = "tests/gpu_split_eval.rs"
+required-features = ["gpu"]

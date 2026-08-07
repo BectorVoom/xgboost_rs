@@ -2,6 +2,7 @@
 //! `xgboost/src/tree/gpu_hist/*.cu` to CubeCL.
 
 pub mod ellpack;
+pub mod evaluate_splits;
 pub mod histogram;
 pub mod quantiser;
 
