@@ -76,7 +76,13 @@ They are **not yet wired into training**. `device=cuda` resolves to the
 training on the CPU. So there is no GPU training number to report yet, and the
 crate does not currently ship a GPU fit.
 
-For CUDA numbers see `KAGGLE.md`; note that Kaggle's **P100 is SM 6.0**, below
-the SM70 XGBoost's own wheels require, so an XGBoost GPU baseline cannot be
-measured on a P100 session — the CubeCL kernels compile through NVRTC for
-whatever device is present and are unaffected.
+On real CUDA (Kaggle Tesla P100) the kernel oracle also passes in full, and the
+speed sweep turns up something worth acting on: on **dense** input native
+64-bit global atomics beat the privatised shared-memory histogram by 1.6x
+(13.95 vs 8.72 Gentry/s at 1M x 32), while `HistogramBuilder::build`
+auto-selects shared whenever the bins fit. Shared only wins on sparse input
+(21.21 Gentry/s). Full table and caveats in `KAGGLE.md`.
+
+No XGBoost GPU baseline yet: Kaggle's **P100 is SM 6.0**, below the SM70
+XGBoost's own wheels require, so every XGBoost CUDA path fails there with
+`This program was not compiled for SM 60`. That needs a T4/L4/V100 session.

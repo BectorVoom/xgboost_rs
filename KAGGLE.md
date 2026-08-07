@@ -79,8 +79,51 @@ Benchmark size via environment variables (defaults in parentheses):
 - `Gentry/s` = matrix entries visited per second (`rows * features / time`);
   XGBoost's own gpu_hist throughput scales the same way.
 - `dense/shared` vs `dense/global` isolates the shared-memory privatised
-  histogram against pure global atomics — on CUDA hardware expect the shared
-  path to win clearly at 256 bins/feature.
+  histogram against pure global atomics.
+
+## Measured on a Kaggle Tesla P100 (SM 6.0), CUDA 13.0
+
+Oracle: **ALL PASS** — all ten kernel cases at exact `i64` equality against the
+CPU reference, with `native i64 atomics: supported`.
+
+| case | 1M x 32 | 4.2M x 64 |
+|---|---:|---:|
+| `dense/shared`        |  8.72 Gentry/s |  9.89 Gentry/s |
+| `dense/global/u32`    |  6.43 |  6.48 |
+| `dense/global/i64`    | **13.95** | **12.43** |
+| `sparse0.5/shared`    | **21.21** | **20.83** |
+| `sparse0.5/global/u32`| 12.09 | 12.09 |
+| `sparse0.5/global/i64`| 19.48 | 20.22 |
+
+**This contradicts the expectation stated above**, which used to read "on CUDA
+hardware expect the shared path to win clearly at 256 bins/feature". On dense
+input it does not: native 64-bit global atomics beat the privatised shared
+histogram by **1.6x** at 1M x 32 and 1.26x at 4.2M x 64. Shared only wins on
+the sparse case.
+
+That matters because `HistogramBuilder::build` picks the shared path whenever a
+group's bins fit in the shared-memory budget, so on this hardware the dense
+path auto-selects the slower of the two. Worth making the choice measured
+rather than assumed before any of this is wired into training.
+
+## What a P100 session cannot measure
+
+XGBoost's own 3.x wheels are compiled for SM70 and up, so on a P100 every CUDA
+path in XGBoost fails outright with `This program was not compiled for SM 60`.
+Two consequences:
+
+- there is no XGBoost `gpu_hist` baseline from a P100 session (the CPU numbers
+  still come out: 200k x 32 in 1.19s, 1M x 32 in 4.28s, 1M x 64 in 7.93s, 20
+  rounds at depth 8);
+- the four GPU-gated oracle cases — `device=cuda`,
+  `sampling_method=gradient_based`, `updater=grow_gpu_hist` and
+  `grow_gpu_approx` — still cannot be pinned, and `tools/gen_string_param_fixtures.py`
+  correctly reports `cuda device usable: False` there.
+
+Those need an SM70+ accelerator (T4, L4 or V100). The CubeCL kernels are
+unaffected either way: they compile through NVRTC for whatever device is
+present, which is why the oracle above passes on the same P100 that XGBoost
+refuses to run on.
 - Timing excludes data upload/quantisation (device-resident inputs, one sync
   per timed batch), so it measures the kernel itself.
 
