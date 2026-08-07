@@ -29,6 +29,7 @@ KPY="$(head -1 "$KAGGLE_BIN" | sed 's|^#!||')"
 say() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*" | tee -a "$LOG"; }
 
 say "waiting for GPU quota (checking every ${INTERVAL}s); interpreter $KPY"
+prev_used=""
 while true; do
   if out="$("$KPY" tools/kaggle/quota.py --need-minutes 30 2>&1)"; then
     say "$out"
@@ -41,5 +42,17 @@ while true; do
     exit 1
   fi
   say "$out"
+
+  # Usage climbing between checks means a session of yours is running right
+  # now and drawing the allowance down further — worth naming, because
+  # otherwise the log just looks like the quota is refusing to reset.
+  used="$("$KPY" tools/kaggle/quota.py --porcelain 2>/dev/null | awk '{print $1}')"
+  if [ -n "$prev_used" ] && [ -n "$used" ]; then
+    if awk -v a="$used" -v b="$prev_used" 'BEGIN{exit !(a>b+0.001)}'; then
+      say "  note: usage rose $(awk -v a="$used" -v b="$prev_used" 'BEGIN{printf "%.2f", a-b}')h since the last check - a GPU session is still running:"
+      kaggle kernels list --mine --sort-by dateRun -p 1 2>/dev/null | awk 'NR>2 && NR<6 {print "    " $1}' | tee -a "$LOG"
+    fi
+  fi
+  prev_used="$used"
   sleep "$INTERVAL"
 done

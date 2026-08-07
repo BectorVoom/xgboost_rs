@@ -27,6 +27,11 @@ def main() -> int:
     # Kaggle reserves session time up front, so leave headroom rather than
     # waiting for the very last minute of the allowance.
     ap.add_argument("--need-minutes", type=float, default=30.0)
+    ap.add_argument(
+        "--porcelain",
+        action="store_true",
+        help="print `used allowed reserved remaining` in hours, for scripts",
+    )
     args = ap.parse_args()
 
     try:
@@ -43,11 +48,14 @@ def main() -> int:
     reserved_h = q.time_reserved.total_seconds() / 3600.0
     remaining_h = allowed_h - used_h - reserved_h
 
-    print(
-        f"gpu quota: {used_h:.2f}h used of {allowed_h:.2f}h allowed"
-        f"{f', {reserved_h:.2f}h reserved' if reserved_h else ''}"
-        f"  ->  {remaining_h:.2f}h remaining"
-    )
+    if args.porcelain:
+        print(f"{used_h:.4f} {allowed_h:.4f} {reserved_h:.4f} {remaining_h:.4f}")
+    else:
+        print(
+            f"gpu quota: {used_h:.2f}h used of {allowed_h:.2f}h allowed"
+            f"{f', {reserved_h:.2f}h reserved' if reserved_h else ''}"
+            f"  ->  {remaining_h:.2f}h remaining"
+        )
     return 0 if remaining_h * 60.0 >= args.need_minutes else 1
 
 
