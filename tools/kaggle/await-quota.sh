@@ -3,6 +3,13 @@
 #
 #   tools/kaggle/await-quota.sh [check-interval-seconds]   # default 1800 (30 min)
 #
+# The wait can be days, so detach it from your shell rather than leaving it in
+# a terminal (or in an agent session, which will eventually end):
+#
+#   setsid nohup tools/kaggle/await-quota.sh 1800 >/dev/null 2>&1 &
+#
+# Progress goes to kaggle-await.log either way. To stop it: pkill -f await-quota
+#
 # The weekly allowance is 30 GPU-hours and `kernels push` refuses outright once
 # it is spent, so there is nothing to do but wait for the reset. This polls the
 # quota and, the first time a session could start, runs push.sh --wait end to
