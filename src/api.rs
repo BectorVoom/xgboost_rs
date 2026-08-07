@@ -9,9 +9,9 @@ use crate::gbm::DartConfig;
 use crate::data::DMatrix;
 use crate::learner::Learner;
 use crate::parameters::{
-    BoosterType, Device, EvalMetric, IterationRange, MultiStrategy, PredictParameters,
-    PredictionType, TrainingParameters, TreeBoosterParameters, TreeUpdaterName, VerboseEval,
-    Verbosity,
+    BoosterType, Device, EvalMetric, IterationRange, MultiStrategy,
+    Objective as ObjectiveSpec, PredictParameters, PredictionType, TrainingParameters,
+    TreeBoosterParameters, TreeUpdaterName, VerboseEval, Verbosity,
 };
 use crate::predictor::TreeRange;
 use crate::tree::param::{GrowPolicy, TrainParam};
@@ -510,7 +510,8 @@ pub fn train_from(
             learning.base_score,
         ),
         _ => {
-            let param = train_param(tree.expect("a tree booster"), general.device)?;
+            let param =
+                train_param(tree.expect("a tree booster"), &learning.objective, general.device)?;
             Learner::new(ctx, obj, metrics, dtrain.num_col(), param, learning.base_score)
         }
     };
@@ -843,8 +844,39 @@ fn unused_parameters(
     unused
 }
 
+/// The `max_delta_step` an objective supplies for the tree's leaf-weight clip,
+/// if it has one of its own.
+///
+/// `count:poisson` is the only objective that does. Upstream declares
+/// `max_delta_step` on `PoissonRegressionParam` with a default of `0.7`, under
+/// the *same* configuration name the tree booster reads — so a poisson fit
+/// clips leaf weights at `0.7` unless the user says otherwise, while every
+/// other objective leaves the tree's own default of `0` alone.
+///
+/// Confirmed against the pinned 3.4.0: on the `positive` fixture a default
+/// poisson fit and one with `max_delta_step=0.7` produce the identical tree
+/// (node 6 leaf weight `0.21`), while `max_delta_step=0` gives `0.689`. This
+/// crate previously passed only `tree.max_delta_step`, so the clip never
+/// applied. The value carried on the objective is already either the user's or
+/// the `0.7` default, so it can be used directly.
+fn objective_max_delta_step(objective: &ObjectiveSpec) -> Option<f32> {
+    match objective {
+        ObjectiveSpec::CountPoisson { max_delta_step } => Some(*max_delta_step),
+        _ => None,
+    }
+}
+
 /// Translate the public tree parameters into the internal training parameters.
-fn train_param(tree: &TreeBoosterParameters, device: Device) -> Result<TrainParam> {
+///
+/// `objective` is read for one thing only: `count:poisson` declares its own
+/// `max_delta_step`, under the same parameter name the tree booster uses, and
+/// it reaches the tree's leaf-weight clip. See
+/// [`objective_max_delta_step`].
+fn train_param(
+    tree: &TreeBoosterParameters,
+    objective: &ObjectiveSpec,
+    device: Device,
+) -> Result<TrainParam> {
     Ok(TrainParam {
         learning_rate: tree.eta,
         min_split_loss: tree.gamma,
@@ -858,7 +890,7 @@ fn train_param(tree: &TreeBoosterParameters, device: Device) -> Result<TrainPara
         min_child_weight: tree.min_child_weight,
         reg_lambda: tree.lambda,
         reg_alpha: tree.alpha,
-        max_delta_step: tree.max_delta_step,
+        max_delta_step: objective_max_delta_step(objective).unwrap_or(tree.max_delta_step),
         subsample: tree.subsample,
         sampling_method: tree.sampling_method,
         colsample_bytree: tree.colsample_bytree,
