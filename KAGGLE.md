@@ -1,5 +1,45 @@
 # Running the oracle + speed benchmark on a Kaggle CUDA GPU
 
+## Scripted (preferred)
+
+`tools/kaggle/push.sh [--wait]` packages the crate, uploads it as a dataset,
+waits for ingest, and pushes `tools/kaggle/run.py` as a kernel. It needs an
+authenticated `kaggle` CLI.
+
+**Ask for a T4, not the default.** Kaggle hands out a **P100 (SM 6.0)** unless
+told otherwise, and XGBoost's own 3.x wheels are built for SM70+ — on a P100
+every XGBoost CUDA path fails with `This program was not compiled for SM 60`,
+so there is no `gpu_hist` baseline and the four GPU-gated oracle cases cannot
+be pinned. The CubeCL kernels are unaffected (NVRTC compiles for the live
+device), which is why the kernel oracle passes on a P100 that XGBoost refuses.
+
+`enable_gpu` is deprecated and cannot choose a type. `machine_shape` can:
+
+```json
+{ "enable_gpu": true, "machine_shape": "NvidiaTeslaT4" }
+```
+
+Accepted values are `NvidiaTeslaT4`, `NvidiaTeslaP100` and `Tpu1VmV38`. This is
+in `tools/kaggle/kernel-metadata.json`.
+
+Two limits worth knowing before you queue anything, because both fail at push
+time with a message that looks like a bug in the config:
+
+* **two concurrent batch GPU sessions** per account;
+* **30 GPU-hours per week**, and `kernels push` refuses outright once that is
+  spent. Check it before packaging:
+
+```python
+from kagglesdk import KaggleClient
+from kagglesdk.kernels.types.kernels_api_service import ApiGetAcceleratorQuotaStatisticsRequest
+with KaggleClient() as c:
+    q = c.kernels.kernels_api_client.get_accelerator_quota_statistics(
+        ApiGetAcceleratorQuotaStatisticsRequest()).gpu_quota
+    print(q.time_used, "of", q.total_time_allowed)
+```
+
+## Manual
+
 The `bench` binary tests every kernel path against a CPU oracle (exact `i64`
 equality) and then times histogram builds. Built with `--features cuda` it runs
 on CubeCL's CUDA runtime (NVRTC-compiled kernels); Kaggle's GPU images ship the
