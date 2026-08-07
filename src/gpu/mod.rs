@@ -5,6 +5,7 @@ pub mod ellpack;
 pub mod evaluate_splits;
 pub mod histogram;
 pub mod quantiser;
+pub mod row_partitioner;
 
 use cubecl::server::Handle;
 

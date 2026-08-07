@@ -36,6 +36,52 @@ pub struct EllpackMatrix {
     pub layout: EllpackLayout,
 }
 
+/// An [`EllpackMatrix`] resident on device.
+///
+/// Both the histogram kernel and the row partitioner read the same `gidx`, so
+/// it is uploaded once and shared rather than copied per consumer — it is by
+/// far the largest buffer a fit holds (`4 * n_rows * row_stride` bytes).
+#[derive(Clone, Debug)]
+pub struct DeviceEllpack {
+    pub gidx: cubecl::server::Handle,
+    pub cut_ptrs: cubecl::server::Handle,
+    pub gidx_len: usize,
+    pub n_cuts: usize,
+    pub n_rows: usize,
+    pub row_stride: u32,
+    pub base_rowid: u32,
+    pub null_value: u32,
+    pub n_bins: u32,
+    pub dense: bool,
+    pub compressed: bool,
+}
+
+impl DeviceEllpack {
+    /// Upload `matrix` to the device.
+    pub fn upload<R: cubecl::prelude::Runtime>(
+        client: &cubecl::prelude::ComputeClient<R>,
+        matrix: &EllpackMatrix,
+    ) -> Self {
+        Self {
+            gidx: client.create_from_slice(bytemuck::cast_slice(&matrix.gidx)),
+            cut_ptrs: client.create_from_slice(bytemuck::cast_slice(&matrix.cut_ptrs)),
+            gidx_len: matrix.gidx.len(),
+            n_cuts: matrix.cut_ptrs.len(),
+            n_rows: matrix.n_rows,
+            row_stride: matrix.row_stride as u32,
+            base_rowid: matrix.base_rowid,
+            null_value: matrix.null_value,
+            n_bins: matrix.n_bins(),
+            dense: matrix.is_dense(),
+            compressed: matrix.is_compressed(),
+        }
+    }
+
+    pub fn n_features(&self) -> usize {
+        self.n_cuts - 1
+    }
+}
+
 impl EllpackMatrix {
     pub fn n_features(&self) -> usize {
         self.cut_ptrs.len() - 1

@@ -51,3 +51,8 @@ path = "tests/parameters.rs"
 name = "gpu_split_eval"
 path = "tests/gpu_split_eval.rs"
 required-features = ["gpu"]
+
+[[test]]
+name = "gpu_row_partition"
+path = "tests/gpu_row_partition.rs"
+required-features = ["gpu"]
