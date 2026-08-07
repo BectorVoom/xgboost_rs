@@ -14,7 +14,7 @@ use xgboost_rs::data::cuts::build_cuts;
 use xgboost_rs::data::gradient_index::build_gradient_index;
 use xgboost_rs::gpu::{DeviceRows, GradientPairInt64};
 use xgboost_rs::gpu::ellpack::{EllpackLayout, build_ellpack};
-use xgboost_rs::gpu::histogram::HistogramBuilder;
+use xgboost_rs::gpu::histogram::{HistogramBuilder, NodeHistJob};
 use xgboost_rs::reference::{Rng, cpu_histogram, random_matrix};
 
 type R = WgpuRuntime;
@@ -198,6 +198,105 @@ fn builds_one_child_and_subtracts_the_sibling() {
 
     assert_eq!(read_slot(0), cpu_histogram(&m, &gpairs, &all[split..]), "built child");
     assert_eq!(read_slot(1), cpu_histogram(&m, &gpairs, &all[..split]), "subtracted sibling");
+}
+
+/// The batched path: a whole level's histograms in one launch, and a whole
+/// level's siblings subtracted in one more.
+///
+/// This is what the grower actually issues, and it is the case a per-slot loop
+/// does not exercise — a batched kernel indexes the node from a second grid
+/// dimension, which is easy to get wrong in a way one node never shows.
+#[test]
+fn a_whole_level_builds_and_subtracts_in_one_launch_each() {
+    let client = client();
+    let m = random_matrix(4000, 5, 32, 0.1, EllpackLayout::DenseCompressed, 71);
+    let engine = HistogramBuilder::new(&client).build(&m).unwrap();
+
+    let mut rng = Rng(73);
+    let gpairs: Vec<GradientPairInt64> = (0..m.n_rows)
+        .map(|_| GradientPairInt64 {
+            grad: rng.next_u32() as i64 - i64::from(u32::MAX / 2),
+            hess: i64::from(rng.next_u32() % 900) + 1,
+        })
+        .collect();
+    let dev_gpairs = engine.upload_gpairs(&gpairs).unwrap();
+    let n_bins = m.n_bins() as usize;
+
+    let all: Vec<u32> = (0..m.n_rows as u32).collect();
+    let ridx = client.create_from_slice(bytemuck::cast_slice(&all));
+
+    // Three parents, each a contiguous segment, each split somewhere.
+    let parents = [(0usize, 1500usize), (1500, 1300), (2800, 1200)];
+    let splits = [600usize, 400, 900]; // rows going to the built child
+
+    let parent_buf = engine.zeroed(n_bins * 4 * parents.len());
+    engine.build_into_batch(
+        &dev_gpairs,
+        &ridx,
+        all.len(),
+        &parents
+            .iter()
+            .enumerate()
+            .map(|(i, &(b, l))| NodeHistJob {
+                ridx_base: b as u32,
+                n_ridx: l as u32,
+                slot: (i * n_bins) as u32,
+            })
+            .collect::<Vec<_>>(),
+        &parent_buf,
+        n_bins * parents.len(),
+    );
+
+    // Build the second child of each parent, subtract the first.
+    let frontier = engine.zeroed(n_bins * 4 * parents.len() * 2);
+    let frontier_bins = n_bins * parents.len() * 2;
+    let jobs: Vec<NodeHistJob> = parents
+        .iter()
+        .zip(splits)
+        .enumerate()
+        .map(|(i, (&(b, l), s))| NodeHistJob {
+            ridx_base: (b + s) as u32,
+            n_ridx: (l - s) as u32,
+            slot: (i * 2 * n_bins) as u32,
+        })
+        .collect();
+    engine.build_into_batch(&dev_gpairs, &ridx, all.len(), &jobs, &frontier, frontier_bins);
+    engine.subtract_batch(
+        &parent_buf,
+        n_bins * parents.len(),
+        &frontier,
+        frontier_bins,
+        &(0..parents.len())
+            .map(|i| {
+                ((i * n_bins) as u32, (i * 2 * n_bins) as u32, ((i * 2 + 1) * n_bins) as u32)
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    let bytes = client.read_one_unchecked(frontier);
+    let words: &[u32] = bytemuck::cast_slice(&bytes);
+    let read_slot = |slot: usize| -> Vec<GradientPairInt64> {
+        words[slot * n_bins * 4..(slot + 1) * n_bins * 4]
+            .chunks_exact(4)
+            .map(|w| GradientPairInt64 {
+                grad: (w[0] as i64) | ((w[1] as i64) << 32),
+                hess: (w[2] as i64) | ((w[3] as i64) << 32),
+            })
+            .collect()
+    };
+
+    for (i, (&(b, l), s)) in parents.iter().zip(splits).enumerate() {
+        assert_eq!(
+            read_slot(i * 2),
+            cpu_histogram(&m, &gpairs, &all[b + s..b + l]),
+            "built child of parent {i}"
+        );
+        assert_eq!(
+            read_slot(i * 2 + 1),
+            cpu_histogram(&m, &gpairs, &all[b..b + s]),
+            "subtracted sibling of parent {i}"
+        );
+    }
 }
 
 /// A slot-0 build must still equal the standalone one, so the offset did not

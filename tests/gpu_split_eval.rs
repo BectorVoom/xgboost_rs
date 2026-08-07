@@ -173,8 +173,6 @@ fn check(case: &Case, p: &TrainParam, constraints: &[MonotoneConstraint], allowe
         alpha: p.reg_alpha,
         max_delta_step: p.max_delta_step,
         min_child_weight: p.min_child_weight,
-        to_float_grad: case.to_float_grad,
-        to_float_hess: case.to_float_hess,
         monotone: constraints
             .iter()
             .map(|c| match c {
@@ -210,7 +208,16 @@ fn check(case: &Case, p: &TrainParam, constraints: &[MonotoneConstraint], allowe
     let hist_handle = client.create_from_slice(bytemuck::cast_slice(&flat));
     let mask: Vec<u32> = allowed.iter().map(|&a| u32::from(a)).collect();
 
-    let got = gpu.evaluate(&hist_handle, case.hist.len(), &[node], &mask).unwrap();
+    let got = gpu
+        .evaluate(
+            &hist_handle,
+            case.hist.len(),
+            &[node],
+            &mask,
+            case.to_float_grad,
+            case.to_float_hess,
+        )
+        .unwrap();
     let got = got[0];
 
     assert_eq!(
@@ -350,8 +357,6 @@ fn batches_nodes_independently() {
         alpha: p.reg_alpha,
         max_delta_step: p.max_delta_step,
         min_child_weight: p.min_child_weight,
-        to_float_grad: case.to_float_grad,
-        to_float_hess: case.to_float_hess,
         monotone: vec![0; n_features],
     };
     let client = client();
@@ -380,7 +385,16 @@ fn batches_nodes_independently() {
     let second = NodeInput { hist_base: case.hist.len() as u32, ..node };
 
     let mask = vec![1u32; 2 * n_features];
-    let got = gpu.evaluate(&handle, case.hist.len() * 2, &[node, second], &mask).unwrap();
+    let got = gpu
+        .evaluate(
+            &handle,
+            case.hist.len() * 2,
+            &[node, second],
+            &mask,
+            case.to_float_grad,
+            case.to_float_hess,
+        )
+        .unwrap();
 
     assert_eq!(got[0], got[1], "the same histogram twice must split the same way");
     let expected = cpu_best_split(&case, &p, &ev, &all_allowed(n_features));

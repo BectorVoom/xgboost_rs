@@ -552,10 +552,11 @@ pub fn reduce_candidates_kernel(
     in_sindex: &Array<u32>,
     in_split_value: &Array<f32>,
     in_left: &Array<i64>,
-    out_loss_chg: &mut Array<f32>,
-    out_sindex: &mut Array<u32>,
-    out_split_value: &mut Array<f32>,
-    out_left: &mut Array<i64>,
+    // Packed so a batch costs two host round trips rather than four: floats
+    // in one buffer, integers in the other. Each read back is a full pipeline
+    // drain, and a level pays them per launch.
+    out_f32: &mut Array<f32>,
+    out_i64: &mut Array<i64>,
     n_features: u32,
     #[comptime] block: usize,
 ) {
@@ -616,11 +617,11 @@ pub fn reduce_candidates_kernel(
 
     if UNIT_POS_X == 0u32 {
         let n = node as usize;
-        out_loss_chg[n] = s_gain[0usize];
-        out_sindex[n] = s_sindex[0usize];
-        out_split_value[n] = s_value[0usize];
-        out_left[n * 2usize] = s_left[0usize];
-        out_left[n * 2usize + 1] = s_left[1usize];
+        out_f32[n * 2usize] = s_gain[0usize];
+        out_f32[n * 2usize + 1] = s_value[0usize];
+        out_i64[n * 3usize] = i64::cast_from(s_sindex[0usize]);
+        out_i64[n * 3usize + 1] = s_left[0usize];
+        out_i64[n * 3usize + 2] = s_left[1usize];
     }
 }
 
@@ -659,10 +660,6 @@ pub struct SplitConfig {
     pub alpha: f32,
     pub max_delta_step: f32,
     pub min_child_weight: f32,
-    /// `to_floating_point` factors of the quantiser the histogram was built
-    /// with.
-    pub to_float_grad: f64,
-    pub to_float_hess: f64,
     /// `-1`, `0` or `+1` per feature; all-zero means unconstrained.
     pub monotone: Vec<i32>,
 }
@@ -741,12 +738,17 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
     /// `hist` holds interleaved `[grad, hess]` `i64` bins; each node's slice
     /// starts at its own `hist_base`. `feature_mask` is `nodes.len() *
     /// n_features` flags — zero for a feature the node may not split on.
+    /// `to_float_*` are the quantiser's factors for the tree being grown; they
+    /// change per tree, while everything else here is fixed for the fit, which
+    /// is why the evaluator is built once and they are passed per call.
     pub fn evaluate(
         &self,
         hist: &Handle,
         hist_bins: usize,
         nodes: &[NodeInput],
         feature_mask: &[u32],
+        to_float_grad: f64,
+        to_float_hess: f64,
     ) -> Result<Vec<DeviceSplitCandidate>> {
         let n_nodes = nodes.len();
         if n_nodes == 0 {
@@ -796,8 +798,8 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
             unsafe { ArrayArg::from_raw_parts(cand_sindex.clone(), n_cand) },
             unsafe { ArrayArg::from_raw_parts(cand_value.clone(), n_cand) },
             unsafe { ArrayArg::from_raw_parts(cand_left.clone(), n_cand * 2) },
-            self.cfg.to_float_grad,
-            self.cfg.to_float_hess,
+            to_float_grad,
+            to_float_hess,
             self.cfg.lambda,
             self.cfg.alpha,
             self.cfg.max_delta_step,
@@ -808,10 +810,8 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
             EVAL_BLOCK as usize,
         );
 
-        let best_chg = c.empty(n_nodes * size_of::<f32>());
-        let best_sindex = c.empty(n_nodes * size_of::<u32>());
-        let best_value = c.empty(n_nodes * size_of::<f32>());
-        let best_left = c.empty(n_nodes * 2 * size_of::<i64>());
+        let best_f32 = c.empty(n_nodes * 2 * size_of::<f32>());
+        let best_i64 = c.empty(n_nodes * 3 * size_of::<i64>());
 
         reduce_candidates_kernel::launch::<R>(
             c,
@@ -821,26 +821,22 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
             unsafe { ArrayArg::from_raw_parts(cand_sindex, n_cand) },
             unsafe { ArrayArg::from_raw_parts(cand_value, n_cand) },
             unsafe { ArrayArg::from_raw_parts(cand_left, n_cand * 2) },
-            unsafe { ArrayArg::from_raw_parts(best_chg.clone(), n_nodes) },
-            unsafe { ArrayArg::from_raw_parts(best_sindex.clone(), n_nodes) },
-            unsafe { ArrayArg::from_raw_parts(best_value.clone(), n_nodes) },
-            unsafe { ArrayArg::from_raw_parts(best_left.clone(), n_nodes * 2) },
+            unsafe { ArrayArg::from_raw_parts(best_f32.clone(), n_nodes * 2) },
+            unsafe { ArrayArg::from_raw_parts(best_i64.clone(), n_nodes * 3) },
             self.n_features as u32,
             EVAL_BLOCK as usize,
         );
 
-        let chg: Vec<f32> = read_vec(c, best_chg);
-        let sindex: Vec<u32> = read_vec(c, best_sindex);
-        let value: Vec<f32> = read_vec(c, best_value);
-        let left: Vec<i64> = read_vec(c, best_left);
+        let floats: Vec<f32> = read_vec(c, best_f32);
+        let ints: Vec<i64> = read_vec(c, best_i64);
 
         Ok((0..n_nodes)
             .map(|i| DeviceSplitCandidate {
-                loss_chg: chg[i],
-                sindex: sindex[i],
-                split_value: value[i],
-                left_grad: left[2 * i],
-                left_hess: left[2 * i + 1],
+                loss_chg: floats[2 * i],
+                split_value: floats[2 * i + 1],
+                sindex: ints[3 * i] as u32,
+                left_grad: ints[3 * i + 1],
+                left_hess: ints[3 * i + 2],
             })
             .collect())
     }

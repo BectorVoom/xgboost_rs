@@ -26,7 +26,7 @@ use cubecl::server::Handle;
 
 use super::ellpack::{DeviceEllpack, build_ellpack};
 use super::evaluate_splits::{DeviceSplitCandidate, NodeInput, SplitConfig, SplitEvaluatorGpu};
-use super::histogram::{HistogramBuilder, HistogramEngine};
+use super::histogram::{HistogramBuilder, HistogramEngine, NodeHistJob};
 use super::quantiser::GradientQuantiser;
 use super::row_partitioner::{RowPartitioner, SegmentSplit};
 use super::{DeviceGpairs, DeviceRows, GradientPairInt64};
@@ -180,6 +180,8 @@ pub struct GpuHistGrower<R: Runtime> {
     n_bins: usize,
     column_sampler: ColumnSampler,
     constraints: InteractionConstraints,
+    /// Built once: the cut layout it uploads is fixed for the fit.
+    split_eval: SplitEvaluatorGpu<R>,
     /// Quantiser factors of the tree currently being grown.
     to_float_grad: f64,
     to_float_hess: f64,
@@ -198,7 +200,22 @@ impl<R: Runtime> GpuHistGrower<R> {
         let engine = HistogramBuilder::new(&client).build_shared(&matrix, &ell)?;
         let n_features = dmat.num_col();
 
+        let split_eval = SplitEvaluatorGpu::<R>::new(
+            client.clone(),
+            &cuts.cut_ptrs,
+            &cuts.cut_values,
+            &cuts.min_values,
+            SplitConfig {
+                lambda: param.reg_lambda,
+                alpha: param.reg_alpha,
+                max_delta_step: param.max_delta_step,
+                min_child_weight: param.min_child_weight,
+                monotone: param.monotone_constraints.iter().map(direction).collect(),
+            },
+        )?;
+
         Ok(Self {
+            split_eval,
             client,
             ell,
             engine,
@@ -252,28 +269,12 @@ impl<R: Runtime> GpuHistGrower<R> {
             device_pairs.iter().map(|g| quantiser.to_fixed_point(*g)).collect();
         let dev_gpairs = self.engine.upload_gpairs(&qpairs)?;
 
-        let split_eval = SplitEvaluatorGpu::<R>::new(
-            self.client.clone(),
-            &self.cuts.cut_ptrs,
-            &self.cuts.cut_values,
-            &self.cuts.min_values,
-            SplitConfig {
-                lambda: self.param.reg_lambda,
-                alpha: self.param.reg_alpha,
-                max_delta_step: self.param.max_delta_step,
-                min_child_weight: self.param.min_child_weight,
-                to_float_grad: self.to_float_grad,
-                to_float_hess: self.to_float_hess,
-                monotone: self.param.monotone_constraints.iter().map(direction).collect(),
-            },
-        )?;
-
         let mut partitioner = RowPartitioner::<R>::all_rows(self.client.clone(), self.n_rows);
         let mut num_leaves: i32 = 1;
         let mut leaf_segments: Vec<(usize, u32, u32)> = Vec::new();
 
         let root =
-            self.init_root(&dev_gpairs, &qpairs, &split_eval, &evaluator, tree, rng, &partitioner)?;
+            self.init_root(&dev_gpairs, &qpairs,  &evaluator, tree, rng, &partitioner)?;
 
         let mut queue = ExpandQueue::new(self.param.grow_policy);
         if root.split.loss_chg > RT_EPS {
@@ -319,7 +320,7 @@ impl<R: Runtime> GpuHistGrower<R> {
                 &partitioner,
                 &evaluator,
             );
-            let evaluated = self.evaluate(&children, &split_eval, &evaluator, rng)?;
+            let evaluated = self.evaluate(&children, &evaluator, rng)?;
 
             for child in evaluated {
                 if child.split.loss_chg > RT_EPS {
@@ -354,7 +355,6 @@ impl<R: Runtime> GpuHistGrower<R> {
         &mut self,
         dev_gpairs: &DeviceGpairs,
         qpairs: &[GradientPairInt64],
-        split_eval: &SplitEvaluatorGpu<R>,
         evaluator: &SplitEvaluator,
         tree: &mut RegTree,
         rng: &mut Mt19937,
@@ -390,7 +390,7 @@ impl<R: Runtime> GpuHistGrower<R> {
             left_stats: GradStats::default(),
             right_stats: GradStats::default(),
         };
-        let evaluated = self.evaluate(&[entry], split_eval, evaluator, rng)?;
+        let evaluated = self.evaluate(&[entry], evaluator, rng)?;
         Ok(evaluated.into_iter().next().expect("one node in, one node out"))
     }
 
@@ -398,7 +398,6 @@ impl<R: Runtime> GpuHistGrower<R> {
     fn evaluate(
         &mut self,
         nodes: &[ExpandEntry],
-        split_eval: &SplitEvaluatorGpu<R>,
         evaluator: &SplitEvaluator,
         rng: &mut Mt19937,
     ) -> Result<Vec<ExpandEntry>> {
@@ -440,7 +439,14 @@ impl<R: Runtime> GpuHistGrower<R> {
             })
             .collect();
 
-        let candidates = split_eval.evaluate(&hist, hist_bins, &inputs, &mask)?;
+        let candidates = self.split_eval.evaluate(
+            &hist,
+            hist_bins,
+            &inputs,
+            &mask,
+            self.to_float_grad,
+            self.to_float_hess,
+        )?;
 
         Ok(nodes
             .iter()
@@ -476,6 +482,10 @@ impl<R: Runtime> GpuHistGrower<R> {
         let frontier_bins = self.n_bins * expandable.len() * 2;
         let n_bins = self.n_bins as u32;
         let mut out = Vec::with_capacity(expandable.len() * 2);
+        // Collected across the batch so the level costs one histogram launch
+        // and one subtraction launch, not two per node.
+        let mut hist_jobs = Vec::with_capacity(expandable.len());
+        let mut sub_slots = Vec::with_capacity(expandable.len());
 
         for (i, e) in expandable.iter().enumerate() {
             let parent = &batch[e.batch_pos];
@@ -501,27 +511,12 @@ impl<R: Runtime> GpuHistGrower<R> {
                 )
             };
 
-            let rows = DeviceRows::slice(
-                partitioner.ridx().clone(),
-                build.1.0 as usize,
-                build.1.1 as usize,
-            );
-            self.engine.build_into(
-                dev_gpairs,
-                &rows,
-                &frontier,
-                frontier_bins,
-                build_slot * n_bins,
-            );
-            self.engine.subtract_into(
-                &parent.hist,
-                parent.hist_bins,
-                parent.slot,
-                &frontier,
-                frontier_bins,
-                build_slot * n_bins,
-                sub_slot * n_bins,
-            );
+            hist_jobs.push(NodeHistJob {
+                ridx_base: build.1.0,
+                n_ridx: build.1.1,
+                slot: build_slot * n_bins,
+            });
+            sub_slots.push((parent.slot, build_slot * n_bins, sub_slot * n_bins));
 
             for (nid, seg, sum, stats, slot) in [build, subtract] {
                 out.push(ExpandEntry {
@@ -542,6 +537,31 @@ impl<R: Runtime> GpuHistGrower<R> {
                 });
             }
         }
+
+        // One launch for every node's histogram, then one for every sibling.
+        // Every parent of a batch shares a buffer, which is what lets the
+        // subtraction be batched too.
+        let parent_hist = batch[expandable[0].batch_pos].hist.clone();
+        let parent_bins = batch[expandable[0].batch_pos].hist_bins;
+        debug_assert!(
+            expandable.iter().all(|e| batch[e.batch_pos].hist_bins == parent_bins),
+            "a batch's parents must share one histogram allocation"
+        );
+        self.engine.build_into_batch(
+            dev_gpairs,
+            partitioner.ridx(),
+            partitioner.n_rows(),
+            &hist_jobs,
+            &frontier,
+            frontier_bins,
+        );
+        self.engine.subtract_batch(
+            &parent_hist,
+            parent_bins,
+            &frontier,
+            frontier_bins,
+            &sub_slots,
+        );
 
         // The depth-wise queue expects ascending node ids, and the smaller
         // child is not always the left one.
@@ -644,7 +664,9 @@ impl<R: Runtime> GpuHistGrower<R> {
     /// A zeroed buffer holding `slots` node histograms side by side.
     fn zeroed_frontier(&self, slots: usize) -> Handle {
         // Four u32 accumulator words per bin, which is also two i64 words.
-        self.client.create_from_slice(bytemuck::cast_slice(&vec![0u32; self.n_bins * 4 * slots]))
+        // Zeroed on device: filling it host-side and uploading would move the
+        // whole frontier across the bus once per level.
+        self.engine.zeroed(self.n_bins * 4 * slots)
     }
 }
 

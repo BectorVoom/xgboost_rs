@@ -107,10 +107,11 @@ fn add_gpair_global(
 ///   `native_i64` is false; 1-word dummy otherwise).
 /// * `hist_i64` — global histogram as 2 `i64` words per bin (used when
 ///   `native_i64` is true; 1-word dummy otherwise). Same byte layout.
-/// * `ridx_base` — first index of this node's slice of `ridx`, so every node
-///   of a level can read the one row-index buffer the partitioner maintains.
-/// * `hist_offset` — bin offset of this node's slot in `hist`, so a whole
-///   frontier of nodes can share one allocation.
+/// * `node_n_ridx` / `node_ridx_base` / `node_hist_offset` — per node, indexed
+///   by `CUBE_POS_Z`: how many rows it has, where its slice of the shared
+///   `ridx` starts, and the bin offset of its slot in `hist`. A level is one
+///   launch rather than one launch per node, which is where a deep tree's time
+///   used to go.
 /// * `dense` / `compressed` — comptime layout flags (`kDense`/`kCompressed`).
 /// * `use_shared` — comptime `kSharedMem`: privatise the group's bins in
 ///   shared memory, then flush to global.
@@ -129,18 +130,26 @@ pub fn hist_kernel(
     gpair: &Array<i64>,
     hist: &mut Array<Atomic<u32>>,
     hist_i64: &mut Array<Atomic<i64>>,
+    node_n_ridx: &Array<u32>,
+    node_ridx_base: &Array<u32>,
+    node_hist_offset: &Array<u32>,
     row_stride: u32,
     base_rowid: u32,
     null_value: u32,
-    n_ridx: u32,
-    ridx_base: u32,
-    hist_offset: u32,
     #[comptime] dense: bool,
     #[comptime] compressed: bool,
     #[comptime] use_shared: bool,
     #[comptime] native_i64: bool,
     #[comptime] smem_words: usize,
 ) {
+    // `CUBE_POS_Z` selects the node, so a whole level of them is one launch —
+    // upstream's `BuildHistBatch`. A node with fewer rows simply leaves its
+    // grid-strided loop early.
+    let node = CUBE_POS_Z;
+    let n_ridx = node_n_ridx[node as usize];
+    let ridx_base = node_ridx_base[node as usize];
+    let hist_offset = node_hist_offset[node as usize];
+
     let group_base = (CUBE_POS_Y * 4) as usize;
     let start_feature = groups[group_base];
     let num_features = groups[group_base + 1];
@@ -232,6 +241,49 @@ pub fn hist_kernel(
     }
 }
 
+/// Zero a buffer on device.
+///
+/// A frontier is allocated per batch and must start at zero because the
+/// histogram kernel only adds. Filling it host-side and uploading costs a
+/// transfer of the whole frontier per level — ~105 MB at depth 10 — for a
+/// buffer whose contents are known.
+#[cube(launch)]
+pub fn zero_u32_kernel(buf: &mut Array<u32>, n: u32) {
+    let i = ABSOLUTE_POS as u32;
+    if i < n {
+        buf[i as usize] = 0u32;
+    }
+}
+
+/// [`subtract_within_kernel`] for a whole batch: `CUBE_POS_Y` selects the node.
+///
+/// Every parent of a batch shares one buffer — a depth-wise batch is a whole
+/// level, produced by a single `build_children` call — so only the slots
+/// differ per node.
+#[cube(launch)]
+pub fn subtract_batch_kernel(
+    parent: &Array<i64>,
+    frontier: &mut Array<i64>,
+    parent_off: &Array<u32>,
+    built_off: &Array<u32>,
+    out_off: &Array<u32>,
+    n_words: u32,
+) {
+    // Not `ABSOLUTE_POS`: that is linear over the *whole* grid, and this grid
+    // has a second dimension, so it would fold the node index into the word
+    // index.
+    let i = CUBE_POS_X * CUBE_DIM_X + UNIT_POS_X;
+    if i < n_words {
+        let node = CUBE_POS_Y as usize;
+        // Read the offsets into locals: an index expression on the left of an
+        // assignment is taken as a mutable borrow of that array.
+        let dst = out_off[node] + i;
+        let src_parent = parent_off[node] + i;
+        let src_built = built_off[node] + i;
+        frontier[dst as usize] = parent[src_parent as usize] - frontier[src_built as usize];
+    }
+}
+
 /// [`subtract_hist_kernel`] for the case the grower actually hits: the built
 /// child and the sibling being written are two slots of the *same* frontier
 /// buffer.
@@ -277,6 +329,16 @@ pub fn subtract_hist_kernel(
         out[(out_off + i) as usize] =
             parent[(parent_off + i) as usize] - built[(built_off + i) as usize];
     }
+}
+
+/// One node's slice of the work in a batched histogram build.
+#[derive(Clone, Copy, Debug)]
+pub struct NodeHistJob {
+    /// First index of this node's rows in the shared `ridx` buffer.
+    pub ridx_base: u32,
+    pub n_ridx: u32,
+    /// Bin offset of this node's slot in the destination buffer.
+    pub slot: u32,
 }
 
 /// A contiguous run of features sharing one shared-memory histogram, the
@@ -603,13 +665,47 @@ impl<R: Runtime> HistogramEngine<R> {
         dst_bins: usize,
         slot: u32,
     ) {
+        self.build_into_batch(
+            gpairs,
+            &rows.handle,
+            rows.base + rows.n,
+            &[NodeHistJob { ridx_base: rows.base as u32, n_ridx: rows.n as u32, slot }],
+            dst,
+            dst_bins,
+        );
+    }
 
+    /// Accumulate a whole level of node histograms in one launch.
+    ///
+    /// The grid is sized for the widest node; narrower ones exit their
+    /// grid-strided loop early. That is far cheaper than one launch per node —
+    /// a depth-10 tree has ~1000 of them.
+    pub fn build_into_batch(
+        &self,
+        gpairs: &DeviceGpairs,
+        ridx: &Handle,
+        ridx_len: usize,
+        jobs: &[NodeHistJob],
+        dst: &Handle,
+        dst_bins: usize,
+    ) {
+        if jobs.is_empty() {
+            return;
+        }
         // Grid sizing, mirroring the `launch` lambda in DispatchHistShmem:
         // enough tiles for (rows x features-per-group) items, occupancy-capped.
+        let widest = jobs.iter().map(|j| j.n_ridx).max().unwrap_or(0);
         let columns_per_group = self.row_stride.div_ceil(self.n_groups);
-        let items_per_group = rows.n as u32 * columns_per_group;
+        let items_per_group = widest * columns_per_group;
         let tile = BLOCK_THREADS * ITEMS_PER_THREAD;
         let n_blocks = items_per_group.div_ceil(tile).clamp(1, self.max_blocks_per_group);
+
+        let n_ridx: Vec<u32> = jobs.iter().map(|j| j.n_ridx).collect();
+        let base: Vec<u32> = jobs.iter().map(|j| j.ridx_base).collect();
+        let offset: Vec<u32> = jobs.iter().map(|j| j.slot).collect();
+        let d_n = self.client.create_from_slice(bytemuck::cast_slice(&n_ridx));
+        let d_base = self.client.create_from_slice(bytemuck::cast_slice(&base));
+        let d_off = self.client.create_from_slice(bytemuck::cast_slice(&offset));
 
         // Exactly one of the two histogram views is the real buffer; the
         // other is a 1-word dummy never touched by the comptime-elided branch.
@@ -621,24 +717,23 @@ impl<R: Runtime> HistogramEngine<R> {
 
         hist_kernel::launch::<R>(
             &self.client,
-            CubeCount::Static(n_blocks, self.n_groups, 1),
+            CubeCount::Static(n_blocks, self.n_groups, jobs.len() as u32),
             CubeDim::new_1d(BLOCK_THREADS),
             unsafe { ArrayArg::from_raw_parts(self.gidx.clone(), self.gidx_len) },
             unsafe { ArrayArg::from_raw_parts(self.cut_ptrs.clone(), self.n_cuts) },
             unsafe { ArrayArg::from_raw_parts(self.groups_dev.clone(), self.n_groups as usize * 4) },
-            // The kernel indexes `ridx` from `base`, so the binding has to
-            // reach `base + n` — binding only `n` would put every read of a
-            // node that is not the first segment out of range.
-            unsafe { ArrayArg::from_raw_parts(rows.handle.clone(), rows.base + rows.n) },
+            // The kernel indexes `ridx` from each node's base, so the binding
+            // spans the whole row index rather than one node's slice.
+            unsafe { ArrayArg::from_raw_parts(ridx.clone(), ridx_len) },
             unsafe { ArrayArg::from_raw_parts(gpairs.handle.clone(), gpairs.n * 2) },
             unsafe { ArrayArg::from_raw_parts(hist32, hist32_len) },
             unsafe { ArrayArg::from_raw_parts(hist64, hist64_len) },
+            unsafe { ArrayArg::from_raw_parts(d_n, jobs.len()) },
+            unsafe { ArrayArg::from_raw_parts(d_base, jobs.len()) },
+            unsafe { ArrayArg::from_raw_parts(d_off, jobs.len()) },
             self.row_stride,
             self.base_rowid,
             self.null_value,
-            rows.n as u32,
-            rows.base as u32,
-            slot,
             self.dense,
             self.compressed,
             self.use_shared,
@@ -704,6 +799,59 @@ impl<R: Runtime> HistogramEngine<R> {
             parent_slot * 2,
             built_slot * 2,
             out_slot * 2,
+            n_words as u32,
+        );
+    }
+
+    /// A zeroed buffer of `words` `u32`, filled on device.
+    pub fn zeroed(&self, words: usize) -> Handle {
+        let h = self.client.empty(words * core::mem::size_of::<u32>());
+        zero_u32_kernel::launch::<R>(
+            &self.client,
+            CubeCount::Static((words as u32).div_ceil(BLOCK_THREADS).max(1), 1, 1),
+            CubeDim::new_1d(BLOCK_THREADS),
+            unsafe { ArrayArg::from_raw_parts(h.clone(), words) },
+            words as u32,
+        );
+        h
+    }
+
+    /// Subtraction trick for a whole batch, in one launch.
+    ///
+    /// `slots` gives `(parent_slot, built_slot, out_slot)` per node, in bins.
+    pub fn subtract_batch(
+        &self,
+        parent: &Handle,
+        parent_bins: usize,
+        frontier: &Handle,
+        frontier_bins: usize,
+        slots: &[(u32, u32, u32)],
+    ) {
+        if slots.is_empty() {
+            return;
+        }
+        let n_words = self.n_bins * 2;
+        // Offsets are in i64 words; a bin is one interleaved pair.
+        let p: Vec<u32> = slots.iter().map(|s| s.0 * 2).collect();
+        let b: Vec<u32> = slots.iter().map(|s| s.1 * 2).collect();
+        let o: Vec<u32> = slots.iter().map(|s| s.2 * 2).collect();
+        let dp = self.client.create_from_slice(bytemuck::cast_slice(&p));
+        let db = self.client.create_from_slice(bytemuck::cast_slice(&b));
+        let dobuf = self.client.create_from_slice(bytemuck::cast_slice(&o));
+
+        subtract_batch_kernel::launch::<R>(
+            &self.client,
+            CubeCount::Static(
+                (n_words as u32).div_ceil(BLOCK_THREADS).max(1),
+                slots.len() as u32,
+                1,
+            ),
+            CubeDim::new_1d(BLOCK_THREADS),
+            unsafe { ArrayArg::from_raw_parts(parent.clone(), parent_bins * 2) },
+            unsafe { ArrayArg::from_raw_parts(frontier.clone(), frontier_bins * 2) },
+            unsafe { ArrayArg::from_raw_parts(dp, slots.len()) },
+            unsafe { ArrayArg::from_raw_parts(db, slots.len()) },
+            unsafe { ArrayArg::from_raw_parts(dobuf, slots.len()) },
             n_words as u32,
         );
     }
