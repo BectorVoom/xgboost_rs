@@ -197,7 +197,13 @@ impl Objective for RegLossObj {
         // `RegLossObj::InitEstimation`: the weighted label mean is only the
         // right answer while `scale_pos_weight` is 1, because the mean cannot
         // see the extra weight on the positives.
-        if (self.scale_pos_weight - 1.0).abs() > RT_EPS {
+        //
+        // `reg:squaredlogerror` is the exception in the family: its link makes
+        // the label mean a poor starting point, and upstream fits the intercept
+        // from the gradient instead. On the pinned 3.4.0 oracle the label mean
+        // gives 1.1359 where XGBoost reports 0.4178, which is exactly the
+        // Newton step — see tests/oracle_string_parameters.rs.
+        if self.loss == Loss::SquaredLogError || (self.scale_pos_weight - 1.0).abs() > RT_EPS {
             fit_intercept(self, info)
         } else {
             fit_intercept_glm_like(info, self.num_output_group(info))

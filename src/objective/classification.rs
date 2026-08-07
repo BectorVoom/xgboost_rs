@@ -2,7 +2,7 @@
 //!
 //! Ports of `src/objective/hinge.cu` and `src/objective/multiclass_obj.cu`.
 
-use super::{GradientPair, Objective, check_labels, fit_intercept, sigmoid};
+use super::{GradientPair, Objective, check_labels, fit_intercept, fit_intercept_glm_like, sigmoid};
 use crate::data::MetaInfo;
 use crate::{Error, Result};
 
@@ -49,7 +49,12 @@ impl Objective for LogitRaw {
     fn pred_transform(&self, _preds: &mut Vec<f32>) {}
 
     fn init_estimation(&mut self, info: &MetaInfo) -> Vec<f32> {
-        fit_intercept(self, info)
+        // `binary:logitraw` shares `LogisticRegression`'s intercept: the stored
+        // value is the weighted label *mean*, in probability space, even though
+        // the prediction is a raw margin. Fitting from the gradient instead
+        // would store `(mean - 0.5) * 4` — the margin-space answer — which is
+        // what upstream's `ProbToMargin` derives later, not what it records.
+        fit_intercept_glm_like(info, self.num_output_group(info))
     }
 
     fn default_metric(&self) -> String {

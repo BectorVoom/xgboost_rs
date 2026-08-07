@@ -14,7 +14,7 @@
 //! Rows are grouped into queries by `group`/`qid`; weights are per query, not
 //! per row, which is what upstream requires too.
 
-use super::{GradientPair, Objective, sigmoid};
+use super::{GradientPair, Objective, fit_intercept, sigmoid};
 use crate::data::MetaInfo;
 use crate::parameters::{LambdaRankPairMethod, LambdaRankParameters};
 use crate::rng::MinStdRand;
@@ -490,10 +490,16 @@ impl Objective for LambdaRank {
         self.bias = bias;
     }
 
-    fn init_estimation(&mut self, _info: &MetaInfo) -> Vec<f32> {
-        // Ranking scores are relative, so upstream's intercept has no effect on
-        // the induced order and stays at the default.
-        vec![0.5]
+    fn init_estimation(&mut self, info: &MetaInfo) -> Vec<f32> {
+        // Ranking scores are relative, so the intercept does not change the
+        // induced order — but it does change the margin the first gradient is
+        // taken at, and therefore every tree. Upstream fits it from the
+        // gradient like any other `FitIntercept` objective; because ranking
+        // gradients very nearly cancel within a group, the answer lands within
+        // a rounding error of zero rather than on the 0.5 default this used to
+        // return. Keeping 0.5 moved every tree — see
+        // tests/oracle_string_parameters.rs.
+        fit_intercept(self, info)
     }
 
     /// `ndcg@k` / `map@k` at the truncation level the objective uses.

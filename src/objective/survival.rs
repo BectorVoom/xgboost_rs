@@ -6,7 +6,7 @@
 //! probabilities, and Cox's partial likelihood sums `exp(margin)` over the
 //! whole risk set.
 
-use super::{GradientPair, Objective, fit_intercept_glm_like};
+use super::{DEFAULT_BASE_SCORE, GradientPair, Objective};
 use crate::data::MetaInfo;
 use crate::parameters::AftDistribution;
 use crate::{Error, Result};
@@ -425,24 +425,14 @@ impl Objective for AftSurvival {
         Ok(())
     }
 
-    fn init_estimation(&mut self, info: &MetaInfo) -> Vec<f32> {
-        // The label mean, on the time scale the intercept is stored in. A
-        // censored row contributes its finite bound.
-        let mut num = 0.0f64;
-        let mut den = 0.0f64;
-        for i in 0..info.num_row {
-            let (lo, hi) = (info.lower_bound(i), info.upper_bound(i));
-            let y = if hi.is_finite() { (lo + hi) / 2.0 } else { lo };
-            if y > 0.0 {
-                let w = info.weight(i) as f64;
-                num += y as f64 * w;
-                den += w;
-            }
-        }
-        if den == 0.0 {
-            return fit_intercept_glm_like(info, 1);
-        }
-        vec![(num / den) as f32]
+    fn init_estimation(&mut self, _info: &MetaInfo) -> Vec<f32> {
+        // `survival:aft` does not fit an intercept at all upstream: it is
+        // neither a `FitIntercept` nor a `FitInterceptGlmLike` objective, so
+        // the default base score stands however the censoring bounds are
+        // distributed. Estimating a time-scale mean here instead put the
+        // intercept at 1.345 where XGBoost reports 0.5, and moved every tree
+        // under it — see tests/oracle_string_parameters.rs.
+        vec![DEFAULT_BASE_SCORE]
     }
 
     fn default_metric(&self) -> String {
