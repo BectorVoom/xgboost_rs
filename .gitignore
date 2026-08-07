@@ -31,3 +31,7 @@ xgboost_rs_kaggle.tar.gz
 
 # Oracle fixture generator virtualenv (recreate with tools/gen_fixtures.py header)
 .venv-oracle/
+
+# Artefacts pulled back from a Kaggle GPU run (tools/kaggle/)
+kaggle-output/
+kaggle-await.log
