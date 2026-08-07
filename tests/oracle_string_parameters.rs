@@ -26,9 +26,10 @@ use xgboost_rs::parameters::{
     LinearUpdater, MonotoneConstraint, MultiStrategy, Objective, ProcessType, SamplingMethod,
     TrainingParameters, TreeBoosterParameters, TreeMethod, TreeUpdaterName, VerboseEval, Verbosity,
 };
+use xgboost_rs::data::cuts::build_cuts;
 use xgboost_rs::{DMatrix, api};
 
-use common::{f32_array, fixture_dir};
+use common::{f32_array, fixture_dir, u32_array};
 
 /// Relative tolerance for anything the SPEC calls a float comparison.
 const TOL: f64 = 1e-5;
@@ -477,6 +478,104 @@ fn the_configured_objective_matches_xgboost() {
     report.finish("configured objective");
 }
 
+/// The quantile cuts the fit binned against.
+///
+/// Every split threshold a `hist` tree records is one of these values, so a cut
+/// that drifts moves split thresholds without anything in the split-choice
+/// logic being wrong — and once a row falls on the other side of a boundary,
+/// the whole subtree below diverges. Checking cuts separately is what tells a
+/// binning bug apart from a split-evaluation bug.
+///
+/// Bit-exact, not within tolerance: a cut is a value copied from the data, not
+/// a computed quantity, so "close" is already wrong.
+///
+/// # What the current failures are
+///
+/// This is **upstream version drift, not a defect here.** The failures split
+/// exactly on row count: every dataset with 300 rows fails and every dataset
+/// with 240 fails nothing. With `max_bin = 256` that is precisely the line
+/// between "fewer distinct values than bins, so every value becomes a cut" and
+/// "the quantile sketch actually runs".
+///
+/// Sketching the same 300-row column under both pinned XGBoosts gives:
+///
+/// ```text
+/// 3.0.5:  -2.400131, -2.3067033, -2.2267025, -2.0828412, ...
+/// 3.4.0:  -2.410044, -2.400131,  -2.3067033, -2.2267025, ...
+/// ```
+///
+/// 3.4.0's list is 3.0.5's shifted by one, with an extra cut at the low end —
+/// and 3.4.0 also reports `min_values` as `-inf` where 3.0.5 reported a finite
+/// minimum. This crate reproduces the 3.0.5 sequence exactly, which is what
+/// `tests/oracle.rs` (pinned to 3.0.5) still proves.
+///
+/// So the sketch here is one upstream version behind. `SPEC.md` names 3.4.0 as
+/// the reference, so closing this means porting 3.4.0's sketch — and it is the
+/// single root cause behind most of the remaining tree, leaf and prediction
+/// differences, because everything downstream bins against these values.
+#[test]
+fn quantile_cuts_match_xgboost_exactly() {
+    let mut report = Report::default();
+    for case in trainable_cases() {
+        let fixture = load(&case.name);
+        let (Some(want_ptrs), Some(want_values)) =
+            (fixture["cut_ptrs"].as_array(), fixture["cut_values"].as_array())
+        else {
+            continue; // `exact` and `gblinear` never sketch
+        };
+        let want_ptrs = u32_array(&Value::Array(want_ptrs.clone()));
+        // `null` is a non-finite entry: 3.4.0 writes each feature's leading
+        // "min value" as -inf rather than a finite minimum.
+        let want_values: Vec<f32> = want_values
+            .iter()
+            .map(|x| x.as_f64().map(|f| f as f32).unwrap_or(f32::NEG_INFINITY))
+            .collect();
+
+        let dmat = load_dataset(&case.data);
+        let max_bin = config_map(&fixture)
+            .get("max_bin")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256u32);
+
+        let detail = match build_cuts(&dmat, max_bin) {
+            Err(e) => Some(format!("building cuts failed: {e}")),
+            Ok(cuts) => (0..cuts.num_features()).find_map(|f| {
+                // `get_quantile_cut()` reports each feature as
+                // `[min_value, ...cuts]`; `HistogramCuts` keeps the minimums in
+                // their own array.
+                let (b, e) = (want_ptrs[f] as usize, want_ptrs[f + 1] as usize);
+                let want_min = want_values[b];
+                let want_cuts = &want_values[b + 1..e];
+                let got_cuts =
+                    &cuts.cut_values[cuts.cut_ptrs[f] as usize..cuts.cut_ptrs[f + 1] as usize];
+
+                // A -inf min is 3.4.0's "no lower bound" sentinel rather than a
+                // value from the data, so there is nothing to compare it to;
+                // the cut values below are what split thresholds come from.
+                if want_min.is_finite() && cuts.min_values[f].to_bits() != want_min.to_bits() {
+                    return Some(format!(
+                        "feature {f} min {} != {want_min}",
+                        cuts.min_values[f]
+                    ));
+                }
+                if got_cuts.len() != want_cuts.len() {
+                    return Some(format!(
+                        "feature {f} has {} cuts, want {}",
+                        got_cuts.len(),
+                        want_cuts.len()
+                    ));
+                }
+                got_cuts.iter().zip(want_cuts).enumerate().find_map(|(i, (g, w))| {
+                    (g.to_bits() != w.to_bits())
+                        .then(|| format!("feature {f} cut {i}: {g} != {w}"))
+                })
+            }),
+        };
+        report.record(&case, detail);
+    }
+    report.finish("quantile cuts");
+}
+
 /// The intercept every prediction starts from.
 ///
 /// This runs before the tree comparisons on purpose: `base_score` is estimated
@@ -704,6 +803,43 @@ fn configurations_xgboost_refuses_are_refused_here() {
             "{}: refusal must name the parameter or its value, got: {err}",
             case.name
         );
+    }
+}
+
+/// Print one case's first tree beside the fixture's, for working on a
+/// difference the summary only names.
+///
+/// Ignored by default; run it at a case with
+/// `CASE=objective_binary_logistic cargo test --test oracle_string_parameters
+///  -- --ignored --nocapture dump_one_case`.
+#[test]
+#[ignore = "diagnostic, not an assertion"]
+fn dump_one_case() {
+    let name = std::env::var("CASE").unwrap_or_else(|_| "objective_binary_logistic".to_owned());
+    let case = cases()
+        .into_iter()
+        .find(|c| c.name == name)
+        .unwrap_or_else(|| panic!("no case named {name}"));
+
+    let (booster, history, fixture, _) = train_case(&case).expect("training failed");
+    let model: Value = serde_json::from_str(&booster.save_model()).unwrap();
+    let gbm = &model["learner"]["gradient_booster"];
+    let empty = Vec::new();
+    let got = gbm["model"]["trees"]
+        .as_array()
+        .or_else(|| gbm["gbtree"]["model"]["trees"].as_array())
+        .unwrap_or(&empty);
+
+    println!("\ncase {name}   params {}", fixture["params"]);
+    println!("base_score  got {:?}  want {}", booster.base_score(), fixture["base_score"]);
+    println!("metric      got {:?}", history.first());
+    println!("            want {} {}", fixture["metric"], fixture["metric_history"]);
+
+    let want = &fixture["trees"][0];
+    for key in ["left_children", "right_children", "split_indices", "split_conditions",
+                "default_left", "sum_hessian", "base_weights"] {
+        println!("\n{key}\n  got  {}", got.first().map(|t| t[key].to_string()).unwrap_or_default());
+        println!("  want {}", want[key]);
     }
 }
 

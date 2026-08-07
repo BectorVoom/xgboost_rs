@@ -544,6 +544,21 @@ def run_case(name: str, param: str, value: str, data: str, params: dict) -> dict
         record["error_detail"] = traceback.format_exc(limit=1).strip().splitlines()[-1]
         return record
 
+    # The quantile cuts the fit binned against. Every split threshold is one of
+    # these, so a cut that drifts moves splits without any split-choice logic
+    # being wrong — worth pinning separately from the trees it produces.
+    try:
+        ptrs, vals = dmat.get_quantile_cut()
+        record["cut_ptrs"] = [int(p) for p in ptrs]
+        # 3.4.0 reports each feature's leading "min value" as -inf, where 3.0.5
+        # reported a finite minimum. JSON has no infinity literal, so encode
+        # non-finite as null the way the datasets encode NaN.
+        record["cut_values"] = [
+            float(v) if np.isfinite(v) else None for v in vals
+        ]
+    except Exception as exc:  # noqa: BLE001 - exact/gblinear never sketch
+        record["cut_error"] = f"{type(exc).__name__}: {exc}"
+
     model = json.loads(booster.save_raw(raw_format="json").decode("utf-8"))
     learner = model["learner"]
     gbm = learner["gradient_booster"]
