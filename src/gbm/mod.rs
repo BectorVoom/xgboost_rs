@@ -239,6 +239,10 @@ pub struct GBTree {
     /// Binned training matrix, built once and reused every round. Only the
     /// histogram growers need it.
     gindex: Option<GHistIndex>,
+    /// Built once per fit: it owns the device-resident ELLPACK, which is by
+    /// far the most expensive thing a GPU fit uploads.
+    #[cfg(feature = "gpu")]
+    gpu_grower: Option<crate::gpu::grower::GpuHistGrower<crate::gpu::DefaultRuntime>>,
     /// Value-sorted column view, which only the `exact` grower needs.
     sorted: Option<CscPage>,
     /// Scratch for one group's gradients, and for the sampled copy of them.
@@ -264,6 +268,8 @@ impl GBTree {
             model,
             param,
             gindex: None,
+            #[cfg(feature = "gpu")]
+            gpu_grower: None,
             sorted: None,
             group_gpair: Vec::new(),
             sampled: Vec::new(),
@@ -331,6 +337,21 @@ impl GBTree {
             // `approx` re-sketches per round from the current hessians, so
             // there is nothing to build ahead of time.
             Some(TreeUpdaterName::GrowHistMaker) => {}
+            // The GPU grower bins into its own ELLPACK and never reads the
+            // CPU binned matrix, so only the cuts are built here.
+            #[cfg(feature = "gpu")]
+            Some(TreeUpdaterName::GrowGpuHist) => {
+                if self.gpu_grower.is_none() {
+                    let cuts = crate::data::cuts::build_cuts(dtrain, self.param.max_bin)?;
+                    let client = crate::gpu::default_client(self.param.device.ordinal().unwrap_or(0).max(0) as usize);
+                    self.gpu_grower = Some(crate::gpu::grower::GpuHistGrower::new(
+                        client,
+                        dtrain,
+                        cuts,
+                        self.param.clone(),
+                    )?);
+                }
+            }
             Some(_) if self.gindex.is_none() => {
                 let cuts = crate::data::cuts::build_cuts(dtrain, self.param.max_bin)?;
                 self.gindex = Some(crate::data::gradient_index::build_gradient_index_with(
@@ -529,10 +550,22 @@ impl GBTree {
         let exact = kind == TreeUpdaterName::GrowColMaker;
         let is_sampling = !exact && sampler.is_sampling(n_rows);
 
+        #[cfg(feature = "gpu")]
+        let gpu = self.gpu_grower.take();
         let param = &self.param;
         let mut grower = if exact {
             Grower::Exact(ColMaker::new(param, self.sorted.as_ref().expect("configured"), dtrain))
         } else {
+            #[cfg(feature = "gpu")]
+            match gpu {
+                Some(g) => Grower::Gpu(Box::new(g), None),
+                None => Grower::Hist(HistGrower::new(
+                    param,
+                    self.gindex.as_ref().expect("configured"),
+                    dtrain,
+                )),
+            }
+            #[cfg(not(feature = "gpu"))]
             Grower::Hist(HistGrower::new(param, self.gindex.as_ref().expect("configured"), dtrain))
         };
         let mut first_tree = true;
@@ -585,6 +618,12 @@ impl GBTree {
                 self.model.tree_info.push(gid as u32);
                 self.model.tree_weight.push(new_weight);
             }
+        }
+        // Put the device grower back, so the next round reuses the uploaded
+        // ELLPACK rather than binning and uploading the matrix again.
+        #[cfg(feature = "gpu")]
+        if let Grower::Gpu(g, _) = grower {
+            self.gpu_grower = Some(*g);
         }
         Ok(())
     }
@@ -850,6 +889,14 @@ fn build_approx_index(
 enum Grower<'a> {
     Hist(HistGrower<'a>),
     Exact(ColMaker<'a>),
+    /// Owned rather than borrowed, because it holds device buffers the
+    /// caller's `&mut self` cannot lend out for the length of a round; the
+    /// caller takes it out of the model and puts it back.
+    #[cfg(feature = "gpu")]
+    Gpu(
+        Box<crate::gpu::grower::GpuHistGrower<crate::gpu::DefaultRuntime>>,
+        Option<crate::gpu::grower::GrownTree>,
+    ),
 }
 
 impl Grower<'_> {
@@ -857,6 +904,10 @@ impl Grower<'_> {
         match self {
             Self::Hist(g) => g.reset(),
             Self::Exact(g) => g.reset(),
+            // The device grower keeps nothing between trees but the uploaded
+            // matrix, which is exactly what must survive.
+            #[cfg(feature = "gpu")]
+            Self::Gpu(_, last) => *last = None,
         }
     }
 
@@ -864,6 +915,12 @@ impl Grower<'_> {
         match self {
             Self::Hist(g) => g.grow(ctx, gpair, tree),
             Self::Exact(g) => g.grow(ctx, gpair, tree),
+            #[cfg(feature = "gpu")]
+            Self::Gpu(g, last) => {
+                *last = Some(
+                    g.grow(gpair, tree, ctx.rng()).expect("device grow"),
+                );
+            }
         }
     }
 
@@ -878,6 +935,11 @@ impl Grower<'_> {
         match self {
             Self::Hist(g) => g.update_predictions(tree, preds, n_groups, group, weight),
             Self::Exact(g) => g.update_predictions(tree, preds, n_groups, group, weight),
+            #[cfg(feature = "gpu")]
+            Self::Gpu(_, last) => last
+                .as_ref()
+                .expect("grow ran before update_predictions")
+                .update_predictions(tree, preds, n_groups, group, weight),
         }
     }
 }

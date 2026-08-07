@@ -690,10 +690,29 @@ fn unimplemented_algorithm_choices_are_rejected_not_ignored() {
         api::train(&p, &d, &[]).unwrap_or_else(|e| panic!("{method} must train: {e}"));
     }
 
+    // `device=cuda` now trains: the `grow_gpu_hist` updater is implemented.
+    // `tests/gpu_training.rs` checks it against the CPU fit; here it only has
+    // to be accepted rather than refused.
     let mut gpu = params(TreeBoosterParameters::default(), 1);
     gpu.booster.general.device = xgboost_rs::parameters::Device::cuda(0);
-    let err = train_error(&gpu, &d, &[]);
-    assert!(err.contains("device"), "{err}");
+    #[cfg(feature = "gpu")]
+    api::train(&gpu, &d, &[]).unwrap_or_else(|e| panic!("device=cuda must train: {e}"));
+    // Without the GPU kernels compiled in there is nothing to run it on, and
+    // the fit says so rather than falling back to the CPU.
+    #[cfg(not(feature = "gpu"))]
+    {
+        let err = train_error(&gpu, &d, &[]);
+        assert!(err.contains("device"), "{err}");
+    }
+
+    // SYCL has no updater in this build either way.
+    let mut sycl = params(TreeBoosterParameters::default(), 1);
+    sycl.booster.general.device = xgboost_rs::parameters::Device::Sycl(
+        xgboost_rs::parameters::SyclKind::Gpu,
+        None,
+    );
+    let err = train_error(&sycl, &d, &[]);
+    assert!(err.contains("SYCL"), "{err}");
 }
 
 /// The objectives and metrics that used to be rejected now train, so the

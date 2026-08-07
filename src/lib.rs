@@ -80,7 +80,7 @@
 //! `tweedie_variance_power`, `aft_loss_distribution*`, the `lambdarank_*`
 //! family).
 //!
-//! **General** — `device` (CPU), `nthread`, `verbosity`,
+//! **General** — `device` (`cpu` and `cuda[:ordinal]`), `nthread`, `verbosity`,
 //! `disable_default_eval_metric` and `validate_parameters`.
 //!
 //! **Prediction** — `predict_type` in all seven kinds (value, margin, leaf,
@@ -94,9 +94,9 @@
 //!
 //! A parameter that selects an algorithm this crate does not have is an error
 //! from [`train`], never a silent fallback: `multi_strategy =
-//! multi_output_tree` (vector leaves), categorical feature types, and any
-//! non-CPU `device` — which also rules out the three GPU and SYCL updaters.
-//! Parameters that only steer one of those — `max_cat_to_onehot`,
+//! multi_output_tree` (vector leaves) and categorical feature types on the GPU,
+//! a `sycl` device, and — in a build without the `gpu` feature — any non-CPU
+//! device at all. Parameters that only steer one of those — `max_cat_to_onehot`,
 //! `max_cat_threshold`, `use_rmm`, `fail_on_invalid_gpu_id` — are accepted but
 //! inert, as are the ones whose stage this fit does not run
 //! (`default_direction` and `opt_dense_col` outside `exact`, `refresh_leaf`
@@ -109,7 +109,9 @@
 //!   parameter surface for both CPU and GPU: typed enums, consuming builders,
 //!   validation, and XGBoost-compatible key/value + JSON config emission. Pure
 //!   CPU code, no GPU toolchain required.
-//! * [`gpu`] — XGBoost's `gpu_hist` CUDA device kernels rewritten with CubeCL.
+//! * [`gpu`] — XGBoost's `gpu_hist` rewritten with CubeCL: the quantiser,
+//!   ELLPACK, histogram, split evaluator, row partitioner and the tree driver
+//!   that `device=cuda` runs.
 //!   The kernels are runtime-generic: they run on any CubeCL runtime
 //!   (Vulkan/wgpu by default, CUDA with the `cuda` cargo feature). Gated behind
 //!   the default-on `gpu` feature, because building CubeCL needs a backend

@@ -478,12 +478,14 @@ fn every_device_spelling_is_honoured_or_rejected_by_name() {
     // (spelling, the spelling it normalises to, whether a CPU fit accepts it)
     let cases: [(&str, &str, bool); 10] = [
         ("cpu", "cpu", true),
-        ("cuda", "cuda", false),
-        ("cuda:0", "cuda:0", false),
-        ("cuda:3", "cuda:3", false),
+        // Every CUDA spelling reaches `grow_gpu_hist`, which this build has
+        // when the `gpu` feature is on. The ordinal only picks a device.
+        ("cuda", "cuda", cfg!(feature = "gpu")),
+        ("cuda:0", "cuda:0", cfg!(feature = "gpu")),
+        ("cuda:3", "cuda:3", cfg!(feature = "gpu")),
         // `gpu` is the deprecated alias and normalises to `cuda`.
-        ("gpu", "cuda", false),
-        ("gpu:1", "cuda:1", false),
+        ("gpu", "cuda", cfg!(feature = "gpu")),
+        ("gpu:1", "cuda:1", cfg!(feature = "gpu")),
         ("sycl", "sycl", false),
         ("sycl:cpu", "sycl:cpu", false),
         ("sycl:gpu", "sycl:gpu", false),
@@ -628,7 +630,7 @@ fn both_sampling_method_spellings_select_a_sampler() {
 
 /// Every `updater` spelling is either run or rejected naming the parameter.
 ///
-/// The three that are refused are the ones whose device this build has no code
+/// The ones that are refused are those whose device this build has no code
 /// for; a caller who names them gets an error, never a quiet substitution.
 #[test]
 fn every_updater_spelling_is_honoured_or_rejected_by_name() {
@@ -639,6 +641,11 @@ fn every_updater_spelling_is_honoured_or_rejected_by_name() {
         TreeUpdaterName::Prune,
         TreeUpdaterName::Refresh,
     ];
+    // `grow_gpu_hist` is implemented too, but only when the kernels are built.
+    let implemented = |u: TreeUpdaterName| {
+        CPU_UPDATERS.contains(&u)
+            || (cfg!(feature = "gpu") && u == TreeUpdaterName::GrowGpuHist)
+    };
     let d = universal_data(100);
     for &updater in TreeUpdaterName::ALL {
         // A tree-modifying updater cannot lead the pipeline, so pair it with a
@@ -654,12 +661,12 @@ fn every_updater_spelling_is_honoured_or_rejected_by_name() {
         );
         match api::train(&p, &d, &[]) {
             Ok(_) => assert!(
-                CPU_UPDATERS.contains(&updater),
-                "`{updater}` trained but has no CPU implementation"
+                implemented(updater),
+                "`{updater}` trained but has no implementation in this build"
             ),
             Err(e) => {
                 assert!(
-                    !CPU_UPDATERS.contains(&updater),
+                    !implemented(updater),
                     "`{updater}` is implemented but was rejected: {e}"
                 );
                 assert!(

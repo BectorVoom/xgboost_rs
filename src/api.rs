@@ -441,10 +441,20 @@ pub fn train_from(
 ) -> Result<(Booster, EvalHistory)> {
     params.validate()?;
     let general = &params.booster.general;
+    if general.device.is_sycl() {
+        return Err(Error::invalid(
+            "device",
+            format!("there is no SYCL updater in this build; got device `{}`", general.device),
+        ));
+    }
+    #[cfg(not(feature = "gpu"))]
     if !general.device.is_cpu() {
         return Err(Error::invalid(
             "device",
-            format!("training runs on the CPU; got device `{}`", general.device),
+            format!(
+                "this build has no GPU kernels; rebuild with the `gpu` feature to use                  device `{}`",
+                general.device
+            ),
         ));
     }
     let (tree, dart) = match &params.booster.booster {
@@ -712,7 +722,7 @@ fn check_supported_updater(tree: &TreeBoosterParameters, device: Device) -> Resu
                 | TreeUpdaterName::GrowColMaker
                 | TreeUpdaterName::Prune
                 | TreeUpdaterName::Refresh
-        );
+        ) || (cfg!(feature = "gpu") && *updater == TreeUpdaterName::GrowGpuHist);
         if !implemented {
             return Err(Error::invalid(
                 "updater",
@@ -758,6 +768,18 @@ fn check_supported_tree_options(
                  categories, or use `one_output_per_tree`",
             ));
         }
+    }
+    // The device split evaluator has no categorical path yet: it scans a
+    // feature's bins in order, which is meaningless for category codes. Refuse
+    // rather than fit something that silently treats categories as ordered.
+    if dtrain.info().has_categorical()
+        && tree.resolved_updaters(device)?.contains(&TreeUpdaterName::GrowGpuHist)
+    {
+        return Err(Error::invalid(
+            "device",
+            "categorical splits are not implemented on the GPU; fit on `device=cpu`, \
+             or one-hot encode the categories yourself",
+        ));
     }
     // Only the histogram updaters bin by category. `exact` enumerates a
     // column's values in ascending order, which would read the category codes
@@ -867,7 +889,7 @@ fn train_param(tree: &TreeBoosterParameters, device: Device) -> Result<TrainPara
         num_parallel_tree: tree.num_parallel_tree,
         monotone_constraints: tree.monotone_constraints.clone(),
         interaction_constraints: tree.interaction_constraints.clone(),
-        max_cached_hist_node: tree.max_cached_hist_nodes(Device::Cpu),
+        max_cached_hist_node: tree.max_cached_hist_nodes(device),
         multi_output_tree: tree.multi_strategy == MultiStrategy::MultiOutputTree,
         sparse_threshold: tree.sparse_threshold,
         max_cat_to_onehot: tree.max_cat_to_onehot,
@@ -877,6 +899,7 @@ fn train_param(tree: &TreeBoosterParameters, device: Device) -> Result<TrainPara
         updaters: tree.resolved_updaters(device)?,
         process_type: tree.process_type,
         refresh_leaf: tree.refresh_leaf,
+        device,
     })
 }
 

@@ -6,7 +6,9 @@
 //! Doing it all in `f64` would produce split decisions that drift from the
 //! reference on near-ties, so the widths are matched exactly.
 
-use crate::parameters::{DefaultDirection, MonotoneConstraint, ProcessType, SamplingMethod, TreeUpdaterName};
+use crate::parameters::{
+    DefaultDirection, Device, MonotoneConstraint, ProcessType, SamplingMethod, TreeUpdaterName,
+};
 
 /// Growth order for the node expansion queue.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -83,6 +85,9 @@ pub struct TrainParam {
     pub process_type: ProcessType,
     /// Whether the `refresh` updater also rewrites leaf values.
     pub refresh_leaf: bool,
+    /// Which processor runs the fit. The grower reads it to pick a device
+    /// ordinal; every other stage is device-agnostic.
+    pub device: Device,
 }
 
 impl Default for TrainParam {
@@ -117,6 +122,7 @@ impl Default for TrainParam {
             updaters: vec![TreeUpdaterName::GrowQuantileHistMaker],
             process_type: ProcessType::Default,
             refresh_leaf: true,
+            device: Device::Cpu,
         }
     }
 }

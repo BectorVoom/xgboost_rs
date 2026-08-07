@@ -10,6 +10,33 @@ pub mod row_partitioner;
 
 use cubecl::server::Handle;
 
+/// The CubeCL runtime a GPU fit runs on.
+///
+/// CUDA when the crate is built with the `cuda` feature — what a real GPU fit
+/// wants — and wgpu/Vulkan otherwise, which is what makes the kernels testable
+/// on any machine, including a CPU Vulkan implementation like lavapipe.
+#[cfg(feature = "cuda")]
+pub type DefaultRuntime = cubecl::cuda::CudaRuntime;
+#[cfg(not(feature = "cuda"))]
+pub type DefaultRuntime = cubecl::wgpu::WgpuRuntime;
+
+/// A compute client for the requested device ordinal.
+///
+/// The ordinal selects a CUDA device; the wgpu runtime has no equivalent
+/// notion here and always takes the default adapter.
+pub fn default_client(ordinal: usize) -> cubecl::prelude::ComputeClient<DefaultRuntime> {
+    use cubecl::prelude::Runtime;
+    #[cfg(feature = "cuda")]
+    {
+        DefaultRuntime::client(&cubecl::cuda::CudaDevice::new(ordinal))
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = ordinal;
+        DefaultRuntime::client(&cubecl::wgpu::WgpuDevice::default())
+    }
+}
+
 /// Single-precision gradient pair, mirrors `xgboost::GradientPair`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GradientPair {
