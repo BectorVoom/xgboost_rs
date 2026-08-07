@@ -61,3 +61,8 @@ required-features = ["gpu"]
 name = "gpu_frontier"
 path = "tests/gpu_frontier.rs"
 required-features = ["gpu"]
+
+[[test]]
+name = "gpu_grower"
+path = "tests/gpu_grower.rs"
+required-features = ["gpu"]

@@ -107,6 +107,8 @@ fn add_gpair_global(
 ///   `native_i64` is false; 1-word dummy otherwise).
 /// * `hist_i64` — global histogram as 2 `i64` words per bin (used when
 ///   `native_i64` is true; 1-word dummy otherwise). Same byte layout.
+/// * `ridx_base` — first index of this node's slice of `ridx`, so every node
+///   of a level can read the one row-index buffer the partitioner maintains.
 /// * `hist_offset` — bin offset of this node's slot in `hist`, so a whole
 ///   frontier of nodes can share one allocation.
 /// * `dense` / `compressed` — comptime layout flags (`kDense`/`kCompressed`).
@@ -131,6 +133,7 @@ pub fn hist_kernel(
     base_rowid: u32,
     null_value: u32,
     n_ridx: u32,
+    ridx_base: u32,
     hist_offset: u32,
     #[comptime] dense: bool,
     #[comptime] compressed: bool,
@@ -175,7 +178,7 @@ pub fn hist_kernel(
                 let ridx_in_set = idx / feature_stride;
                 let fidx_in_set = idx - ridx_in_set * feature_stride;
 
-                let row = ridx[ridx_in_set as usize];
+                let row = ridx[(ridx_base + ridx_in_set) as usize];
                 let fidx = fidx_in_set + start_feature;
 
                 // IterIdx: entry for (row, fidx) in the ELLPACK matrix.
@@ -229,18 +232,50 @@ pub fn hist_kernel(
     }
 }
 
+/// [`subtract_hist_kernel`] for the case the grower actually hits: the built
+/// child and the sibling being written are two slots of the *same* frontier
+/// buffer.
+///
+/// It needs its own kernel because binding one buffer twice — once read-only
+/// as `built`, once read-write as `out` — is not a thing a bind group can
+/// express. Here the frontier is one read-write binding read at `built_off` and
+/// written at `out_off`.
+#[cube(launch)]
+pub fn subtract_within_kernel(
+    parent: &Array<i64>,
+    frontier: &mut Array<i64>,
+    parent_off: u32,
+    built_off: u32,
+    out_off: u32,
+    n_words: u32,
+) {
+    let i = ABSOLUTE_POS as u32;
+    if i < n_words {
+        frontier[(out_off + i) as usize] =
+            parent[(parent_off + i) as usize] - frontier[(built_off + i) as usize];
+    }
+}
+
 /// Port of the `SubtractionTrick` device lambda (histogram.cuh):
 /// `sibling = parent - built`, elementwise over interleaved i64 words.
+///
+/// The three word offsets let parent, built and sibling each live in a
+/// different frontier buffer at a different slot, which is what happens once a
+/// level's histograms are allocated together.
 #[cube(launch)]
 pub fn subtract_hist_kernel(
     parent: &Array<i64>,
     built: &Array<i64>,
     out: &mut Array<i64>,
+    parent_off: u32,
+    built_off: u32,
+    out_off: u32,
     n_words: u32,
 ) {
     let i = ABSOLUTE_POS as u32;
     if i < n_words {
-        out[i as usize] = parent[i as usize] - built[i as usize];
+        out[(out_off + i) as usize] =
+            parent[(parent_off + i) as usize] - built[(built_off + i) as usize];
     }
 }
 
@@ -538,6 +573,7 @@ impl<R: Runtime> HistogramEngine<R> {
     pub fn upload_rows(&self, ridx: &[u32]) -> DeviceRows {
         DeviceRows {
             handle: self.client.create_from_slice(bytemuck::cast_slice(ridx)),
+            base: 0,
             n: ridx.len(),
         }
     }
@@ -590,7 +626,10 @@ impl<R: Runtime> HistogramEngine<R> {
             unsafe { ArrayArg::from_raw_parts(self.gidx.clone(), self.gidx_len) },
             unsafe { ArrayArg::from_raw_parts(self.cut_ptrs.clone(), self.n_cuts) },
             unsafe { ArrayArg::from_raw_parts(self.groups_dev.clone(), self.n_groups as usize * 4) },
-            unsafe { ArrayArg::from_raw_parts(rows.handle.clone(), rows.n) },
+            // The kernel indexes `ridx` from `base`, so the binding has to
+            // reach `base + n` — binding only `n` would put every read of a
+            // node that is not the first segment out of range.
+            unsafe { ArrayArg::from_raw_parts(rows.handle.clone(), rows.base + rows.n) },
             unsafe { ArrayArg::from_raw_parts(gpairs.handle.clone(), gpairs.n * 2) },
             unsafe { ArrayArg::from_raw_parts(hist32, hist32_len) },
             unsafe { ArrayArg::from_raw_parts(hist64, hist64_len) },
@@ -598,6 +637,7 @@ impl<R: Runtime> HistogramEngine<R> {
             self.base_rowid,
             self.null_value,
             rows.n as u32,
+            rows.base as u32,
             slot,
             self.dense,
             self.compressed,
@@ -627,10 +667,45 @@ impl<R: Runtime> HistogramEngine<R> {
             unsafe { ArrayArg::from_raw_parts(parent.handle.clone(), n_words) },
             unsafe { ArrayArg::from_raw_parts(built.handle.clone(), n_words) },
             unsafe { ArrayArg::from_raw_parts(out.clone(), n_words) },
+            0,
+            0,
+            0,
             n_words as u32,
         );
 
         Ok(DeviceHistogram { handle: out, n_bins: parent.n_bins })
+    }
+
+    /// Subtraction trick within a frontier: slot `out_slot` of `frontier`
+    /// becomes `parent[parent_slot] - frontier[built_slot]`, in bins.
+    ///
+    /// `parent` is a different allocation — the previous batch's frontier —
+    /// while the built child and the sibling share this batch's, which is why
+    /// the frontier is one read-write binding rather than two.
+    #[allow(clippy::too_many_arguments)]
+    pub fn subtract_into(
+        &self,
+        parent: &Handle,
+        parent_bins: usize,
+        parent_slot: u32,
+        frontier: &Handle,
+        frontier_bins: usize,
+        built_slot: u32,
+        out_slot: u32,
+    ) {
+        // Each bin is one interleaved `[grad, hess]` i64 pair.
+        let n_words = self.n_bins * 2;
+        subtract_within_kernel::launch::<R>(
+            &self.client,
+            CubeCount::Static((n_words as u32).div_ceil(BLOCK_THREADS).max(1), 1, 1),
+            CubeDim::new_1d(BLOCK_THREADS),
+            unsafe { ArrayArg::from_raw_parts(parent.clone(), parent_bins * 2) },
+            unsafe { ArrayArg::from_raw_parts(frontier.clone(), frontier_bins * 2) },
+            parent_slot * 2,
+            built_slot * 2,
+            out_slot * 2,
+            n_words as u32,
+        );
     }
 
     /// Read a histogram back as `i64` gradient pairs.

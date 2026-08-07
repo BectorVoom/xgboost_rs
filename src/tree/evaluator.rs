@@ -62,6 +62,19 @@ impl SplitEvaluator {
         }
     }
 
+    /// Node `nid`'s weight box, as `(lower, upper)`.
+    ///
+    /// The device split evaluator applies the box itself, so it needs the pair
+    /// as numbers; an unconstrained node's box is the whole line. A node id
+    /// beyond the current bounds has not been split into yet and is likewise
+    /// unconstrained.
+    pub fn bounds(&self, nid: usize) -> (f32, f32) {
+        if !self.has_constraint || nid >= self.lower.len() {
+            return (f32::MIN, f32::MAX);
+        }
+        (self.lower[nid], self.upper[nid])
+    }
+
     /// Clip a weight into node `nid`'s box.
     #[inline]
     fn apply_bounds(&self, nid: usize, w: f32) -> f32 {
@@ -182,7 +195,7 @@ fn is_valid_split(p: &TrainParam, left: &GradStats, right: &GradStats) -> bool {
 }
 
 /// The `MonotoneConstraint` as the integer XGBoost stores.
-fn direction(c: &MonotoneConstraint) -> i32 {
+pub fn direction(c: &MonotoneConstraint) -> i32 {
     match c {
         MonotoneConstraint::Decreasing => -1,
         MonotoneConstraint::Unconstrained => 0,

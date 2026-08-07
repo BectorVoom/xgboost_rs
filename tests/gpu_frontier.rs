@@ -12,7 +12,7 @@ use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 use xgboost_rs::DMatrix;
 use xgboost_rs::data::cuts::build_cuts;
 use xgboost_rs::data::gradient_index::build_gradient_index;
-use xgboost_rs::gpu::GradientPairInt64;
+use xgboost_rs::gpu::{DeviceRows, GradientPairInt64};
 use xgboost_rs::gpu::ellpack::{EllpackLayout, build_ellpack};
 use xgboost_rs::gpu::histogram::HistogramBuilder;
 use xgboost_rs::reference::{Rng, cpu_histogram, random_matrix};
@@ -138,6 +138,66 @@ fn frontier_slots_accumulate_independently() {
             .collect();
         assert_eq!(got, want, "slot {slot}");
     }
+}
+
+/// The grower's exact shape: a parent histogram in one buffer, one child built
+/// from a *slice* of a shared row index into a second buffer, and the sibling
+/// subtracted into another slot of that same second buffer.
+#[test]
+fn builds_one_child_and_subtracts_the_sibling() {
+    let client = client();
+    let m = random_matrix(3000, 5, 32, 0.15, EllpackLayout::DenseCompressed, 61);
+    let engine = HistogramBuilder::new(&client).build(&m).unwrap();
+
+    let mut rng = Rng(67);
+    let gpairs: Vec<GradientPairInt64> = (0..m.n_rows)
+        .map(|_| GradientPairInt64 {
+            grad: rng.next_u32() as i64 - i64::from(u32::MAX / 2),
+            hess: i64::from(rng.next_u32() % 700) + 1,
+        })
+        .collect();
+    let dev_gpairs = engine.upload_gpairs(&gpairs).unwrap();
+    let n_bins = m.n_bins() as usize;
+
+    // The partitioner's layout: one buffer, the node's rows a contiguous range.
+    let all: Vec<u32> = (0..m.n_rows as u32).collect();
+    let ridx = client.create_from_slice(bytemuck::cast_slice(&all));
+    let split = 1100usize; // left child is [0, split), right is [split, n)
+
+    let parent_buf = client.create_from_slice(bytemuck::cast_slice(&vec![0u32; n_bins * 4]));
+    engine.build_into(
+        &dev_gpairs,
+        &DeviceRows::slice(ridx.clone(), 0, m.n_rows),
+        &parent_buf,
+        n_bins,
+        0,
+    );
+
+    // Build the right child into slot 0, subtract the left into slot 1.
+    let frontier = client.create_from_slice(bytemuck::cast_slice(&vec![0u32; n_bins * 4 * 2]));
+    engine.build_into(
+        &dev_gpairs,
+        &DeviceRows::slice(ridx.clone(), split, m.n_rows - split),
+        &frontier,
+        n_bins * 2,
+        0,
+    );
+    engine.subtract_into(&parent_buf, n_bins, 0, &frontier, n_bins * 2, 0, n_bins as u32);
+
+    let bytes = client.read_one_unchecked(frontier);
+    let words: &[u32] = bytemuck::cast_slice(&bytes);
+    let read_slot = |slot: usize| -> Vec<GradientPairInt64> {
+        words[slot * n_bins * 4..(slot + 1) * n_bins * 4]
+            .chunks_exact(4)
+            .map(|w| GradientPairInt64 {
+                grad: (w[0] as i64) | ((w[1] as i64) << 32),
+                hess: (w[2] as i64) | ((w[3] as i64) << 32),
+            })
+            .collect()
+    };
+
+    assert_eq!(read_slot(0), cpu_histogram(&m, &gpairs, &all[split..]), "built child");
+    assert_eq!(read_slot(1), cpu_histogram(&m, &gpairs, &all[..split]), "subtracted sibling");
 }
 
 /// A slot-0 build must still equal the standalone one, so the offset did not

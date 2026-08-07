@@ -3,6 +3,7 @@
 
 pub mod ellpack;
 pub mod evaluate_splits;
+pub mod grower;
 pub mod histogram;
 pub mod quantiser;
 pub mod row_partitioner;
@@ -70,10 +71,19 @@ impl DeviceGpairs {
 #[derive(Clone, Debug)]
 pub struct DeviceRows {
     pub(crate) handle: Handle,
+    /// First index of this node's slice of the buffer. The partitioner keeps
+    /// every node's rows in one `ridx` allocation, so a node is a range of it
+    /// rather than a buffer of its own.
+    pub(crate) base: usize,
     pub(crate) n: usize,
 }
 
 impl DeviceRows {
+    /// A node's slice of a partitioned row index.
+    pub fn slice(handle: Handle, base: usize, n: usize) -> Self {
+        Self { handle, base, n }
+    }
+
     pub fn len(&self) -> usize {
         self.n
     }
