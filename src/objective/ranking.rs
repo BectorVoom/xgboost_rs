@@ -219,8 +219,13 @@ impl LambdaRank {
         for k in 0..n {
             let y = labels[rank[k]] as f64;
             n_rel[k] = if k == 0 { y } else { n_rel[k - 1] + y };
-            let prec = y * n_rel[k] / ((k + 1) as f64);
-            acc[k] = if k == 0 { prec } else { acc[k - 1] + prec };
+            // `acc` is upstream's `\sum l_k / k` — the label over its rank, not
+            // the precision at that rank. Weighting the term by `n_rel[k]` as
+            // well double-counts the relevant documents seen so far; with
+            // binary labels the two agree at k = 0 and diverge from k = 1 on,
+            // which is why only `rank:map` drifted.
+            let term = y / ((k + 1) as f64);
+            acc[k] = if k == 0 { term } else { acc[k - 1] + term };
         }
         (n_rel, acc)
     }
