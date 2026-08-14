@@ -1,19 +1,36 @@
 #!/usr/bin/env bash
-# Package the crate, upload it as a Kaggle dataset, and push the GPU kernel.
+# Package the crate, upload it as a Kaggle dataset, and push a GPU kernel.
 #
-#   tools/kaggle/push.sh            # push and return
-#   tools/kaggle/push.sh --wait     # push, wait for completion, fetch output
+#   tools/kaggle/push.sh                                  # the oracle kernel
+#   tools/kaggle/push.sh --wait                           # ...and wait for it
+#   tools/kaggle/push.sh --wait param-bench-metadata.json # a different kernel
 #
-# Requires an authenticated `kaggle` CLI (~/.kaggle/). The kernel requests a
-# T4 via `machine_shape` — see kernel-metadata.json for why that matters.
+# The kernel is named by its metadata file, which carries both the slug and the
+# script to run, so adding a kernel means adding a metadata file and nothing
+# else. Requires an authenticated `kaggle` CLI (~/.kaggle/). The kernels request
+# a T4 via `machine_shape` — see the metadata comment for why that matters.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
-SLUG="yensen2/xgboost-rs-gpu-oracle"
+WAIT=""
+META="kernel-metadata.json"
+for arg in "$@"; do
+  case "$arg" in
+    --wait) WAIT=1 ;;
+    *.json) META="$arg" ;;
+    *) echo "unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
+
+META_PATH="tools/kaggle/$META"
+[ -f "$META_PATH" ] || { echo "no such metadata: $META_PATH" >&2; exit 2; }
+SLUG="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$META_PATH")"
+CODE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["code_file"])' "$META_PATH")"
 DATASET="yensen2/xgboost-rs-gpu-src"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 
+echo "==> kernel $SLUG (from $CODE)"
 mkdir -p "$STAGE/data" "$STAGE/kernel"
 
 # The crate, minus build output and the committed fixtures (the generator
@@ -25,7 +42,9 @@ cat > "$STAGE/data/dataset-metadata.json" <<EOF
 {"title": "xgboost-rs gpu src", "id": "$DATASET", "licenses": [{"name": "Apache 2.0"}]}
 EOF
 
-cp tools/kaggle/run.py tools/kaggle/kernel-metadata.json "$STAGE/kernel/"
+# Kaggle wants the kernel's metadata under its own fixed name.
+cp "tools/kaggle/$CODE" "$STAGE/kernel/"
+cp "$META_PATH" "$STAGE/kernel/kernel-metadata.json"
 
 echo "==> uploading source dataset"
 if kaggle datasets status "$DATASET" >/dev/null 2>&1; then
@@ -45,9 +64,7 @@ done
 echo "==> pushing kernel"
 kaggle kernels push -p "$STAGE/kernel"
 
-if [ "${1:-}" != "--wait" ]; then
-  exit 0
-fi
+[ -n "$WAIT" ] || exit 0
 
 echo "==> waiting for the run"
 until kaggle kernels status "$SLUG" 2>&1 | grep -qE "COMPLETE|ERROR|CANCEL"; do
@@ -55,7 +72,10 @@ until kaggle kernels status "$SLUG" 2>&1 | grep -qE "COMPLETE|ERROR|CANCEL"; do
 done
 kaggle kernels status "$SLUG"
 
-OUT="kaggle-output"
+OUT="kaggle-output/$(basename "$SLUG")"
 mkdir -p "$OUT"
-kaggle kernels output "$SLUG" -p "$OUT"
+# `output` fetches the files the run wrote; `logs` fetches the console, which is
+# the only place a failure before the first file shows up.
+kaggle kernels output "$SLUG" -p "$OUT" || true
+kaggle kernels logs "$SLUG" > "$OUT/console.log" 2>&1 || true
 echo "==> output in $OUT/"
