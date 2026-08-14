@@ -346,6 +346,16 @@ mod tests {
             last = rng.next_u32();
         }
         assert_eq!(last, 4_123_659_995);
+
+        // `seed = 0` is XGBoost's default and therefore the sequence every
+        // fixture was generated from — including the pair seed
+        // `LambdaRankObj::GetGradient` draws before sampling. Pinned
+        // separately from 5489 because a seeding bug that only bites at zero
+        // would otherwise hide behind the standard's own test vector.
+        let mut rng = Mt19937::new(0);
+        assert_eq!(rng.next_u32(), 2_357_136_044);
+        assert_eq!(rng.next_u32(), 2_546_248_239);
+        assert_eq!(rng.next_u32(), 3_071_714_933);
     }
 
     #[test]
