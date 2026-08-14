@@ -84,62 +84,123 @@ Several of those are the *point* of the parameter rather than an artefact:
 * **`max_cached_hist_node` is within 5% across four orders of magnitude.** It
   bounds resident memory on a wide tree rather than buying speed.
 
-## CPU against the device
+## CPU against the device, on real hardware
 
-The same sweep at 50 000 rows x 20 features, 5 rounds, run twice — once with
-`--device cpu`, once with `--device cuda`. Only the groups where the two
-*differ* are worth listing; everything else lands within noise of the CPU
-column's ratio.
+The same sweep run twice on one Kaggle VM — **Tesla T4** (SM 7.5, 15 GB)
+against the **4 vCPU Intel Xeon @ 2.00 GHz** that hosts it — at 200 000 rows x
+40 features, 10 rounds, best of 2. Same machine, back to back, so the ratio
+between the two columns means something even though neither absolute number
+belongs to the laptop the CPU table above was measured on.
 
-| Group | What moves | CPU | device |
+Reproduce with `tools/kaggle/push.sh --wait param-bench-metadata.json`.
+
+### Does the device win?
+
+Wall clock for the same fit, host CPU against T4:
+
+| Case | CPU | T4 | T4 speedup |
 |---|---|---|---|
-| `grow_policy` | depthwise -> lossguide, 64 leaves | 2.12x | **4.90x** |
-| `num_parallel_tree` | 1 -> 4 | 2.05x | **3.75x** |
-| `multi_strategy` | one tree per output -> vector leaf, 4 targets | 1.17x | **0.65x** |
-| `dart` | `rate_drop` 0 -> 0.5 | 2.19x | 1.42x |
-| `tree_method` | hist -> approx, varying hessian | 3.61x | 1.66x |
-| | hist -> exact | 4.67x | **refused** |
-| `gblinear` | gbtree -> `coord_descent` | 0.58x | **3.35x** |
-| | gbtree -> `shotgun` | 0.61x | 0.34x |
-| `nthread` | 1 -> 8 | 0.51x | 1.00x |
+| `hist`, depth 6 (the baseline) | 0.693 s | 0.545 s | 1.27x |
+| `max_depth=10` | 2.208 s | 0.616 s | **3.58x** |
+| `lossguide`, 64 leaves | 0.958 s | 0.667 s | 1.44x |
+| `num_class=8` | 2.605 s | 2.074 s | 1.26x |
+| `multi_output_tree`, 4 targets | 1.307 s | 0.804 s | 1.63x |
+| `num_parallel_tree=4` | 1.363 s | 0.932 s | 1.46x |
+| `dart`, `rate_drop=0.5` | 2.210 s | 2.146 s | 1.03x |
+| `approx`, varying hessian | 4.084 s | 3.737 s | 1.09x |
+| `exact` | 8.276 s | refused | — |
+| `gblinear/coord_descent` | 0.554 s | 0.901 s | **0.61x** |
+| `gblinear/greedy` | 7.401 s | 8.754 s | 0.85x |
 
-What those say about the *shape* of the device path — none of it dependent on
-which GPU is underneath:
+**The device wins where the tree is deep and loses where the work is serial.**
+`max_depth=10` is the standout at 3.6x: the CPU pays 3.9x going from depth 4 to
+10 and the T4 pays 1.27x, because the extra levels are more parallel work of
+exactly the kind it already had. At the other end, `gblinear` is *slower* on
+the device — see below — and `dart` and `approx` barely move, because both
+spend their extra time rebuilding host-side state (the dropped-tree rescale,
+the per-round re-sketch) rather than in the kernels.
 
-* **`lossguide` costs the device more than twice what it costs the CPU.** The
-  device grows a *batch* of nodes per launch, and loss-guide's queue yields one
-  node at a time (`ExpandQueue::pop_batch`), so every launch does one node's
-  work. Depth-wise fills the batch with a whole level. This is the single
-  largest device-only penalty in the sweep.
-* **A vector leaf is a *win* on the device (0.65x) and a small loss on the CPU
-  (1.17x).** One tree per round instead of one per target saves the device a
-  per-tree round of launches and frontier setup, which is a cost the CPU
-  barely has. The fit is level in both columns, so the saving is not bought by
-  fitting less. `multi_strategy=multi_output_tree` is worth reaching for on the
-  device in a way it is not on the CPU.
+### Which parameters cost the device something different
+
+Ratios within each device, so the host's speed cancels out:
+
+| Group | What moves | CPU | T4 |
+|---|---|---|---|
+| `max_depth` | 4 -> 10 | 3.91x | **1.27x** |
+| `max_bin` | 16 -> 512 | 1.70x | 1.31x |
+| `num_class` | 2 -> 8 | 2.71x | 2.48x |
+| `grow_policy` | depthwise/16 -> lossguide/64 | 1.68x | **1.38x** |
+| `num_parallel_tree` | 1 -> 4 | 1.94x | 1.71x |
+| `multi_strategy` | one tree per output -> vector leaf, 4 targets | 1.01x | **0.86x** |
+| `dart` | `rate_drop` 0 -> 0.5 | 3.19x | 3.99x |
+| `tree_method` | hist -> approx, varying hessian | 5.89x | 6.86x |
+| | hist -> exact | 11.94x | **refused** |
+| `gblinear` | gbtree -> `coord_descent` | 0.79x | **1.65x** |
+| | cyclic -> `greedy` | 13.4x | **9.7x** |
+| `nthread` | 1 -> 4 | 0.72x | **1.01x** |
+
+* **Depth is the parameter the device changes most.** 3.9x on the CPU against
+  1.3x on the T4. A deeper tree is more nodes per level, which is more
+  independent work for a device that already launches a level at a time. The
+  same mechanism is why `lossguide` — which the device used to be blamed for —
+  comes out *cheaper* there (1.38x against 1.68x) once the nodes are big
+  enough: what the device dislikes is small launches, not the policy.
+* **A vector leaf is a win on the device and free on the CPU** — 0.86x against
+  1.01x at four targets, with the fit level in both columns, so the saving is
+  not bought by fitting less. One tree a round instead of one per target saves
+  the device three quarters of its per-tree launches and frontier setup.
 * **`nthread` does nothing on the device**, which is the expected shape and
-  worth having measured: the CPU column scales 2x from 1 to 8 threads, the
-  device column is flat, so the work really is off the host.
-* **`gblinear`'s device solver is 3.4x the gbtree reference where the CPU
-  solver is 0.6x.** Coordinate descent updates one feature at a time and each
-  step needs the previous step's residuals, so the device pays a launch and a
-  readback *per feature per group per round*. That serial dependency is
-  upstream's too; what this measures is that the round trips dominate at this
-  size. It is the right answer bit-for-bit (`tests/gpu_linear.rs`) and the wrong
-  shape for a small matrix.
+  worth having measured: the CPU column drops to 0.72x from 1 to 4 threads and
+  the device column does not move, so the work really is off the host.
+* **`gblinear` is the one place the device is the wrong tool.** Coordinate
+  descent updates one feature at a time and each step needs the previous
+  step's residuals, so the device pays a launch and a readback *per feature per
+  group per round* — 1.65x the gbtree reference where the CPU solver is 0.79x.
+  The serial dependency is upstream's; what this measures is that the round
+  trips dominate. It is the right answer bit-for-bit
+  (`tests/gpu_linear.rs`) and the wrong shape for this matrix.
 * **`exact` is refused**, as upstream refuses it: there is no GPU column-scan
   updater.
 
-## What the device column is and is not
+### What the lavapipe stand-in got wrong
 
-This machine has no NVIDIA GPU. The `device` column is the device *code path*
-running on **lavapipe**, a software Vulkan implementation on the same CPU, so
-it measures what that path *does* — how many launches, how much crosses the
-host boundary, how the work scales with the parameter — and **not how fast a
-GPU would do it**. Nothing above is a claim about GPU speed, and the ratios
-quoted are only ever device-against-device.
+This document previously carried a device column measured on **lavapipe**, a
+software Vulkan implementation on the local CPU, because this machine has no
+NVIDIA GPU. It is a faithful way to run the device *code path* and it was
+useful for correctness, but as a performance model it was wrong in both
+directions and is recorded here so the next person does not trust it again:
 
-For real hardware see `docs/gpu-benchmarks.md` (Tesla T4, against XGBoost's own
-`gpu_hist`, across rows, features, depth, `max_bin`, sparsity, `grow_policy`
-and round count) and `docs/gpu-multi-output-performance.md`. `param_bench`
-takes `--device cuda`, so this sweep is what to run there.
+Compared at the size lavapipe was measured at — 50 000 x 20, 5 rounds — with
+each column's own CPU beside it, because that is the comparison the claims were
+made from:
+
+| Ratio | lavapipe CPU | lavapipe device | T4's CPU | T4 |
+|---|---|---|---|---|
+| `grow_policy`, depthwise/16 -> lossguide/64 | 2.12x | **4.90x** | 1.95x | 2.47x |
+| `num_parallel_tree` 1 -> 4 | 2.05x | **3.75x** | 2.20x | 2.08x |
+| `gblinear`, gbtree -> `coord_descent` | 0.58x | **3.35x** | 0.47x | 2.13x |
+| `multi_strategy`, vector leaf, 4 targets | 1.17x | 0.65x | 0.96x | 0.75x |
+
+So of the four things that column was used to claim:
+
+* **"`lossguide` is the single largest device-only penalty" was wrong.** The
+  penalty is real but roughly half the size, and at the larger configuration it
+  **inverts** — 1.38x on the T4 against 1.68x on its CPU, so a loss-guided tree
+  is *cheaper* on the device once there is enough work per node.
+* **"`num_parallel_tree` costs the device nearly twice what it costs the CPU"
+  was wrong**; it costs slightly less.
+* **`gblinear` was right in direction and about 60% too pessimistic.**
+* **The vector-leaf win was right in direction and overstated.**
+
+The pattern is that lavapipe exaggerates anything launch-bound, because a
+"launch" there is CPU work rather than a submission to a real queue — and it
+exaggerates most where the per-launch work is smallest, which is why the
+overstatement grows as the configuration shrinks. Its reliable signal was the
+*sign* of a difference, not its size, and even the sign flipped once. Nothing
+about correctness is affected — the fits are identical either way, which is
+what `tests/gpu_training.rs` and `tests/gpu_linear.rs` assert — but no timing
+claim from it survives.
+
+For the comparison against XGBoost's own `gpu_hist` rather than against this
+crate's CPU path, see `docs/gpu-benchmarks.md`, and
+`docs/gpu-multi-output-performance.md` for the vector-leaf kernels.
