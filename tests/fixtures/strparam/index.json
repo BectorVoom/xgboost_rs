@@ -1,0 +1,703 @@
+{
+ "xgboost_version": "3.4.0",
+ "gpu_present": false,
+ "cases": [
+  {
+   "case": "objective_reg_squarederror",
+   "param": "objective",
+   "value": "reg:squarederror",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "objective_reg_squaredlogerror",
+   "param": "objective",
+   "value": "reg:squaredlogerror",
+   "data": "positive",
+   "outcome": "ok"
+  },
+  {
+   "case": "objective_reg_logistic",
+   "param": "objective",
+   "value": "reg:logistic",
+   "data": "unit",
+   "outcome": "ok"
+  },
+  {
+   "case": "objective_reg_pseudohubererror",
+   "param": "objective",
+   "value": "reg:pseudohubererror",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "objective_reg_absoluteerror",
+   "param": "objective",
+   "value": "reg:absoluteerror",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "objective_reg_quantileerror",
+   "param": "objective",
+   "value": "reg:quantileerror",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "objective_reg_expectileerror",
+   "param": "objective",
+   "value": "reg:expectileerror",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "objective_reg_gamma",
+   "param": "objective",
+   "value": "reg:gamma",
+   "data": "positive",
+   "outcome": "ok"
+  },
+  {
+   "case": "objective_reg_tweedie",
+   "param": "objective",
+   "value": "reg:tweedie",
+   "data": "positive",
+   "outcome": "ok"
+  },
+  {
+   "case": "objective_reg_linear",
+   "param": "objective",
+   "value": "reg:linear",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "objective_count_poisson",
+   "param": "objective",
+   "value": "count:poisson",
+   "data": "positive",
+   "outcome": "ok"
+  },
+  {
+   "case": "objective_survival_cox",
+   "param": "objective",
+   "value": "survival:cox",
+   "data": "cox",
+   "outcome": "ok"
+  },
+  {
+   "case": "objective_survival_aft",
+   "param": "objective",
+   "value": "survival:aft",
+   "data": "survival",
+   "outcome": "ok"
+  },
+  {
+   "case": "objective_binary_logistic",
+   "param": "objective",
+   "value": "binary:logistic",
+   "data": "binary",
+   "outcome": "ok"
+  },
+  {
+   "case": "objective_binary_logitraw",
+   "param": "objective",
+   "value": "binary:logitraw",
+   "data": "binary",
+   "outcome": "ok"
+  },
+  {
+   "case": "objective_binary_hinge",
+   "param": "objective",
+   "value": "binary:hinge",
+   "data": "binary",
+   "outcome": "ok"
+  },
+  {
+   "case": "objective_multi_softmax",
+   "param": "objective",
+   "value": "multi:softmax",
+   "data": "multiclass",
+   "outcome": "ok"
+  },
+  {
+   "case": "objective_multi_softprob",
+   "param": "objective",
+   "value": "multi:softprob",
+   "data": "multiclass",
+   "outcome": "ok"
+  },
+  {
+   "case": "objective_rank_pairwise",
+   "param": "objective",
+   "value": "rank:pairwise",
+   "data": "ranking",
+   "outcome": "ok"
+  },
+  {
+   "case": "objective_rank_ndcg",
+   "param": "objective",
+   "value": "rank:ndcg",
+   "data": "ranking",
+   "outcome": "ok"
+  },
+  {
+   "case": "objective_rank_map",
+   "param": "objective",
+   "value": "rank:map",
+   "data": "ranking_binary",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_rmse",
+   "param": "eval_metric",
+   "value": "rmse",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_rmsle",
+   "param": "eval_metric",
+   "value": "rmsle",
+   "data": "positive",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_mae",
+   "param": "eval_metric",
+   "value": "mae",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_mape",
+   "param": "eval_metric",
+   "value": "mape",
+   "data": "positive",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_mphe",
+   "param": "eval_metric",
+   "value": "mphe",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_logloss",
+   "param": "eval_metric",
+   "value": "logloss",
+   "data": "binary",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_error",
+   "param": "eval_metric",
+   "value": "error",
+   "data": "binary",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_error_at_0p7",
+   "param": "eval_metric",
+   "value": "error@0.7",
+   "data": "binary",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_merror",
+   "param": "eval_metric",
+   "value": "merror",
+   "data": "multiclass",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_mlogloss",
+   "param": "eval_metric",
+   "value": "mlogloss",
+   "data": "multiclass",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_auc",
+   "param": "eval_metric",
+   "value": "auc",
+   "data": "binary",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_aucpr",
+   "param": "eval_metric",
+   "value": "aucpr",
+   "data": "binary",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_pre",
+   "param": "eval_metric",
+   "value": "pre",
+   "data": "ranking_binary",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_pre_at_3",
+   "param": "eval_metric",
+   "value": "pre@3",
+   "data": "ranking_binary",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_ndcg",
+   "param": "eval_metric",
+   "value": "ndcg",
+   "data": "ranking",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_ndcg_at_3",
+   "param": "eval_metric",
+   "value": "ndcg@3",
+   "data": "ranking",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_ndcg_at_3_",
+   "param": "eval_metric",
+   "value": "ndcg@3-",
+   "data": "ranking",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_map",
+   "param": "eval_metric",
+   "value": "map",
+   "data": "ranking_binary",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_map_at_3",
+   "param": "eval_metric",
+   "value": "map@3",
+   "data": "ranking_binary",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_map_at_3_",
+   "param": "eval_metric",
+   "value": "map@3-",
+   "data": "ranking_binary",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_poisson_nloglik",
+   "param": "eval_metric",
+   "value": "poisson-nloglik",
+   "data": "positive",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_gamma_nloglik",
+   "param": "eval_metric",
+   "value": "gamma-nloglik",
+   "data": "positive",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_cox_nloglik",
+   "param": "eval_metric",
+   "value": "cox-nloglik",
+   "data": "cox",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_gamma_deviance",
+   "param": "eval_metric",
+   "value": "gamma-deviance",
+   "data": "positive",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_tweedie_nloglik_at_1p5",
+   "param": "eval_metric",
+   "value": "tweedie-nloglik@1.5",
+   "data": "positive",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_aft_nloglik",
+   "param": "eval_metric",
+   "value": "aft-nloglik",
+   "data": "survival",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_interval_regression_accuracy",
+   "param": "eval_metric",
+   "value": "interval-regression-accuracy",
+   "data": "survival",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_quantile",
+   "param": "eval_metric",
+   "value": "quantile",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_expectile",
+   "param": "eval_metric",
+   "value": "expectile",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "metric_ams_at_0p15",
+   "param": "eval_metric",
+   "value": "ams@0.15",
+   "data": "binary_weighted",
+   "outcome": "ok"
+  },
+  {
+   "case": "tree_method_auto",
+   "param": "tree_method",
+   "value": "auto",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "tree_method_exact",
+   "param": "tree_method",
+   "value": "exact",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "tree_method_approx",
+   "param": "tree_method",
+   "value": "approx",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "tree_method_hist",
+   "param": "tree_method",
+   "value": "hist",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "grow_policy_depthwise",
+   "param": "grow_policy",
+   "value": "depthwise",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "grow_policy_lossguide",
+   "param": "grow_policy",
+   "value": "lossguide",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "sampling_method_uniform",
+   "param": "sampling_method",
+   "value": "uniform",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "sampling_method_gradient_based",
+   "param": "sampling_method",
+   "value": "gradient_based",
+   "data": "regression",
+   "outcome": "ok",
+   "requires_gpu": true
+  },
+  {
+   "case": "process_type_default",
+   "param": "process_type",
+   "value": "default",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "process_type_update",
+   "param": "process_type",
+   "value": "update",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "updater_grow_colmaker",
+   "param": "updater",
+   "value": "grow_colmaker",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "updater_grow_histmaker",
+   "param": "updater",
+   "value": "grow_histmaker",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "updater_grow_quantile_histmaker",
+   "param": "updater",
+   "value": "grow_quantile_histmaker",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "updater_grow_quantile_histmaker_sycl",
+   "param": "updater",
+   "value": "grow_quantile_histmaker_sycl",
+   "data": "regression",
+   "outcome": "error"
+  },
+  {
+   "case": "updater_grow_gpu_hist",
+   "param": "updater",
+   "value": "grow_gpu_hist",
+   "data": "regression",
+   "outcome": "error",
+   "requires_gpu": true
+  },
+  {
+   "case": "updater_grow_gpu_approx",
+   "param": "updater",
+   "value": "grow_gpu_approx",
+   "data": "regression",
+   "outcome": "error",
+   "requires_gpu": true
+  },
+  {
+   "case": "updater_prune",
+   "param": "updater",
+   "value": "prune",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "updater_refresh",
+   "param": "updater",
+   "value": "refresh",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "multi_strategy_one_output_per_tree",
+   "param": "multi_strategy",
+   "value": "one_output_per_tree",
+   "data": "multitarget",
+   "outcome": "ok"
+  },
+  {
+   "case": "multi_strategy_multi_output_tree",
+   "param": "multi_strategy",
+   "value": "multi_output_tree",
+   "data": "multitarget",
+   "outcome": "ok"
+  },
+  {
+   "case": "default_direction_learn",
+   "param": "default_direction",
+   "value": "learn",
+   "data": "missing",
+   "outcome": "ok"
+  },
+  {
+   "case": "default_direction_left",
+   "param": "default_direction",
+   "value": "left",
+   "data": "missing",
+   "outcome": "ok"
+  },
+  {
+   "case": "default_direction_right",
+   "param": "default_direction",
+   "value": "right",
+   "data": "missing",
+   "outcome": "ok"
+  },
+  {
+   "case": "monotone_constraints_neg1",
+   "param": "monotone_constraints",
+   "value": "-1",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "monotone_constraints_0",
+   "param": "monotone_constraints",
+   "value": "0",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "monotone_constraints_1",
+   "param": "monotone_constraints",
+   "value": "1",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "sample_type_uniform",
+   "param": "sample_type",
+   "value": "uniform",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "sample_type_weighted",
+   "param": "sample_type",
+   "value": "weighted",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "normalize_type_tree",
+   "param": "normalize_type",
+   "value": "tree",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "normalize_type_forest",
+   "param": "normalize_type",
+   "value": "forest",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "feature_selector_cyclic",
+   "param": "feature_selector",
+   "value": "cyclic",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "feature_selector_shuffle",
+   "param": "feature_selector",
+   "value": "shuffle",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "feature_selector_random",
+   "param": "feature_selector",
+   "value": "random",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "feature_selector_greedy",
+   "param": "feature_selector",
+   "value": "greedy",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "feature_selector_thrifty",
+   "param": "feature_selector",
+   "value": "thrifty",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "linear_updater_shotgun",
+   "param": "updater",
+   "value": "shotgun",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "linear_updater_coord_descent",
+   "param": "updater",
+   "value": "coord_descent",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "aft_loss_distribution_normal",
+   "param": "aft_loss_distribution",
+   "value": "normal",
+   "data": "survival",
+   "outcome": "ok"
+  },
+  {
+   "case": "aft_loss_distribution_logistic",
+   "param": "aft_loss_distribution",
+   "value": "logistic",
+   "data": "survival",
+   "outcome": "ok"
+  },
+  {
+   "case": "aft_loss_distribution_extreme",
+   "param": "aft_loss_distribution",
+   "value": "extreme",
+   "data": "survival",
+   "outcome": "ok"
+  },
+  {
+   "case": "lambdarank_pair_method_mean",
+   "param": "lambdarank_pair_method",
+   "value": "mean",
+   "data": "ranking",
+   "outcome": "ok"
+  },
+  {
+   "case": "lambdarank_pair_method_topk",
+   "param": "lambdarank_pair_method",
+   "value": "topk",
+   "data": "ranking",
+   "outcome": "ok"
+  },
+  {
+   "case": "verbosity_0",
+   "param": "verbosity",
+   "value": "0",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "verbosity_1",
+   "param": "verbosity",
+   "value": "1",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "verbosity_2",
+   "param": "verbosity",
+   "value": "2",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "verbosity_3",
+   "param": "verbosity",
+   "value": "3",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "device_cpu",
+   "param": "device",
+   "value": "cpu",
+   "data": "regression",
+   "outcome": "ok"
+  },
+  {
+   "case": "device_cuda",
+   "param": "device",
+   "value": "cuda",
+   "data": "regression",
+   "outcome": "ok",
+   "requires_gpu": true
+  }
+ ]
+}

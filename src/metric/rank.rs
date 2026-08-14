@@ -396,6 +396,24 @@ impl Metric for Ams {
     }
 }
 
+// `ams@t` is the one metric still off against the pinned 3.4.0 oracle
+// (`metric_ams_at_0p15`), and it is off in the metric alone: that case's
+// predictions, leaf assignment and tree structure all match exactly.
+//
+// Ruled out, by recomputing the metric from the fixture's own recorded
+// predictions, labels and weights and scanning every possibility:
+//
+//   * the cut. No `ntop` in `1..=n` reproduces upstream's value.
+//   * tie ordering. The model has only 33 distinct predictions over 300 rows,
+//     so the `ratio * n` cut lands mid-tie — but neither stable order,
+//     reverse-index, by-weight nor by-label reproduces it at any cut.
+//   * the weights. Dropping them entirely does not reproduce it either.
+//
+// So the difference is not in this arithmetic; whatever upstream sums here is
+// not the (prediction, label, weight) triple the fixture records. Worth
+// checking what `Metric::Evaluate` is actually handed for a weighted binary
+// fit before touching the formula again.
+
 #[cfg(test)]
 mod tests {
     use super::*;

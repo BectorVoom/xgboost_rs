@@ -40,6 +40,10 @@ pub use regression::{
 };
 pub use survival::{AftSurvival, CoxRegression};
 
+/// `LearnerModelParam::kDefaultBaseScore` — the intercept an objective that
+/// does not estimate one is left with.
+pub const DEFAULT_BASE_SCORE: f32 = 0.5;
+
 /// First and second derivative of the loss at one `(row, output)`.
 ///
 /// Mirrors `xgboost::GradientPair`.

@@ -14,7 +14,14 @@ use rayon::prelude::*;
 use std::cmp::Ordering;
 
 /// Sketch capacity factor: `WQSketch::kFactor` upstream.
-const K_FACTOR: f32 = 8.0;
+///
+/// 3.4.0 lowered this from `8.0` to `2.0`. Combined with the epsilon change
+/// (see [`sketch_epsilon`]) the internal epsilon a level is sized to goes from
+/// `1 / (8 * bins)` to `1 / (2 * bins)` — four times coarser — so a feature's
+/// summary is pruned in cases where 3.0.5 kept every value. That is the change
+/// with the widest reach: it moves cut values whenever a column has more
+/// distinct values than roughly `2 * max_bin`.
+const K_FACTOR: f32 = 2.0;
 
 /// One summary element: a value with its rank interval `[rmin, rmax]`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -253,17 +260,128 @@ fn fix_error(data: &mut [Entry]) {
     }
 }
 
+/// `common::SketchEpsilon` — the approximation error a feature's sketch is
+/// built to.
+///
+/// One over the number of bins the feature can actually fill, which is capped
+/// by how many values it has. 3.0.5 folded [`K_FACTOR`] in here and passed
+/// `1 / (bins * 8)`; 3.4.0 passes `1 / bins` and divides by `K_FACTOR` inside
+/// [`limit_size_level`] instead. The product is the same either way — this
+/// follows 3.4.0 so the two halves line up with upstream's names.
+fn sketch_epsilon(max_bins: usize, num_samples: usize) -> f64 {
+    let n = num_samples.max(1);
+    let n_bins = max_bins.min(n);
+    1.0 / n_bins as f64
+}
+
+/// `common::SketchSummaryBudget` — how many entries a feature's summary keeps
+/// when it is pruned before the cuts are read off it.
+///
+/// 3.0.5 used a flat `min(n, max_bin * K_FACTOR)`. 3.4.0 asks the sketch for
+/// the same `O(log n / eps)` budget its own levels are sized to, which is what
+/// [`limit_size_level`] already computes.
+fn sketch_summary_budget(max_bins: usize, num_samples: usize) -> usize {
+    limit_size_level(num_samples, sketch_epsilon(max_bins, num_samples)).1
+}
+
 /// `QuantileSketchTemplate::LimitSizeLevel`.
+///
+/// `eps` is the user-facing epsilon; the level sizing uses `eps / K_FACTOR`,
+/// which is where the factor of 8 lives in 3.4.0.
 fn limit_size_level(maxn: usize, eps: f64) -> (usize, usize) {
+    if maxn == 0 {
+        return (1, 1);
+    }
+    let internal_eps = eps / K_FACTOR as f64;
     let mut nlevel = 1usize;
     loop {
-        let limit_size = ((nlevel as f64 / eps).ceil() as usize + 1).min(maxn);
+        let limit_size = ((nlevel as f64 / internal_eps).ceil() as usize + 1).min(maxn);
         let n = 1usize.checked_shl(nlevel as u32).unwrap_or(usize::MAX);
         if n.saturating_mul(limit_size) >= maxn {
             return (nlevel, limit_size);
         }
         nlevel += 1;
     }
+}
+
+/// `WQSummary::QueryCutValues` — read the histogram cut values off a pruned
+/// summary.
+///
+/// This is the step 3.4.0 rewrote. 3.0.5 took the summary's retained entries
+/// directly (`data[1..min(size, max_bin)]`, de-duplicated) and then appended a
+/// sentinel above every observed value. 3.4.0 keeps that shortcut only when the
+/// summary already fits in `max_bin`; otherwise it answers `max_bin - 1` evenly
+/// spaced *rank* queries against the summary, which is what changes the cut
+/// values — a rank query lands between retained entries rather than on one.
+///
+/// Either way the result is forced strictly increasing, and the sentinel above
+/// the largest value is appended last so a value above every cut still has a
+/// bin.
+fn query_cut_values(data: &[Entry], max_bin: usize) -> Vec<f32> {
+    if data.is_empty() {
+        return vec![1e-5];
+    }
+    let n_entries = data.len();
+    let mut cut_values: Vec<f32> = Vec::with_capacity(n_entries.min(max_bin) + 1);
+
+    // First index at or after `cursor` whose value exceeds `value`.
+    let advance = |mut cursor: usize, value: f32| {
+        while cursor < n_entries && data[cursor].value <= value {
+            cursor += 1;
+        }
+        cursor
+    };
+
+    let mut last_cut = data[0].value;
+    let mut next_value_cursor = advance(1, last_cut);
+
+    if n_entries <= max_bin {
+        // Every retained value fits, so no rank query is needed: emit the
+        // distinct values above the first one.
+        while next_value_cursor < n_entries {
+            let cpt = data[next_value_cursor].value;
+            cut_values.push(cpt);
+            last_cut = cpt;
+            next_value_cursor = advance(next_value_cursor + 1, last_cut);
+        }
+    } else {
+        let total = data[n_entries - 1].rmax as f64;
+        let mut query_cursor = 0usize;
+        for i in 1..max_bin {
+            let rank = i as f64 * total / max_bin as f64;
+            let rank2 = 2.0 * rank;
+            while query_cursor < n_entries - 2
+                && rank2 >= (data[query_cursor + 1].rmin + data[query_cursor + 1].rmax) as f64
+            {
+                query_cursor += 1;
+            }
+            let queried = if rank2
+                < (data[query_cursor].rmin_next() + data[query_cursor + 1].rmax_prev()) as f64
+            {
+                data[query_cursor]
+            } else {
+                data[query_cursor + 1]
+            };
+            let mut cpt = queried.value;
+            // Force strictly increasing: a repeated rank answer falls back to
+            // the next distinct value, and running out of those ends the list.
+            if cpt <= last_cut {
+                next_value_cursor = advance(next_value_cursor, last_cut);
+                if next_value_cursor == n_entries {
+                    break;
+                }
+                cpt = data[next_value_cursor].value;
+            } else if next_value_cursor < n_entries && data[next_value_cursor].value <= cpt {
+                next_value_cursor = advance(next_value_cursor + 1, cpt);
+            }
+            cut_values.push(cpt);
+            last_cut = cpt;
+        }
+    }
+
+    let cpt = data[n_entries - 1].value;
+    cut_values.push(cpt + (cpt.abs() + 1e-5));
+    cut_values
 }
 
 /// A single feature's sketch: `WQuantileSketch<float, float>`.
@@ -277,6 +395,8 @@ struct QuantileSketch {
     temp: Vec<Entry>,
     /// Double buffer for the radix sort of `queue`.
     sort_scratch: Vec<QEntry>,
+    /// Reusable buffer for prune/combine results.
+    scratch: Vec<Entry>,
 }
 
 impl QuantileSketch {
@@ -306,7 +426,7 @@ impl QuantileSketch {
                 self.sort_scratch = scratch;
                 self.temp = temp;
                 self.qtail = 0;
-                self.push_temp();
+                self.push_summary();
             }
         }
         if self.qtail == 0 || self.queue[self.qtail - 1].value != x {
@@ -323,74 +443,79 @@ impl QuantileSketch {
         }
     }
 
-    /// `QuantileSketchTemplate::PushTemp` — cascade `temp` up the level stack.
-    fn push_temp(&mut self) {
+    /// `QuantileSketchTemplate::PushSummary` — cascade `temp` up the level
+    /// stack, carrying whenever a level overflows.
+    ///
+    /// 3.4.0 restructured this: the cascade starts at level **0**, which is now
+    /// a resident level like any other. 3.0.5 started at level 1 and kept
+    /// `level[0]` as scratch, which is why [`get_summary`](Self::get_summary)
+    /// had to seed it from the queue.
+    fn push_summary(&mut self) {
         let limit_size = self.limit_size;
-        let mut l = 1usize;
+        let mut l = 0usize;
         loop {
             self.init_level(l + 1);
-            if self.level[l].is_empty() {
-                let mut dst = std::mem::take(&mut self.level[l]);
-                set_prune(&self.temp, limit_size, &mut dst);
-                self.level[l] = dst;
-                return;
-            }
-            let mut scratch = std::mem::take(&mut self.level[0]);
+
+            // Clamp the incoming summary to per-level capacity, then merge it
+            // with the resident level, which is consumed.
+            let mut scratch = std::mem::take(&mut self.scratch);
             set_prune(&self.temp, limit_size, &mut scratch);
-            self.level[0] = scratch;
-
             let mut temp = std::mem::take(&mut self.temp);
-            set_combine(&self.level[0], &self.level[l], &mut temp);
+            set_combine(&scratch, &self.level[l], &mut temp);
             self.temp = temp;
+            self.scratch = scratch;
+            self.level[l].clear();
 
-            if self.temp.len() > limit_size {
-                self.level[l].clear();
-            } else {
-                self.level[l].clear();
-                self.level[l].extend_from_slice(&self.temp);
-                return;
+            if self.temp.len() <= limit_size {
+                break;
             }
             l += 1;
         }
+        // The first level the merged summary fits in.
+        self.level[l].clear();
+        let temp = std::mem::take(&mut self.temp);
+        self.level[l].extend_from_slice(&temp);
+        self.temp = temp;
     }
 
     /// `QuantileSketchTemplate::GetSummary`.
-    fn get_summary(&mut self, out: &mut Vec<Entry>) {
-        let mut scratch = std::mem::take(&mut self.sort_scratch);
-        make_summary(&mut self.queue[..self.qtail], &mut scratch, out);
-        self.sort_scratch = scratch;
-        if self.level.is_empty() {
-            if out.len() > self.limit_size {
-                let mut temp = std::mem::take(&mut self.temp);
-                set_prune(out, self.limit_size, &mut temp);
-                out.clear();
-                out.extend_from_slice(&temp);
-                self.temp = temp;
-            }
-            return;
+    /// The summary of everything pushed so far, pruned to `max_size`.
+    ///
+    /// 3.4.0's shape: flush the pending queue through the level cascade first,
+    /// then merge *every* level into a fresh accumulator, pruning to
+    /// `max(max_size, limit_size)` as it goes, and prune once more to
+    /// `max_size` at the end. 3.0.5 instead started from the queue summary and
+    /// folded levels into `level[0]`, pruning only to `limit_size` — which is
+    /// what made its cuts differ once the sketch was pruned at all.
+    fn get_summary(&mut self, max_size: usize, out: &mut Vec<Entry>) {
+        // Flush the queue into the level hierarchy.
+        if self.qtail > 0 {
+            let mut temp = std::mem::take(&mut self.temp);
+            let mut sort_scratch = std::mem::take(&mut self.sort_scratch);
+            make_summary(&mut self.queue[..self.qtail], &mut sort_scratch, &mut temp);
+            self.sort_scratch = sort_scratch;
+            self.temp = temp;
+            self.qtail = 0;
+            self.push_summary();
         }
 
-        let mut scratch = std::mem::take(&mut self.level[0]);
-        set_prune(out, self.limit_size, &mut scratch);
-        self.level[0] = scratch;
-
-        for l in 1..self.level.len() {
+        let prune_size = max_size.max(self.limit_size);
+        out.clear();
+        let mut merged = std::mem::take(&mut self.temp);
+        for l in 0..self.level.len() {
             if self.level[l].is_empty() {
                 continue;
             }
-            if self.level[0].is_empty() {
-                let src = std::mem::take(&mut self.level[l]);
-                self.level[0].extend_from_slice(&src);
-                self.level[l] = src;
-            } else {
-                set_combine(&self.level[0], &self.level[l], out);
-                let mut scratch = std::mem::take(&mut self.level[0]);
-                set_prune(out, self.limit_size, &mut scratch);
-                self.level[0] = scratch;
-            }
+            set_combine(out, &self.level[l], &mut merged);
+            set_prune(&merged, prune_size, out);
         }
+        self.temp = merged;
+
+        let mut scratch = std::mem::take(&mut self.scratch);
+        set_prune(out, max_size, &mut scratch);
         out.clear();
-        out.extend_from_slice(&self.level[0]);
+        out.extend_from_slice(&scratch);
+        self.scratch = scratch;
     }
 }
 
@@ -596,9 +721,7 @@ fn build_cuts_impl(
             // A categorical column is not sketched at all, so it needs no
             // staging buffers.
             if column_sizes[f] > 0 && !is_cat[f] {
-                let n_bins = max_bins.min(column_sizes[f]).max(1);
-                let eps = 1.0f64 / ((n_bins as f32 * K_FACTOR) as f64);
-                s.init(column_sizes[f], eps);
+                s.init(column_sizes[f], sketch_epsilon(max_bins, column_sizes[f]));
             }
             s
         })
@@ -667,11 +790,9 @@ fn build_cuts_impl(
                 if column_sizes[f] == 0 || is_cat[f] {
                     return;
                 }
-                let intermediate = column_sizes[f].min(max_bins * K_FACTOR as usize);
-                let mut summary = Vec::new();
-                sketch.get_summary(&mut summary);
-                set_prune(&summary, intermediate, reduced);
-                *num_cuts = intermediate;
+                let budget = sketch_summary_budget(max_bins, column_sizes[f]);
+                sketch.get_summary(budget, reduced);
+                *num_cuts = budget;
             });
     });
 
@@ -682,20 +803,13 @@ fn build_cuts_impl(
         min_values: vec![0.0f32; n_features],
         is_categorical: if any_cat { is_cat.clone() } else { Vec::new() },
     };
-    let mut final_summaries: Vec<Vec<Entry>> = vec![Vec::new(); n_features];
     for f in 0..n_features {
-        let max_num_bins = num_cuts[f].min(max_bins);
-        if is_cat[f] {
-            // Bins are the category codes; there is no value below the first
-            // one to split against, and the backward scan never runs.
-            cuts.min_values[f] = 0.0;
-        } else if num_cuts[f] != 0 {
-            set_prune(&reduced[f], max_num_bins + 1, &mut final_summaries[f]);
-            let mval = final_summaries[f][0].value;
-            cuts.min_values[f] = mval - mval.abs() - 1e-5;
-        } else {
-            cuts.min_values[f] = 1e-5;
-        }
+        // 3.4.0 removed `HistogramCuts::min_vals_` outright. The lower bound of
+        // a feature's first bin is now `-inf`
+        // (`HistogramCuts::NumericBinLowerBound`), which is what the backward
+        // scan splits against; 3.0.5 stored `min - |min| - 1e-5` instead.
+        // Categorical features never reach the backward scan.
+        cuts.min_values[f] = if is_cat[f] { 0.0 } else { f32::NEG_INFINITY };
     }
 
     for f in 0..n_features {
@@ -717,19 +831,11 @@ fn build_cuts_impl(
             cuts.cut_ptrs.push(cuts.cut_values.len() as u32);
             continue;
         }
-        let max_num_bins = num_cuts[f].min(max_bins);
-        let a = &final_summaries[f];
-        // `AddCutPoint`: element 0 is represented by `min_values`, so start at 1.
-        let required = a.len().min(max_num_bins);
-        for i in 1..required {
-            let cpt = a[i].value;
-            if i == 1 || cpt > *cuts.cut_values.last().unwrap() {
-                cuts.cut_values.push(cpt);
-            }
-        }
-        // A final cut strictly greater than every observed value.
-        let cpt = if !a.is_empty() { a[a.len() - 1].value } else { cuts.min_values[f] };
-        cuts.cut_values.push(cpt + (cpt.abs() + 1e-5));
+        // `AddCutPoints`: the bin count is capped by what the summary actually
+        // retained, and the values are read off it by rank.
+        let a = &reduced[f];
+        let max_num_bins = a.len().min(max_bins);
+        cuts.cut_values.extend_from_slice(&query_cut_values(a, max_num_bins));
         cuts.cut_ptrs.push(cuts.cut_values.len() as u32);
     }
 

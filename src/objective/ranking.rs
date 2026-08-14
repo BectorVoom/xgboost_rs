@@ -14,7 +14,7 @@
 //! Rows are grouped into queries by `group`/`qid`; weights are per query, not
 //! per row, which is what upstream requires too.
 
-use super::{GradientPair, Objective, sigmoid};
+use super::{GradientPair, Objective, fit_intercept, sigmoid};
 use crate::data::MetaInfo;
 use crate::parameters::{LambdaRankPairMethod, LambdaRankParameters};
 use crate::rng::MinStdRand;
@@ -219,8 +219,13 @@ impl LambdaRank {
         for k in 0..n {
             let y = labels[rank[k]] as f64;
             n_rel[k] = if k == 0 { y } else { n_rel[k - 1] + y };
-            let prec = y * n_rel[k] / ((k + 1) as f64);
-            acc[k] = if k == 0 { prec } else { acc[k - 1] + prec };
+            // `acc` is upstream's `\sum l_k / k` — the label over its rank, not
+            // the precision at that rank. Weighting the term by `n_rel[k]` as
+            // well double-counts the relevant documents seen so far; with
+            // binary labels the two agree at k = 0 and diverge from k = 1 on,
+            // which is why only `rank:map` drifted.
+            let term = y / ((k + 1) as f64);
+            acc[k] = if k == 0 { term } else { acc[k - 1] + term };
         }
         (n_rel, acc)
     }
@@ -490,10 +495,16 @@ impl Objective for LambdaRank {
         self.bias = bias;
     }
 
-    fn init_estimation(&mut self, _info: &MetaInfo) -> Vec<f32> {
-        // Ranking scores are relative, so upstream's intercept has no effect on
-        // the induced order and stays at the default.
-        vec![0.5]
+    fn init_estimation(&mut self, info: &MetaInfo) -> Vec<f32> {
+        // Ranking scores are relative, so the intercept does not change the
+        // induced order — but it does change the margin the first gradient is
+        // taken at, and therefore every tree. Upstream fits it from the
+        // gradient like any other `FitIntercept` objective; because ranking
+        // gradients very nearly cancel within a group, the answer lands within
+        // a rounding error of zero rather than on the 0.5 default this used to
+        // return. Keeping 0.5 moved every tree — see
+        // tests/oracle_string_parameters.rs.
+        fit_intercept(self, info)
     }
 
     /// `ndcg@k` / `map@k` at the truncation level the objective uses.

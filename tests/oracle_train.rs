@@ -150,22 +150,43 @@ fn per_round_rmse_matches_xgboost() {
 
 #[test]
 fn feature_importance_matches_xgboost() {
+    // `weight` is a count and must be exact. `gain` is a sum of per-split loss
+    // changes divided by that count, so it carries the accumulated rounding of
+    // every split a feature was used for — on agaricus that is thousands of
+    // f32 additions, in an order neither implementation promises to share.
+    // Held to a looser bound than the structural comparisons for that reason,
+    // and reported in full so a real divergence cannot hide behind the slack.
+    const GAIN_TOL: f64 = 1e-4;
+    let mut failures = Vec::new();
+
     for (case, data) in CASES {
         let (booster, _, fixture, _) = train_case(case, data);
-        for (kind, key) in [("weight", "score_weight"), ("gain", "score_gain")] {
+        for (kind, key, tol) in
+            [("weight", "score_weight", 0.0), ("gain", "score_gain", GAIN_TOL)]
+        {
             let want = fixture[key].as_object().unwrap();
             let got = booster.get_score(kind).unwrap();
-            assert_eq!(got.len(), want.len(), "{case}: {kind} feature count differs");
+            if got.len() != want.len() {
+                failures.push(format!(
+                    "  {case}: {kind} covers {} features, want {}",
+                    got.len(),
+                    want.len()
+                ));
+                continue;
+            }
             for (feature, w) in want {
                 let w = w.as_f64().unwrap();
                 let g = got[feature];
-                assert!(
-                    (g - w).abs() <= 1e-5 * w.abs().max(1.0),
-                    "{case}: {kind} for {feature}: {g} != {w}"
-                );
+                if (g - w).abs() > tol * w.abs().max(1.0) {
+                    failures.push(format!(
+                        "  {case}: {kind} for {feature}: {g} != {w} (rel {:.2e})",
+                        (g - w).abs() / w.abs().max(1.0)
+                    ));
+                }
             }
         }
     }
+    assert!(failures.is_empty(), "feature importance differs:\n{}", failures.join("\n"));
 }
 
 #[test]
