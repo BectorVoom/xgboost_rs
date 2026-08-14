@@ -1,9 +1,15 @@
 # What the GPU path still does not do
 
 `device=cuda` trains and matches the CPU fit bit-for-bit on a single round
-(`tests/gpu_training.rs`). One thing is still absent, and it is out of scope. It
-is refused by name at the API boundary rather than silently mis-fitted, so
-nothing here is a correctness risk — only missing capability.
+(`tests/gpu_training.rs`), and every one of the 99 string-parameter oracle
+cases produces the *identical* tree on both devices
+(`every_string_parameter_fits_the_same_on_cpu_and_on_the_device`,
+`tests/oracle_string_parameters.rs`). Since the CPU side of those cases is
+pinned to XGBoost 3.4.0, that is what pins the device fit to XGBoost on a
+machine with no NVIDIA GPU.
+
+Two things are left, and both are refused or bounded by name rather than
+silently mis-fitted, so nothing here is a correctness risk.
 
 ## 1. Categorical splits (implemented)
 
@@ -82,12 +88,49 @@ which is what the `matches_across_depth_and_grow_policy` case caught.
 Categorical features are refused, on the GPU exactly as on the CPU: a vector
 leaf has no categorical split there either.
 
-## 3. SYCL (refused, and out of scope)
+## 3. `tree_method=approx` (implemented)
+
+What makes a fit `approx` is the per-round re-sketch of the quantile cuts,
+weighted by the current hessians — not which processor grows the tree from
+them. So `approx_cuts` (`src/gbm/mod.rs`) is shared by both devices and only
+the grower differs: `grow_gpu_approx` builds a fresh ELLPACK from those cuts
+each round, which is the cost `approx` pays either way. Under a constant
+hessian both devices skip the re-sketch, as upstream does.
+
+## 4. `gblinear` (implemented)
+
+Note the spelling: upstream **rejects** `updater=gpu_coord_descent`, deprecated
+since 2.0.0 in favour of `device=cuda` with `updater=coord_descent`, so there
+is no new updater name here either. `src/gpu/linear.rs` runs the two O(nnz)
+passes a coordinate step is made of — the column's `(g·x, h·x²)` and the
+correction to that column's residuals — and the weights come out *bit-identical*
+to the CPU's, because the sum is folded in the same fixed 4096-entry blocks and
+the residual update is forced to round at every `f32` operation.
+
+`shotgun` is hogwild and has no device version upstream or here. It is
+accepted, as upstream accepts it, runs on the CPU, and says so through
+`BoosterParameters::warnings` — otherwise `device` would be a parameter that
+silently did nothing.
+
+## 5. SYCL (refused, and out of scope)
 
 `Device::Sycl` is rejected outright. CubeCL has no SYCL backend here, so there
 is nothing to run it on.
 
 ## Not a feature gap, but outstanding
 
-`docs/gpu-benchmarks.md` records that the device path is 5–14× slower than
-XGBoost's `gpu_hist`, with the measured evidence for where the time goes.
+**A vector leaf under a monotone box parts company with the CPU past depth 4.**
+Both devices score a sum of `n_targets` clipped-weight terms, and a clipped
+term is a difference of large quantities, so candidates near the bottom of a
+deep tree are all but tied — and the device's `f32` arithmetic, which the
+backend evaluates wide and narrows once rather than rounding at every
+operation, is enough to swap which one wins. Identical to depth 4, no worse a
+fit beyond (`multi_output_tree_matches_with_regularisation_and_constraints`).
+The `Array<f32>` round-trip that fixed the same problem in `src/gpu/linear.rs`
+would probably fix this too.
+
+**Speed.** `docs/gpu-benchmarks.md` records that the device path is 5–14×
+slower than XGBoost's `gpu_hist`, with the measured evidence for where the time
+goes. `docs/parameter-performance.md` adds which *parameters* the device is
+disproportionately sensitive to — `lossguide` most of all, because the device
+grows a batch of nodes per launch and loss-guide's queue yields one at a time.
