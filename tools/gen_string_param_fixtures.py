@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import json
 import pathlib
-import traceback
+import re
 
 import numpy as np
 import xgboost as xgb
@@ -79,6 +79,19 @@ def detect_gpu() -> bool:
 
 GPU_PRESENT = False  # set in main()
 
+# What an XGBoost error carries besides the message: a wall-clock timestamp,
+# and a stack trace of load addresses and the absolute path of the interpreter
+# that raised it. None of it is behaviour, all of it changes every run — and a
+# fixture set that churns on every regeneration cannot show a *real* change.
+# Only the message is kept, and it is what the refusal is being pinned on.
+TIMESTAMP = re.compile(r"\[\d{2}:\d{2}:\d{2}\]\s*")
+
+
+def describe(exc: BaseException) -> str:
+    """The exception's name and message, without the clock or the stack."""
+    text = TIMESTAMP.sub("", f"{type(exc).__name__}: {exc}")
+    return text.split("\nStack trace:")[0].strip()
+
 
 # --------------------------------------------------------------- datasets ---
 #
@@ -123,11 +136,24 @@ def ds_binary() -> dict:
 
 
 def ds_binary_weighted() -> dict:
-    """Binary with weights: `ams@t` and the weighted AUC paths read them."""
-    d = ds_binary()
+    """Binary with weights, and a label the model cannot fit exactly.
+
+    `ams@t` is the only case on this dataset, and it is the one metric whose
+    value depends on *which rows* land above a cut. `ds_binary`'s label is a
+    deterministic function of two features, so any tree deep enough separates
+    it and every row collapses onto two or three predictions — the 15% cut then
+    falls inside a run of equal values, where which rows sit above it is
+    decided by `std::sort`'s tie-breaking rather than by XGBoost, and nothing
+    can reproduce it. Drawing the label instead of computing it leaves the
+    model genuinely uncertain, so predictions spread out and the cut falls
+    between two distinct values.
+    """
+    x = _features(300, 6, 16)
     rng = np.random.default_rng(17)
-    d["w"] = rng.uniform(0.5, 2.0, size=d["y"].shape[0]).astype(np.float32)
-    return d
+    p = 1.0 / (1.0 + np.exp(-(x[:, 0] + 0.5 * x[:, 1])))
+    y = (rng.random(300) < p).astype(np.float32)
+    w = rng.uniform(0.5, 2.0, size=300).astype(np.float32)
+    return {"x": x, "y": y, "w": w}
 
 
 def ds_multiclass() -> dict:
@@ -347,11 +373,29 @@ for metric, data, obj in [
     ("interval-regression-accuracy", "survival", "survival:aft"),
     ("quantile", "regression", "reg:quantileerror"),
     ("expectile", "regression", "reg:expectileerror"),
-    ("ams@0.15", "binary_weighted", "binary:logistic"),
+    ("ams@0.25", "binary_weighted", "binary:logistic"),
 ]:
     slug = metric.replace(":", "_").replace("@", "_at_").replace("-", "_").replace(".", "p")
+    extra = dict(objective_extras(obj))
+    if metric.startswith("ams@"):
+        # `ams@t` cuts the rows sorted by prediction at `t * n` and scores that
+        # prefix. Upstream sorts with `std::sort` on the prediction alone, so
+        # when the cut lands inside a run of *equal* predictions, which rows
+        # fall above it is decided by libstdc++'s introsort — not by XGBoost,
+        # and not reproducible by anything but that binary. A tree's
+        # predictions take only `n_leaves` distinct values, so that is the
+        # normal case, not a corner: the default `max_depth=4` puts the cut
+        # mid-tie in every round, and so does every ratio from 0.05 to 0.5.
+        #
+        # This combination is the one that does not: a deep unregularised fit
+        # on a label the model cannot fit exactly (see `ds_binary_weighted`),
+        # cut at a quarter, has distinct predictions on both sides of the cut
+        # in all four rounds — and there the two agree to the last digit.
+        # Which is the point: the metric is then pinned by XGBoost's
+        # arithmetic rather than by its sort.
+        extra.update(max_depth=12, min_child_weight=0, eta=0.5)
     case(f"metric_{slug}", "eval_metric", metric, data,
-         objective=obj, eval_metric=metric, **objective_extras(obj))
+         objective=obj, eval_metric=metric, **extra)
 
 # --- tree_method -----------------------------------------------------------
 for tm in ["auto", "exact", "approx", "hist"]:
@@ -476,7 +520,7 @@ def prediction_block(booster: xgb.Booster, dmat: xgb.DMatrix) -> dict:
         try:
             out[key] = block(booster.predict(dmat, **kwargs), rows)
         except Exception as exc:  # noqa: BLE001 - recorded, not raised
-            out[key] = {"error": f"{type(exc).__name__}: {exc}"}
+            out[key] = {"error": describe(exc)}
     return out
 
 
@@ -540,8 +584,7 @@ def run_case(name: str, param: str, value: str, data: str, params: dict) -> dict
         )
     except Exception as exc:  # noqa: BLE001 - refusal is the recorded outcome
         record["outcome"] = "error"
-        record["error"] = f"{type(exc).__name__}: {exc}"
-        record["error_detail"] = traceback.format_exc(limit=1).strip().splitlines()[-1]
+        record["error"] = describe(exc)
         return record
 
     # The quantile cuts the fit binned against. Every split threshold is one of
@@ -557,7 +600,7 @@ def run_case(name: str, param: str, value: str, data: str, params: dict) -> dict
             float(v) if np.isfinite(v) else None for v in vals
         ]
     except Exception as exc:  # noqa: BLE001 - exact/gblinear never sketch
-        record["cut_error"] = f"{type(exc).__name__}: {exc}"
+        record["cut_error"] = describe(exc)
 
     model = json.loads(booster.save_raw(raw_format="json").decode("utf-8"))
     learner = model["learner"]

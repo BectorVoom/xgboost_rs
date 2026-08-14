@@ -396,23 +396,23 @@ impl Metric for Ams {
     }
 }
 
-// `ams@t` is the one metric still off against the pinned 3.4.0 oracle
-// (`metric_ams_at_0p15`), and it is off in the metric alone: that case's
-// predictions, leaf assignment and tree structure all match exactly.
+// `ams@t` used to be the one metric off against the pinned 3.4.0 oracle. It is
+// **not** the arithmetic above, which reproduces upstream to the last digit;
+// the fixture was asking an unanswerable question.
 //
-// Ruled out, by recomputing the metric from the fixture's own recorded
-// predictions, labels and weights and scanning every possibility:
+// The cut is `ratio * n` rows down the list sorted by prediction, and upstream
+// sorts with `std::sort` on the prediction *alone*. When the cut lands inside a
+// run of equal predictions — which is the normal case for a tree, whose
+// predictions take only `n_leaves` distinct values — which rows sit above it is
+// decided by libstdc++'s introsort, not by XGBoost, and nothing outside that
+// binary can reproduce it. Every candidate `ntop` was checked: for the old
+// fixture, upstream's value is not the AMS of *any* prefix in index order,
+// which is exactly what a different tie permutation looks like.
 //
-//   * the cut. No `ntop` in `1..=n` reproduces upstream's value.
-//   * tie ordering. The model has only 33 distinct predictions over 300 rows,
-//     so the `ratio * n` cut lands mid-tie — but neither stable order,
-//     reverse-index, by-weight nor by-label reproduces it at any cut.
-//   * the weights. Dropping them entirely does not reproduce it either.
-//
-// So the difference is not in this arithmetic; whatever upstream sums here is
-// not the (prediction, label, weight) triple the fixture records. Worth
-// checking what `Metric::Evaluate` is actually handed for a weighted binary
-// fit before touching the formula again.
+// The fixture now asks a question with an answer: a deep unregularised fit on
+// a drawn (not computed) binary label, cut at a quarter, has distinct
+// predictions either side of the cut in every round — and there the two agree
+// exactly. See the `ams@` branch of `tools/gen_string_param_fixtures.py`.
 
 #[cfg(test)]
 mod tests {

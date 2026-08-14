@@ -353,9 +353,9 @@
    "outcome": "ok"
   },
   {
-   "case": "metric_ams_at_0p15",
+   "case": "metric_ams_at_0p25",
    "param": "eval_metric",
-   "value": "ams@0.15",
+   "value": "ams@0.25",
    "data": "binary_weighted",
    "outcome": "ok"
   },
