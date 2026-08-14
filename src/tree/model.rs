@@ -234,10 +234,6 @@ impl RegTree {
         }
     }
 
-    /// The whole leaf-output array, for serialisation.
-    pub(crate) fn leaf_vectors(&self) -> &[f32] {
-        &self.leaf_vectors
-    }
 
     /// Restore the leaf-output array of a loaded vector-leaf tree.
     pub(crate) fn set_leaf_vectors(&mut self, leaf_size: usize, values: Vec<f32>) {
