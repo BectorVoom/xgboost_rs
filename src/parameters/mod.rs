@@ -119,6 +119,7 @@ pub use tree::{
     DartNormalizeType, DartParameters, DartParametersBuilder, DartSampleType, DefaultDirection,
     GrowPolicy, MonotoneConstraint, MultiStrategy, ProcessType, SamplingMethod,
     TreeBoosterParameters, TreeBoosterParametersBuilder, TreeMethod, TreeUpdaterName,
+    UpdaterDevice,
 };
 
 use config::{ConfigEntry as Entry, push};
@@ -160,6 +161,15 @@ impl BoosterType {
         match self {
             Self::Gbtree(tree) => Some(tree),
             Self::Dart(dart) => Some(&dart.tree),
+            Self::Gblinear(_) => None,
+        }
+    }
+
+    /// The tree parameters, mutably, for the two tree boosters.
+    pub const fn tree_mut(&mut self) -> Option<&mut TreeBoosterParameters> {
+        match self {
+            Self::Gbtree(tree) => Some(tree),
+            Self::Dart(dart) => Some(&mut dart.tree),
             Self::Gblinear(_) => None,
         }
     }

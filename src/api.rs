@@ -723,7 +723,11 @@ fn check_supported_updater(tree: &TreeBoosterParameters, device: Device) -> Resu
                 | TreeUpdaterName::GrowColMaker
                 | TreeUpdaterName::Prune
                 | TreeUpdaterName::Refresh
-        ) || (cfg!(feature = "gpu") && *updater == TreeUpdaterName::GrowGpuHist);
+        ) || (cfg!(feature = "gpu")
+            && matches!(
+                updater,
+                TreeUpdaterName::GrowGpuHist | TreeUpdaterName::GrowGpuApprox
+            ));
         if !implemented {
             return Err(Error::invalid(
                 "updater",

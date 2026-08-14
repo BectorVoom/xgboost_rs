@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{CASES, f32_array, load_data, load_json, u32_array};
+use common::{CASES, load_data, load_json, u32_array};
 use xgboost_rs::data::cuts::build_cuts;
 
 /// Quantile cuts must match upstream exactly — every later stage is defined in

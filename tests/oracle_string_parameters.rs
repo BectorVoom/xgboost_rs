@@ -34,6 +34,16 @@ use common::{f32_array, fixture_dir, u32_array};
 /// Relative tolerance for anything the SPEC calls a float comparison.
 const TOL: f64 = 1e-5;
 
+/// Absolute floor for comparing a *gain* across devices, on top of [`TOL`].
+///
+/// A gain is a difference of regularised sums, so a small gain computed out of
+/// large sums keeps far fewer significant digits than the sums do. Measured
+/// across the whole fixture set the largest gap is `1.6e-5` absolute, on a
+/// vector leaf whose gain sums one term per target; this is set an order of
+/// magnitude above that and nothing else in the model is given any slack.
+#[cfg(feature = "gpu")]
+const GAIN_ABS_TOL: f64 = 1e-4;
+
 // ------------------------------------------------------------ fixtures ----
 
 fn strparam_dir() -> std::path::PathBuf {
@@ -777,7 +787,17 @@ fn linear_weights_match_xgboost() {
 /// parameter — never accepted and quietly trained as something else.
 #[test]
 fn configurations_xgboost_refuses_are_refused_here() {
-    let refused: Vec<Case> = cases().into_iter().filter(|c| c.outcome == "error").collect();
+    let refused: Vec<Case> = cases()
+        .into_iter()
+        .filter(|c| c.outcome == "error")
+        // A `requires_gpu` case refused upstream was refused for want of a
+        // *device* on the generating machine ("Must have at least one
+        // device"), not because the configuration is invalid. This build
+        // reaches its own GPU path, so accepting it is correct rather than a
+        // missed refusal; `gpu_cases_are_honest_about_the_device` is what
+        // keeps those cases honest.
+        .filter(|c| !c.requires_gpu)
+        .collect();
     assert!(!refused.is_empty(), "the generator recorded no refusals; that is itself suspicious");
 
     for case in refused {
@@ -918,4 +938,238 @@ fn a_cuda_device_is_never_silently_downgraded_to_cpu() {
             }
         }
     }
+}
+
+// ------------------------------------------------------- device parity ----
+
+/// Replay a case's configuration on `device`, for `rounds` rounds.
+///
+/// A thinner [`train_case`]: the fixture's own round count lets round one's
+/// quantisation difference feed round two's gradients, and from there the two
+/// devices are fitting different problems. The device claim this file makes is
+/// about a *single* round, where both paths see identical gradients.
+#[cfg(feature = "gpu")]
+fn train_case_on(case: &Case, device: Device, rounds: u32) -> Result<xgboost_rs::Booster, String> {
+    let fixture = load(&case.name);
+    let dmat = load_dataset(&case.data);
+    let mut params = config_to_params(&case.name, &config_map(&fixture));
+    params.num_boost_round = rounds;
+    params.booster.general.device = device;
+    retarget_updaters(&mut params, device);
+
+    let base = if fixture["updates_existing_model"].as_bool().unwrap_or(false) {
+        let mut seed = params.clone();
+        if let BoosterType::Gbtree(t) = &mut seed.booster.booster {
+            t.process_type = ProcessType::Default;
+            t.updater = None;
+        }
+        // The ensemble being rewritten is grown on the same device, so the
+        // comparison stays device-against-device rather than putting a
+        // CPU-grown model underneath a device fit.
+        Some(api::train(&seed, &dmat, &[]).map_err(|e| format!("seeding: {e}"))?.0)
+    } else {
+        None
+    };
+
+    api::train_from(&params, &dmat, &[(&dmat, "train")], base.as_ref())
+        .map(|(b, _)| b)
+        .map_err(|e| e.to_string())
+}
+
+/// Point an explicitly named grower at `device`.
+///
+/// A fixture that names `grow_quantile_histmaker` is asking for *`hist`*, and
+/// `hist` on CUDA is spelled `grow_gpu_hist` — the updater name carries the
+/// device, so replaying the same request on the other device means renaming
+/// it. Without this the comparison would only ever be able to say the device
+/// refuses a CPU updater, which is a fact about the spelling and not about the
+/// fit. The tree-modifying stages (`prune`, `refresh`) belong to no device and
+/// are carried across untouched.
+#[cfg(feature = "gpu")]
+fn retarget_updaters(params: &mut TrainingParameters, device: Device) {
+    use TreeUpdaterName::*;
+    let Some(tree) = params.booster.booster.tree_mut() else { return };
+    let Some(updaters) = tree.updater.as_mut() else { return };
+    for u in updaters.iter_mut() {
+        *u = match (*u, device.is_cuda()) {
+            (GrowQuantileHistMaker, true) | (GrowGpuHist, false) => {
+                if device.is_cuda() { GrowGpuHist } else { GrowQuantileHistMaker }
+            }
+            (GrowHistMaker, true) | (GrowGpuApprox, false) => {
+                if device.is_cuda() { GrowGpuApprox } else { GrowHistMaker }
+            }
+            (other, _) => other,
+        };
+    }
+}
+
+/// The reason a case cannot run on `device=cuda`, when XGBoost has that same
+/// rule. Anything not named here **must** run on the device.
+///
+/// Both rules are upstream's own: `MapTreeMethodToUpdaters` (`src/gbm/gbtree.cc`)
+/// has no GPU entry for `exact`, and there is no SYCL backend in this build.
+/// They are stated against the fixture's own configuration rather than against
+/// a list of case names, so a fixture added later is classified by what it asks
+/// for rather than by whether someone remembered to list it.
+#[cfg(feature = "gpu")]
+fn device_refusal(cfg: &BTreeMap<String, String>) -> Option<&'static str> {
+    let updater = cfg.get("updater").map(String::as_str).unwrap_or("");
+    let names = |u: &str| updater.split(',').any(|part| part.trim() == u);
+    if cfg.get("tree_method").map(String::as_str) == Some("exact") || names("grow_colmaker") {
+        return Some("the `exact` updater has no GPU implementation, as upstream");
+    }
+    if updater.split(',').any(|part| part.trim().ends_with("_sycl")) {
+        return Some("there is no SYCL backend in this build");
+    }
+    None
+}
+
+/// **Every string-valued parameter must drive `device=cuda` exactly as it
+/// drives the CPU.**
+///
+/// This is what "full parameter support on both devices" has to mean if it is
+/// to mean anything: not that the device *accepts* the parameter, but that one
+/// round of it produces the identical tree. Bit-identical is the right bar and
+/// not an optimistic one — both paths see the same gradients on round one, and
+/// although the device sums quantised `i64` bins where the CPU sums `f64`, the
+/// split arithmetic that decides the tree agrees exactly.
+///
+/// Together with the CPU cases above being pinned to XGBoost 3.4.0, this pins
+/// the *device* fit to XGBoost as well — the only way to pin it at all on a
+/// machine with no NVIDIA GPU, where upstream cannot produce a GPU fixture to
+/// compare against (see [`gpu_cases_are_honest_about_the_device`]).
+#[cfg(feature = "gpu")]
+#[test]
+fn every_string_parameter_fits_the_same_on_cpu_and_on_the_device() {
+    let mut report = Report::default();
+    let mut refused = 0usize;
+
+    for case in cases().into_iter().filter(|c| c.outcome == "ok" || c.requires_gpu) {
+        let cfg = config_map(&load(&case.name));
+        if let Some(reason) = device_refusal(&cfg) {
+            // Refusing is acceptable only if it is *this* refusal, said out loud.
+            match train_case_on(&case, Device::cuda(0), 1) {
+                Ok(_) => report.record(
+                    &case,
+                    Some(format!("expected a refusal ({reason}), but the device fit ran")),
+                ),
+                Err(e) => {
+                    refused += 1;
+                    if !(e.contains("device") || e.contains("exact") || e.contains("SYCL")) {
+                        report.record(&case, Some(format!("refused without naming why: {e}")));
+                    }
+                }
+            }
+            continue;
+        }
+
+        let detail = match (train_case_on(&case, Device::Cpu, 1), train_case_on(&case, Device::cuda(0), 1)) {
+            (Err(c), _) => Some(format!("the CPU fit itself failed: {c}")),
+            (Ok(_), Err(g)) => Some(format!("the device refused it: {g}")),
+            (Ok(cpu), Ok(gpu)) => diff_models(&cpu, &gpu, &load_dataset(&case.data)),
+        };
+        report.record(&case, detail);
+    }
+
+    assert!(refused > 0, "no case exercised a documented device refusal");
+    report.finish("one-round device parity");
+}
+
+/// Describe the first way two fits differ: the ensemble first, then what it
+/// predicts. Integers are compared exactly, and so are the predictions — one
+/// round of the same gradients leaves no room for a tolerance.
+#[cfg(feature = "gpu")]
+fn diff_models(
+    cpu: &xgboost_rs::Booster,
+    gpu: &xgboost_rs::Booster,
+    dmat: &DMatrix,
+) -> Option<String> {
+    let booster_of = |b: &xgboost_rs::Booster| -> Value {
+        let m: Value = serde_json::from_str(&b.save_model()).unwrap();
+        m["learner"]["gradient_booster"].clone()
+    };
+    let (c, g) = (booster_of(cpu), booster_of(gpu));
+    let trees = |v: &Value| v["model"]["trees"].as_array().cloned().unwrap_or_default();
+    let (ct, gt) = (trees(&c), trees(&g));
+    if ct.len() != gt.len() {
+        return Some(format!("tree count: cpu {} != gpu {}", ct.len(), gt.len()));
+    }
+    for (i, (a, b)) in ct.iter().zip(&gt).enumerate() {
+        // Compare every field the model records, not a list written here: a
+        // field added to the serialiser must not slip through unchecked.
+        for (field, want) in a.as_object().expect("a tree is a JSON object") {
+            let got = &b[field];
+            if got == want {
+                continue;
+            }
+            // `loss_changes` is the one field allowed to drift, to the SPEC's
+            // ordinary `1e-5` relative bar or [`GAIN_ABS_TOL`], whichever is
+            // looser. The backend evaluates the gain's division at `f64` and
+            // narrows once, so it does not reproduce
+            // `CalcGainGivenWeight`'s narrow-before-divide; and because a gain
+            // is the *difference* of two such quantities, a small gain
+            // subtracted out of large sums loses relative precision to
+            // cancellation — which is what the absolute floor covers. It is a
+            // recorded diagnostic, not a decision: which feature, which
+            // threshold, which default direction and what the leaf is worth
+            // are all pinned bit-for-bit by the fields around it.
+            if field == "loss_changes"
+                && let (Some(w), Some(g)) = (want.as_array(), got.as_array())
+                && w.len() == g.len()
+                && w.iter().zip(g).all(|(x, y)| {
+                    let (x, y) = (x.as_f64().unwrap_or(f64::NAN), y.as_f64().unwrap_or(f64::NAN));
+                    close(y, x) || (x - y).abs() <= GAIN_ABS_TOL
+                })
+            {
+                continue;
+            }
+            if field == "loss_changes"
+                && let (Some(w), Some(g)) = (want.as_array(), got.as_array())
+                && w.len() == g.len()
+            {
+                let worst = w
+                    .iter()
+                    .zip(g)
+                    .map(|(x, y)| {
+                        let (x, y) = (x.as_f64().unwrap(), y.as_f64().unwrap());
+                        ((x - y).abs() / x.abs().max(1.0), x, y)
+                    })
+                    .max_by(|a, b| a.0.total_cmp(&b.0))
+                    .unwrap();
+                return Some(format!(
+                    "tree {i}: `loss_changes` worst relative gap {:.3e} (cpu {} vs gpu {})",
+                    worst.0, worst.1, worst.2
+                ));
+            }
+            let where_ = match (want.as_array(), got.as_array()) {
+                (Some(w), Some(g)) if w.len() != g.len() => {
+                    format!(" (cpu has {} entries, gpu {})", w.len(), g.len())
+                }
+                (Some(w), Some(g)) => match w.iter().zip(g).position(|(x, y)| x != y) {
+                    Some(k) => format!(" at [{k}]: cpu {} != gpu {}", w[k], g[k]),
+                    None => String::new(),
+                },
+                _ => String::new(),
+            };
+            return Some(format!("tree {i}: `{field}` differs{where_}"));
+        }
+    }
+    // Anything outside the tree arrays — the tree count, `tree_info`, the
+    // dropout weights — must agree exactly.
+    for (key, want) in c.as_object().expect("the booster is a JSON object") {
+        if key != "model" && g[key] != *want {
+            return Some(format!("`{key}` differs outside the trees"));
+        }
+    }
+    for key in ["gbtree_model_param", "iteration_indptr", "tree_info"] {
+        if c["model"][key] != g["model"][key] {
+            return Some(format!("`model.{key}` differs"));
+        }
+    }
+    for (i, (a, b)) in cpu.predict(dmat).iter().zip(&gpu.predict(dmat)).enumerate() {
+        if a != b {
+            return Some(format!("prediction[{i}]: cpu {a} != gpu {b}"));
+        }
+    }
+    None
 }

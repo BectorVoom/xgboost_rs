@@ -21,7 +21,7 @@ use xgboost_rs::parameters::{
     GrowPolicy, LambdaRankPairMethod, LambdaRankParameters, LearningTaskParameters,
     LinearBoosterParameters, LinearUpdater, MonotoneConstraint, MultiStrategy, Objective,
     ProcessType, SamplingMethod, SyclKind, ToConfig, TrainingParameters, TreeBoosterParameters,
-    TreeMethod, TreeUpdaterName, VerboseEval, Verbosity,
+    TreeMethod, TreeUpdaterName, UpdaterDevice, VerboseEval, Verbosity,
 };
 use xgboost_rs::{DMatrix, api};
 
@@ -632,6 +632,11 @@ fn both_sampling_method_spellings_select_a_sampler() {
 ///
 /// The ones that are refused are those whose device this build has no code
 /// for; a caller who names them gets an error, never a quiet substitution.
+///
+/// Each updater is run on the device it is *for*
+/// ([`TreeUpdaterName::device_class`]): naming a CUDA updater while `device`
+/// says `cpu` is its own refusal, covered by
+/// [`an_updater_must_match_the_device`].
 #[test]
 fn every_updater_spelling_is_honoured_or_rejected_by_name() {
     const CPU_UPDATERS: &[TreeUpdaterName] = &[
@@ -641,24 +646,32 @@ fn every_updater_spelling_is_honoured_or_rejected_by_name() {
         TreeUpdaterName::Prune,
         TreeUpdaterName::Refresh,
     ];
-    // `grow_gpu_hist` is implemented too, but only when the kernels are built.
+    // The CUDA updaters are implemented too, but only when the kernels are built.
     let implemented = |u: TreeUpdaterName| {
         CPU_UPDATERS.contains(&u)
-            || (cfg!(feature = "gpu") && u == TreeUpdaterName::GrowGpuHist)
+            || (cfg!(feature = "gpu")
+                && matches!(u, TreeUpdaterName::GrowGpuHist | TreeUpdaterName::GrowGpuApprox))
     };
     let d = universal_data(100);
     for &updater in TreeUpdaterName::ALL {
         // A tree-modifying updater cannot lead the pipeline, so pair it with a
         // grower — which is the only sequence the parameter surface accepts.
+        // The grower has to be one for the same device, for the same reason.
+        let device = match updater.device_class() {
+            Some(UpdaterDevice::Cuda) => Device::cuda(0),
+            Some(UpdaterDevice::Sycl) => Device::Sycl(SyclKind::Default, None),
+            Some(UpdaterDevice::Cpu) | None => Device::Cpu,
+        };
         let sequence = if updater.can_modify_tree() {
             vec![TreeUpdaterName::GrowQuantileHistMaker, updater]
         } else {
             vec![updater]
         };
-        let p = training(
+        let mut p = training(
             LearningTaskParameters::default(),
             TreeBoosterParameters { updater: Some(sequence), max_depth: 4, ..Default::default() },
         );
+        p.booster.general.device = device;
         match api::train(&p, &d, &[]) {
             Ok(_) => assert!(
                 implemented(updater),
@@ -669,12 +682,71 @@ fn every_updater_spelling_is_honoured_or_rejected_by_name() {
                     !implemented(updater),
                     "`{updater}` is implemented but was rejected: {e}"
                 );
+                let text = e.to_string();
                 assert!(
-                    e.to_string().contains("tree_method") || e.to_string().contains("updater"),
+                    text.contains("tree_method")
+                        || text.contains("updater")
+                        || text.contains("device"),
                     "`{updater}` was rejected without naming the parameter: {e}"
                 );
             }
         }
+    }
+}
+
+/// An explicitly named grower must match `device`, rather than quietly
+/// deciding the fit's device for it.
+///
+/// This is the hole an explicit `updater` opens in the `tree_method` rules:
+/// `tree_method=exact` is refused on CUDA, but `updater=grow_colmaker` used to
+/// walk straight past that check and run the CPU grower while `device` said
+/// `cuda` — and `updater=grow_gpu_hist` did the mirror image, running on the
+/// device while `device` said `cpu`. Both are silent substitutions of the one
+/// parameter the caller was most explicit about.
+#[test]
+fn an_updater_must_match_the_device() {
+    let d = universal_data(100);
+    let cases: &[(TreeUpdaterName, Device)] = &[
+        (TreeUpdaterName::GrowColMaker, Device::cuda(0)),
+        (TreeUpdaterName::GrowQuantileHistMaker, Device::cuda(0)),
+        (TreeUpdaterName::GrowHistMaker, Device::cuda(0)),
+        (TreeUpdaterName::GrowGpuHist, Device::Cpu),
+        (TreeUpdaterName::GrowGpuApprox, Device::Cpu),
+        (TreeUpdaterName::GrowQuantileHistMakerSycl, Device::Cpu),
+    ];
+    for &(updater, device) in cases {
+        let mut p = training(
+            LearningTaskParameters::default(),
+            TreeBoosterParameters {
+                updater: Some(vec![updater]),
+                max_depth: 4,
+                ..Default::default()
+            },
+        );
+        p.booster.general.device = device;
+        let err = api::train(&p, &d, &[])
+            .err()
+            .unwrap_or_else(|| panic!("`{updater}` on device `{device}` must be refused"));
+        let text = err.to_string();
+        assert!(
+            text.contains("updater") && text.contains(&device.to_string()),
+            "the refusal must name both the updater and the device, got: {err}"
+        );
+    }
+
+    // The tree-modifying updaters have no device of their own and must keep
+    // working next to a grower on either device.
+    for modifier in [TreeUpdaterName::Prune, TreeUpdaterName::Refresh] {
+        let mut p = training(
+            LearningTaskParameters::default(),
+            TreeBoosterParameters {
+                updater: Some(vec![TreeUpdaterName::GrowQuantileHistMaker, modifier]),
+                max_depth: 4,
+                ..Default::default()
+            },
+        );
+        p.booster.general.device = Device::Cpu;
+        api::train(&p, &d, &[]).unwrap_or_else(|e| panic!("`{modifier}` on the CPU: {e}"));
     }
 }
 

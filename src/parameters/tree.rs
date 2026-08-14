@@ -8,6 +8,8 @@
 //! (`src/tree/updater_colmaker.cc`) and `LearnerTrainParam::multi_strategy`
 //! (`src/learner.cc`).
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use super::config::{ConfigEntry, ToConfig, push, push_bool, push_opt};
@@ -103,12 +105,60 @@ str_enum! {
     default = GrowQuantileHistMaker;
 }
 
+/// The kind of processor an updater is built for.
+///
+/// Only the *growers* have one. `prune` and `refresh` rewrite a finished tree
+/// out of node statistics and run wherever the fit does, which is why
+/// [`TreeUpdaterName::device_class`] returns `None` for them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdaterDevice {
+    /// `grow_colmaker`, `grow_histmaker`, `grow_quantile_histmaker`.
+    Cpu,
+    /// `grow_gpu_hist`, `grow_gpu_approx`.
+    Cuda,
+    /// `grow_quantile_histmaker_sycl`.
+    Sycl,
+}
+
+impl UpdaterDevice {
+    /// Whether an updater of this class can run on `device`.
+    pub fn matches(self, device: Device) -> bool {
+        match self {
+            Self::Cpu => device.is_cpu(),
+            Self::Cuda => device.is_cuda(),
+            Self::Sycl => device.is_sycl(),
+        }
+    }
+}
+
+impl fmt::Display for UpdaterDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Cpu => "the CPU",
+            Self::Cuda => "CUDA",
+            Self::Sycl => "SYCL",
+        })
+    }
+}
+
 impl TreeUpdaterName {
     /// Whether this updater rewrites trees that already exist, rather than
     /// growing new ones. Mirrors `TreeUpdater::CanModifyTree`; it is what
     /// decides which updaters `process_type=update` accepts.
     pub const fn can_modify_tree(self) -> bool {
         matches!(self, Self::Prune | Self::Refresh)
+    }
+
+    /// The processor this updater is built for, or `None` if it runs anywhere.
+    pub const fn device_class(self) -> Option<UpdaterDevice> {
+        match self {
+            Self::GrowColMaker | Self::GrowHistMaker | Self::GrowQuantileHistMaker => {
+                Some(UpdaterDevice::Cpu)
+            }
+            Self::GrowGpuHist | Self::GrowGpuApprox => Some(UpdaterDevice::Cuda),
+            Self::GrowQuantileHistMakerSycl => Some(UpdaterDevice::Sycl),
+            Self::Prune | Self::Refresh => None,
+        }
     }
 }
 
@@ -291,6 +341,19 @@ impl TreeBoosterParameters {
         use TreeUpdaterName::*;
 
         if let Some(updater) = &self.updater {
+            for named in updater {
+                if let Some(wanted) = named.device_class()
+                    && !wanted.matches(device)
+                {
+                    return Err(Error::invalid(
+                        "updater",
+                        format!(
+                            "the `{named}` updater runs on {wanted}, but device is `{device}`; \
+                             name an updater for this device, or set `device` to match"
+                        ),
+                    ));
+                }
+            }
             return Ok(updater.clone());
         }
         Ok(match self.tree_method {

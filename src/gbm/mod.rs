@@ -335,8 +335,12 @@ impl GBTree {
                 }
             }
             // `approx` re-sketches per round from the current hessians, so
-            // there is nothing to build ahead of time.
+            // there is nothing to build ahead of time — on either device. The
+            // GPU variant differs only in what it does with the cuts once it
+            // has them, which is why it shares this arm.
             Some(TreeUpdaterName::GrowHistMaker) => {}
+            #[cfg(feature = "gpu")]
+            Some(TreeUpdaterName::GrowGpuApprox) => {}
             // The GPU grower bins into its own ELLPACK and never reads the
             // CPU binned matrix, so only the cuts are built here.
             #[cfg(feature = "gpu")]
@@ -549,8 +553,16 @@ impl GBTree {
 
         // `approx` rebuilds its binned matrix from each group's hessians, so
         // it cannot share one grower across the round the way the other two do.
-        if kind == TreeUpdaterName::GrowHistMaker {
-            return self.grow_round_approx(ctx, dtrain, gpair, preds, n_groups, n_rows, new_weight);
+        // True of the device variant too: what makes a fit `approx` is the
+        // per-round re-sketch, not which processor grows the tree from it.
+        #[cfg(feature = "gpu")]
+        let is_approx =
+            matches!(kind, TreeUpdaterName::GrowHistMaker | TreeUpdaterName::GrowGpuApprox);
+        #[cfg(not(feature = "gpu"))]
+        let is_approx = kind == TreeUpdaterName::GrowHistMaker;
+        if is_approx {
+            return self
+                .grow_round_approx(ctx, dtrain, gpair, preds, n_groups, n_rows, new_weight, kind);
         }
 
         let sampler = RowSampler::new(self.param.sampling_method, self.param.subsample);
@@ -747,6 +759,13 @@ impl GBTree {
     /// differences, both of which upstream has too — the row sample is drawn
     /// once per group rather than once per tree (the sketch has to be built
     /// from *some* sample), and the binned matrix is rebuilt per group.
+    ///
+    /// `kind` selects where the tree is then grown from those cuts:
+    /// `grow_histmaker` on the CPU, `grow_gpu_approx` on the device. The sketch
+    /// itself is the same code either way, which is what makes the two fits
+    /// comparable — and is upstream's arrangement too, where
+    /// `GlobalApproxUpdater` and `GPUGlobalApproxMaker` differ in their device
+    /// but not in what defines the method.
     #[allow(clippy::too_many_arguments)]
     fn grow_round_approx(
         &mut self,
@@ -757,9 +776,17 @@ impl GBTree {
         n_groups: usize,
         n_rows: usize,
         new_weight: f32,
+        kind: TreeUpdaterName,
     ) -> crate::Result<()> {
         let sampler = RowSampler::new(self.param.sampling_method, self.param.subsample);
         let is_sampling = sampler.is_sampling(n_rows);
+        #[cfg(feature = "gpu")]
+        let on_device = kind == TreeUpdaterName::GrowGpuApprox;
+        #[cfg(not(feature = "gpu"))]
+        let on_device = {
+            let _ = kind;
+            false
+        };
 
         for gid in 0..n_groups {
             let mut group_gpair: Vec<GradientPair> = if n_groups == 1 {
@@ -774,14 +801,53 @@ impl GBTree {
 
             // Skipped once built when the objective's hessian is constant:
             // re-sketching would give the same cuts, and upstream skips it too.
-            if !(self.constant_hessian && self.gindex.is_some()) {
-                self.gindex =
-                    Some(build_approx_index(dtrain, &self.param, &group_gpair)?);
+            #[cfg(feature = "gpu")]
+            let already_binned =
+                if on_device { self.gpu_grower.is_some() } else { self.gindex.is_some() };
+            #[cfg(not(feature = "gpu"))]
+            let already_binned = self.gindex.is_some();
+
+            if !(self.constant_hessian && already_binned) {
+                if on_device {
+                    #[cfg(feature = "gpu")]
+                    {
+                        // Only the cuts are wanted here: the device grower bins
+                        // into its own ELLPACK and never reads a `GHistIndex`.
+                        // Rebuilding the grower is what re-bins and re-uploads,
+                        // which is the cost `approx` pays on either device.
+                        let cuts = approx_cuts(dtrain, &self.param, &group_gpair)?;
+                        let ordinal =
+                            self.param.device.ordinal().unwrap_or(0).max(0) as usize;
+                        self.gpu_grower = Some(crate::gpu::grower::GpuHistGrower::new(
+                            crate::gpu::default_client(ordinal),
+                            dtrain,
+                            cuts,
+                            self.param.clone(),
+                        )?);
+                    }
+                } else {
+                    self.gindex = Some(build_approx_index(dtrain, &self.param, &group_gpair)?);
+                }
             }
 
+            #[cfg(feature = "gpu")]
+            let gpu = if on_device { self.gpu_grower.take() } else { None };
             let param = &self.param;
-            let mut grower =
-                HistGrower::new(param, self.gindex.as_ref().expect("rebuilt above"), dtrain);
+            #[cfg(feature = "gpu")]
+            let mut grower = match gpu {
+                Some(g) => Grower::Gpu(Box::new(g), None),
+                None => Grower::Hist(HistGrower::new(
+                    param,
+                    self.gindex.as_ref().expect("rebuilt above"),
+                    dtrain,
+                )),
+            };
+            #[cfg(not(feature = "gpu"))]
+            let mut grower = Grower::Hist(HistGrower::new(
+                param,
+                self.gindex.as_ref().expect("rebuilt above"),
+                dtrain,
+            ));
             for i in 0..self.param.num_parallel_tree {
                 if i > 0 {
                     grower.reset();
@@ -804,6 +870,12 @@ impl GBTree {
                 self.model.trees.push(tree);
                 self.model.tree_info.push(gid as u32);
                 self.model.tree_weight.push(new_weight);
+            }
+            // Hand the device grower back before the next group re-sketches:
+            // under a constant hessian that group reuses this very ELLPACK.
+            #[cfg(feature = "gpu")]
+            if let Grower::Gpu(g, _) = grower {
+                self.gpu_grower = Some(*g);
             }
         }
         Ok(())
@@ -907,11 +979,25 @@ fn build_approx_index(
     param: &TrainParam,
     gpair: &[GradientPair],
 ) -> crate::Result<GHistIndex> {
+    let cuts = approx_cuts(dtrain, param, gpair)?;
+    crate::data::gradient_index::build_gradient_index_with(dtrain, &cuts, param.sparse_threshold)
+}
+
+/// The `approx` sketch: quantile cuts weighted by each row's hessian.
+///
+/// This is what makes the method `approx` rather than `hist`, and it is the
+/// half both devices share — only what is done with the cuts afterwards
+/// differs, so a CPU and a device `approx` fit bin against identical
+/// boundaries.
+fn approx_cuts(
+    dtrain: &DMatrix,
+    param: &TrainParam,
+    gpair: &[GradientPair],
+) -> crate::Result<HistogramCuts> {
     let info = dtrain.info();
     let weights: Vec<f32> =
         gpair.iter().enumerate().map(|(r, g)| g.hess * info.weight(r)).collect();
-    let cuts = crate::data::cuts::build_cuts_weighted(dtrain, param.max_bin, Some(&weights))?;
-    crate::data::gradient_index::build_gradient_index_with(dtrain, &cuts, param.sparse_threshold)
+    crate::data::cuts::build_cuts_weighted(dtrain, param.max_bin, Some(&weights))
 }
 
 /// The grower a round runs, chosen by the pipeline's first non-modifying

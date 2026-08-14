@@ -222,6 +222,81 @@ fn matches_with_num_parallel_tree() {
     compare_accuracy(&d, p, 2);
 }
 
+// ------------------------------------------------------- approx on CUDA ----
+
+/// `tree_method=approx` on the device: the sketch is re-run every round from
+/// the current hessians, and the tree is then grown from those cuts on the GPU.
+///
+/// The claim is the same one the whole file makes — one round is bit-identical
+/// to the CPU fit — and it is worth making separately because `approx` reaches
+/// the device grower by a different route: a fresh ELLPACK per round built from
+/// hessian-weighted cuts, rather than the one uploaded once per fit.
+#[test]
+fn approx_matches_the_cpu_fit() {
+    let d = data(2000, 6, 0.0, 61);
+    let approx = |b: xgboost_rs::parameters::TreeBoosterParametersBuilder| {
+        b.tree_method(xgboost_rs::parameters::TreeMethod::Approx).build().unwrap()
+    };
+    compare_exact(&d, approx(TreeBoosterParameters::builder()));
+    compare_exact(&d, approx(TreeBoosterParameters::builder().max_depth(8)));
+    compare_exact(&d, approx(TreeBoosterParameters::builder().max_bin(64)));
+}
+
+#[test]
+fn approx_matches_with_missing_values_and_lossguide() {
+    let d = data(1500, 6, 0.25, 67);
+    compare_exact(
+        &d,
+        TreeBoosterParameters::builder()
+            .tree_method(xgboost_rs::parameters::TreeMethod::Approx)
+            .grow_policy(GrowPolicy::LossGuide)
+            .max_depth(0)
+            .max_leaves(16)
+            .build()
+            .unwrap(),
+    );
+}
+
+/// The interesting case for `approx`: a hessian that actually varies, so the
+/// sketch really is rebuilt each round rather than being reused unchanged.
+/// Under `reg:squarederror` every hessian is `1`, and both devices then skip
+/// the re-sketch — which would leave the per-round path untested.
+#[test]
+fn approx_re_sketches_every_round_on_both_devices() {
+    let d = {
+        let mut d = data(1500, 5, 0.0, 71);
+        // Labels in {0, 1} so the logistic hessian p(1-p) moves with the fit.
+        let y: Vec<f32> = d.info().labels.iter().map(|v| f32::from(*v > 0.0)).collect();
+        d.set_labels(&y).unwrap();
+        d
+    };
+    let tree = TreeBoosterParameters::builder()
+        .tree_method(xgboost_rs::parameters::TreeMethod::Approx)
+        .max_depth(4)
+        .build()
+        .unwrap();
+
+    let logistic = |device: Device| {
+        let mut p = params(device, tree.clone(), 4);
+        p.booster.learning.objective = Objective::BinaryLogistic;
+        p
+    };
+    let (cpu, _) = api::train(&logistic(Device::Cpu), &d, &[]).unwrap();
+    let (gpu, _) = api::train(&logistic(Device::cuda(0)), &d, &[]).unwrap();
+
+    // Four rounds of a varying hessian: the two fits are no longer required to
+    // be bit-identical (round one's leaf values feed round two's gradients),
+    // but they must agree on what they learned.
+    let (cp, gp) = (cpu.predict(&d), gpu.predict(&d));
+    let labels = &d.info().labels;
+    let rmse = |p: &[f32]| -> f64 {
+        (p.iter().zip(labels).map(|(a, b)| ((a - b) as f64).powi(2)).sum::<f64>() / p.len() as f64)
+            .sqrt()
+    };
+    let (c, g) = (rmse(&cp), rmse(&gp));
+    assert!(g <= c * 1.03 && c <= g * 1.03, "approx: cpu rmse {c} vs gpu {g}");
+}
+
 /// One categorical column (membership, not order, drives the label) plus a
 /// couple of ordinary numeric ones — enough to force column sampling and the
 /// numeric evaluator to run alongside the categorical one in the same batch.
