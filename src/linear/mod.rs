@@ -23,7 +23,7 @@
 //!
 //! `coord_descent` is already deterministic upstream and is ported as-is.
 
-mod coordinate;
+pub mod coordinate;
 mod selector;
 
 use crate::context::Context;
@@ -102,6 +102,10 @@ pub struct GBLinear {
     /// The weights as of the start of the current round, so the prediction
     /// cache can be advanced by the difference instead of recomputed.
     round_start_weight: Vec<f32>,
+    /// The transpose and the residual gradients, resident on the device.
+    /// `Some` only for a `device=cuda` fit with the `coord_descent` updater.
+    #[cfg(feature = "gpu")]
+    gpu: Option<crate::gpu::linear::GpuLinear<crate::gpu::DefaultRuntime>>,
 }
 
 impl GBLinear {
@@ -116,6 +120,8 @@ impl GBLinear {
             is_converged: false,
             gpair: Vec::new(),
             round_start_weight: Vec::new(),
+            #[cfg(feature = "gpu")]
+            gpu: None,
         }
     }
 
@@ -131,6 +137,8 @@ impl GBLinear {
             is_converged: false,
             gpair: Vec::new(),
             round_start_weight: Vec::new(),
+            #[cfg(feature = "gpu")]
+            gpu: None,
         }
     }
 
@@ -186,7 +194,16 @@ impl GBLinear {
             self.gpair.extend_from_slice(gpair);
             let n_rows = dtrain.num_row();
             match self.param.updater {
+                // `shotgun` is hogwild parallel coordinate descent and has no
+                // device counterpart, upstream or here; it runs on the CPU
+                // whatever `device` says, which is what
+                // `BoosterParameters::warnings` warns about.
                 LinearUpdater::Shotgun => self.shotgun(ctx, n_rows),
+                #[cfg(feature = "gpu")]
+                LinearUpdater::CoordDescent if ctx.device.is_cuda() => {
+                    self.configure_device(ctx, n_rows);
+                    self.coord_descent_gpu(ctx, n_rows);
+                }
                 LinearUpdater::CoordDescent => self.coord_descent(ctx, n_rows),
             }
         }
@@ -355,6 +372,115 @@ impl GBLinear {
                 }
             }
         }
+        self.pages = Some(pages);
+    }
+
+    /// Upload the transpose, once per fit. Idempotent.
+    #[cfg(feature = "gpu")]
+    fn configure_device(&mut self, ctx: &Context, n_rows: usize) {
+        if self.gpu.is_some() {
+            return;
+        }
+        let ordinal = ctx.device.ordinal().unwrap_or(0).max(0) as usize;
+        self.gpu = Some(crate::gpu::linear::GpuLinear::new(
+            crate::gpu::default_client(ordinal),
+            self.pages.as_ref().expect("configured"),
+            n_rows,
+            self.model.num_output_group,
+        ));
+    }
+
+    /// [`coord_descent`](Self::coord_descent) with both O(nnz) passes on the
+    /// device: upstream's `GPUCoordinateUpdater`.
+    ///
+    /// Step for step the same loop, and deliberately so — the device sums a
+    /// column in the same fixed block order the CPU does
+    /// (`crate::gpu::linear`), so the two produce the *same* model rather than
+    /// two close ones, and `tests/gpu_linear.rs` holds them to that.
+    ///
+    /// The gradients live on the device between features, because that is the
+    /// point: each step corrects them in place and the next column's sum reads
+    /// them back. They come home only when a feature selector wants to score
+    /// features by them, which two of the five do.
+    #[cfg(feature = "gpu")]
+    fn coord_descent_gpu(&mut self, ctx: &mut Context, n_rows: usize) {
+        let (alpha, lambda) = self.penalties();
+        let n_features = self.model.num_feature;
+        let n_groups = self.model.num_output_group;
+        let lr = self.param.eta as f64;
+        // Only `greedy` and `thrifty` score features by the residuals; for the
+        // other three the host copy is never read and never needs fetching.
+        let selector_reads_gradients = matches!(
+            self.param.feature_selector,
+            FeatureSelector::Greedy | FeatureSelector::Thrifty
+        );
+
+        let pages = self.pages.take().expect("configured");
+        let gpu = self.gpu.as_mut().expect("configured above");
+        gpu.upload_gpair(&self.gpair);
+
+        // The intercepts first, exactly as `update_bias` does.
+        for gid in 0..n_groups {
+            let (g, h) = gpu.bias_gradient(gid);
+            let dbias = (lr * coordinate_delta_bias(g, h)) as f32;
+            self.model.weight[n_features * n_groups + gid] += dbias;
+            gpu.update_bias_residual(gid, dbias);
+        }
+
+        if selector_reads_gradients {
+            gpu.download_gpair(&mut self.gpair);
+        }
+        self.selector.setup(
+            ctx,
+            &self.model.weight,
+            &self.gpair,
+            &pages,
+            n_features,
+            n_groups,
+            alpha,
+            lambda,
+            self.param.top_k,
+        );
+
+        for gid in 0..n_groups {
+            for i in 0..n_features {
+                if selector_reads_gradients {
+                    gpu.download_gpair(&mut self.gpair);
+                }
+                let Some(fidx) = self.selector.next_feature(
+                    ctx,
+                    i,
+                    &self.model.weight,
+                    &self.gpair,
+                    &pages,
+                    n_features,
+                    gid,
+                    n_groups,
+                    alpha,
+                    lambda,
+                ) else {
+                    break;
+                };
+                let (mut g, mut h) = (0.0f64, 0.0f64);
+                for page in 0..gpu.num_pages() {
+                    let (pg, ph) = gpu.column_gradient(page, fidx, gid);
+                    g += pg;
+                    h += ph;
+                }
+                let w = self.model.weight[fidx * n_groups + gid];
+                let dw = (lr * coordinate_delta(g, h, w as f64, alpha, lambda)) as f32;
+                self.model.weight[fidx * n_groups + gid] = w + dw;
+                for page in 0..gpu.num_pages() {
+                    gpu.update_residual(page, fidx, gid, dw);
+                }
+            }
+        }
+
+        // The round's residuals are the next round's starting point only
+        // through the model, but `check_convergence` and the tests read the
+        // host copy, so it is left in step with the device.
+        gpu.download_gpair(&mut self.gpair);
+        let _ = n_rows;
         self.pages = Some(pages);
     }
 

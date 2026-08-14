@@ -7,7 +7,7 @@
 //! row sample advances it, so where a draw happens in the sequence is part of
 //! the model's definition.
 
-use crate::parameters::{GeneralParameters, LearningTaskParameters, Verbosity};
+use crate::parameters::{Device, GeneralParameters, LearningTaskParameters, Verbosity};
 use crate::rng::Mt19937;
 
 /// `LearnerImpl::kRandSeedMagic`, the multiplier `seed_per_iteration` uses.
@@ -24,6 +24,10 @@ pub struct Context {
     pub seed_per_iteration: bool,
     /// How much the fit reports on stderr.
     pub verbosity: Verbosity,
+    /// Which processor the fit runs on, upstream's `Context::Device()`. The
+    /// tree boosters read it through their resolved updater; `gblinear` has no
+    /// updater name of its own for the device, so it reads it from here.
+    pub device: Device,
     rng: Mt19937,
 }
 
@@ -41,6 +45,7 @@ impl Context {
             seed: learning.seed,
             seed_per_iteration: learning.seed_per_iteration,
             verbosity: general.verbosity,
+            device: general.device,
             // `Learner::Configure` seeds the engine from `seed`; the narrowing
             // to the engine's 32-bit seed type is C++'s and is reproduced here.
             rng: Mt19937::new(learning.seed as u32),

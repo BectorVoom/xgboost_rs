@@ -71,3 +71,8 @@ required-features = ["gpu"]
 name = "gpu_training"
 path = "tests/gpu_training.rs"
 required-features = ["gpu"]
+
+[[test]]
+name = "gpu_linear"
+path = "tests/gpu_linear.rs"
+required-features = ["gpu"]

@@ -314,10 +314,14 @@ fn validation_errors_name_the_offending_parameter() {
         ),
         (
             "device",
-            BoosterParameters::builder()
-                .general(GeneralParameters::builder().device(Device::cuda(0)).build().unwrap())
-                .linear(LinearBoosterParameters::default())
+            // A CUDA updater named while `device` says `cpu`: the refusal has
+            // to name the device, or a caller cannot tell which of the two to
+            // change.
+            TreeBoosterParameters::builder()
+                .updater(vec![TreeUpdaterName::GrowGpuHist])
                 .build()
+                .unwrap()
+                .resolved_updaters(Device::Cpu)
                 .unwrap_err(),
         ),
         ("num_boost_round", TrainingParameters::builder().num_boost_round(0).build().unwrap_err()),

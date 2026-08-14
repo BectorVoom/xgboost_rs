@@ -123,7 +123,7 @@ pub use tree::{
 };
 
 use config::{ConfigEntry as Entry, push};
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 /// Which booster the fit uses, along with that booster's parameters.
 ///
@@ -238,15 +238,6 @@ impl BoosterParameters {
         // time, so reuse it rather than restating the rule.
         self.resolved_updaters()?;
 
-        if matches!(self.booster, BoosterType::Gblinear(_)) && !self.general.device.is_cpu() {
-            return Err(Error::invalid(
-                "device",
-                format!(
-                    "the `gblinear` booster has no GPU implementation; got device `{}`",
-                    self.general.device
-                ),
-            ));
-        }
         Ok(())
     }
 
@@ -267,6 +258,20 @@ impl BoosterParameters {
             warnings.push(
                 "`reg:linear` is deprecated; use `reg:squarederror` instead".to_owned(),
             );
+        }
+        // `shotgun` is hogwild parallel coordinate descent, and neither this
+        // crate nor upstream has a device version of it. Upstream accepts the
+        // pairing silently; saying so is the least this can do, because the
+        // one parameter that then does nothing is `device`.
+        if let BoosterType::Gblinear(linear) = &self.booster
+            && linear.updater == LinearUpdater::Shotgun
+            && !self.general.device.is_cpu()
+        {
+            warnings.push(format!(
+                "the `shotgun` updater has no device implementation and runs on the CPU; \
+                 `device = {}` has no effect. Use `updater = coord_descent` for a device fit",
+                self.general.device
+            ));
         }
         if let Some(tree) = self.booster.tree()
             && tree.subsample == 1.0
@@ -372,13 +377,32 @@ mod tests {
     }
 
     #[test]
-    fn rejects_gblinear_on_gpu() {
-        let err = BoosterParameters::builder()
+    fn accepts_gblinear_on_gpu_and_warns_about_shotgun() {
+        // `coord_descent` has a device implementation and is accepted silently.
+        let coord = BoosterParameters::builder()
+            .general(GeneralParameters::builder().device(Device::cuda(0)).build().unwrap())
+            .linear(
+                LinearBoosterParameters::builder()
+                    .updater(LinearUpdater::CoordDescent)
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        assert!(coord.warnings().is_empty(), "{:?}", coord.warnings());
+
+        // `shotgun` does not, and runs on the CPU — which is worth saying,
+        // because `device` is then the parameter doing nothing.
+        let shotgun = BoosterParameters::builder()
             .general(GeneralParameters::builder().device(Device::cuda(0)).build().unwrap())
             .linear(LinearBoosterParameters::default())
             .build()
-            .unwrap_err();
-        assert!(err.to_string().contains("gblinear"), "{err}");
+            .unwrap();
+        assert!(
+            shotgun.warnings().iter().any(|w| w.contains("shotgun") && w.contains("CPU")),
+            "{:?}",
+            shotgun.warnings()
+        );
 
         BoosterParameters::builder().linear(LinearBoosterParameters::default()).build().unwrap();
     }

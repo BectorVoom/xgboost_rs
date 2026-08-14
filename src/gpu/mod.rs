@@ -6,6 +6,7 @@ pub mod ellpack;
 pub mod evaluate_splits;
 pub mod grower;
 pub mod histogram;
+pub mod linear;
 pub mod quantiser;
 pub mod row_partitioner;
 

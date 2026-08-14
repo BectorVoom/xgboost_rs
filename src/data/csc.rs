@@ -106,6 +106,12 @@ impl CscPage {
     pub fn column_len(&self, fidx: usize) -> usize {
         self.col_ptr[fidx + 1] - self.col_ptr[fidx]
     }
+
+    /// The three arrays behind the page, for a consumer that wants to upload
+    /// the whole transpose rather than walk it a column at a time.
+    pub fn raw(&self) -> (&[usize], &[u32], &[f32]) {
+        (&self.col_ptr, &self.row_idx, &self.value)
+    }
 }
 
 /// Every column-major page of a matrix, in row order.
