@@ -24,13 +24,24 @@ done
 
 META_PATH="tools/kaggle/$META"
 [ -f "$META_PATH" ] || { echo "no such metadata: $META_PATH" >&2; exit 2; }
+
+# The owner comes from whoever the CLI is authenticated as, never from a name
+# written down here. A hardcoded one is wrong the moment the credentials change
+# and fails in a way that reads like a broken config: `datasets create` reports
+# "dataset slugs and hashlink are all null", then the kernel pushes *without*
+# its source and dies on an empty /kaggle/input. The committed metadata carries
+# `KAGGLE_OWNER` and it is substituted here.
+OWNER="$(kaggle config view 2>/dev/null | awk '/^- username:/{print $3}')"
+[ -n "$OWNER" ] || { echo "cannot read the Kaggle username — is the CLI authenticated?" >&2; exit 2; }
+
 SLUG="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$META_PATH")"
+SLUG="${SLUG/KAGGLE_OWNER/$OWNER}"
 CODE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["code_file"])' "$META_PATH")"
-DATASET="yensen2/xgboost-rs-gpu-src"
+DATASET="$OWNER/xgboost-rs-gpu-src"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 
-echo "==> kernel $SLUG (from $CODE)"
+echo "==> owner $OWNER, kernel $SLUG (from $CODE)"
 mkdir -p "$STAGE/data" "$STAGE/kernel"
 
 # The crate, minus build output and the committed fixtures (the generator
@@ -44,7 +55,7 @@ EOF
 
 # Kaggle wants the kernel's metadata under its own fixed name.
 cp "tools/kaggle/$CODE" "$STAGE/kernel/"
-cp "$META_PATH" "$STAGE/kernel/kernel-metadata.json"
+sed "s|KAGGLE_OWNER|$OWNER|g" "$META_PATH" > "$STAGE/kernel/kernel-metadata.json"
 
 echo "==> uploading source dataset"
 if kaggle datasets status "$DATASET" >/dev/null 2>&1; then
