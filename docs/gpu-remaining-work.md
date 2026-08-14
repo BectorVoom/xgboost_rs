@@ -131,6 +131,14 @@ would probably fix this too.
 
 **Speed.** `docs/gpu-benchmarks.md` records that the device path is 5–14×
 slower than XGBoost's `gpu_hist`, with the measured evidence for where the time
-goes. `docs/parameter-performance.md` adds which *parameters* the device is
-disproportionately sensitive to — `lossguide` most of all, because the device
-grows a batch of nodes per launch and loss-guide's queue yields one at a time.
+goes. That is the gap against a *good* GPU implementation; against this crate's
+own CPU path the device does win — `docs/parameter-performance.md` measures a
+T4 at 1.27× its host on a baseline fit and 3.58× at `max_depth = 10`, which is
+the shape to expect, since depth is what gives a level-at-a-time launcher more
+independent work.
+
+The two places it loses are worth knowing before reaching for `device=cuda`:
+`gblinear` (0.61×, because coordinate descent needs the previous feature's
+residuals and so pays a launch and a readback per feature per group per round)
+and anything whose extra work is host-side rather than in the kernels — `dart`
+and `approx` both come out level with the CPU.
