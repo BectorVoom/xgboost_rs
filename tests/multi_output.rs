@@ -98,26 +98,45 @@ fn a_vector_leaf_grows_one_tree_per_round_not_one_per_output() {
 }
 
 /// Each leaf of a vector-leaf tree carries one value per target, and the model
-/// records that in `size_leaf_vector`.
+/// records that the way `MultiTargetTree::SaveModel` does: a leaf-major
+/// `leaf_weights` array, with each leaf's row index stored where an internal
+/// node keeps its right child.
 #[test]
 fn a_vector_leaf_tree_records_its_leaf_size() {
     let d = multi_target_data(400);
     let vector = train(&params(strategy(MultiStrategy::MultiOutputTree), 5), &d);
     for tree in trees(&vector) {
         assert_eq!(tree["tree_param"]["size_leaf_vector"], "2");
-        let n_nodes: usize = tree["tree_param"]["num_nodes"].as_str().unwrap().parse().unwrap();
-        assert_eq!(
-            tree["leaf_values"].as_array().unwrap().len(),
-            n_nodes * 2,
-            "one value per node per target"
-        );
+        let left = tree["left_children"].as_array().unwrap();
+        let right = tree["right_children"].as_array().unwrap();
+        let weights = tree["leaf_weights"].as_array().unwrap();
+
+        let leaves: Vec<usize> =
+            (0..left.len()).filter(|&i| left[i].as_i64().unwrap() < 0).collect();
+        assert_eq!(weights.len(), leaves.len() * 2, "one row per leaf, one value per target");
+
+        // Every leaf names a distinct row, and they are numbered in node order.
+        for (row, &nid) in leaves.iter().enumerate() {
+            assert_eq!(
+                right[nid].as_i64().unwrap(),
+                row as i64,
+                "leaf {nid} must name row {row} of `leaf_weights`"
+            );
+        }
+        // An internal node names a child, never a row.
+        for i in 0..left.len() {
+            if left[i].as_i64().unwrap() >= 0 {
+                assert!(right[i].as_i64().unwrap() > i as i64, "node {i} names a later child");
+            }
+        }
     }
 
-    // The ordinary strategy is unchanged: scalar leaves, no vector array.
+    // The ordinary strategy is unchanged: scalar leaves, and no leaf array at
+    // all — the one output per leaf lives in `split_conditions`.
     let per_output = train(&params(strategy(MultiStrategy::OneOutputPerTree), 5), &d);
     for tree in trees(&per_output) {
         assert_eq!(tree["tree_param"]["size_leaf_vector"], "1");
-        assert!(tree["leaf_values"].as_array().unwrap().is_empty());
+        assert!(tree.get("leaf_weights").is_none(), "a scalar tree carries no leaf array");
     }
 }
 

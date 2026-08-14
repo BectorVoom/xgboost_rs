@@ -134,12 +134,37 @@ fn tree_to_json(id: usize, tree: &RegTree) -> Value {
     let mut loss_changes = Vec::with_capacity(n);
     let mut sum_hessian = Vec::with_capacity(n);
 
+    // A vector leaf's outputs do not fit in `split_conditions`, which holds one
+    // value per node. `MultiTargetTree::SaveModel` puts them in a *leaf-major*
+    // array instead — one row per leaf, not per node — and stores each leaf's
+    // row index in the slot `right_children` would otherwise use for a child.
+    // `split_conditions` on a leaf is then never written, and comes out as the
+    // smallest denormal (`1e-45`), which is reproduced here so the file matches
+    // upstream's byte for byte.
+    let multi = tree.is_multi_target();
+    let mut leaf_weights: Vec<f32> = Vec::new();
+
     for (nid, node) in tree.nodes.iter().enumerate() {
+        let is_leaf = node.is_leaf();
         left.push(node.left as i64);
-        right.push(node.right as i64);
-        parents.push(if node.parent == INVALID_NODE { ROOT_PARENT } else { node.parent as i64 });
+        if multi && is_leaf {
+            right.push((leaf_weights.len() / tree.leaf_size()) as i64);
+            leaf_weights.extend_from_slice(tree.leaf_value(nid));
+            split_conditions.push(f32::from_bits(1));
+        } else {
+            right.push(node.right as i64);
+            split_conditions.push(node.value);
+        }
+        // The two upstream serialisers spell "no parent" differently:
+        // `RegTree` writes `kInvalidNodeId` as an *unsigned* 2147483647,
+        // `MultiTargetTree` writes `-1`. Both are pinned by fixtures, so both
+        // are reproduced rather than unified.
+        parents.push(if node.parent == INVALID_NODE {
+            if multi { -1 } else { ROOT_PARENT }
+        } else {
+            node.parent as i64
+        });
         split_indices.push(node.split_index);
-        split_conditions.push(node.value);
         default_left.push(u8::from(node.default_left));
         base_weights.push(tree.stats[nid].base_weight);
         loss_changes.push(tree.stats[nid].loss_chg);
@@ -171,7 +196,7 @@ fn tree_to_json(id: usize, tree: &RegTree) -> Value {
         categories_sizes.push(categories.len() as i64 - begin);
     }
 
-    json!({
+    let mut doc = json!({
         "base_weights": base_weights,
         "categories": categories,
         "categories_nodes": categories_nodes,
@@ -187,17 +212,19 @@ fn tree_to_json(id: usize, tree: &RegTree) -> Value {
         "split_indices": split_indices,
         "split_type": split_type,
         "sum_hessian": sum_hessian,
-        // A vector-leaf tree's outputs do not fit in `split_conditions`, which
-        // holds one value per node; they ride alongside, as upstream's
-        // `MultiTargetTree` writes them.
-        "leaf_values": tree.leaf_vectors(),
         "tree_param": {
             "num_deleted": tree.num_deleted().to_string(),
             "num_feature": tree.num_feature().to_string(),
             "num_nodes": n.to_string(),
             "size_leaf_vector": tree.leaf_size().to_string(),
         },
-    })
+    });
+    // Only a vector-leaf tree carries the field, as upstream: a scalar tree's
+    // one output per leaf already sits in `split_conditions`.
+    if multi {
+        doc["leaf_weights"] = json!(leaf_weights);
+    }
+    doc
 }
 
 /// Parse a model written by [`save_model`] or by XGBoost.
@@ -426,12 +453,31 @@ fn tree_from_json(t: &Value, num_feature: usize) -> Result<RegTree> {
         .unwrap_or(1)
         .max(1);
     if leaf_size > 1 {
-        let values = float_array(t, "leaf_values")?;
-        if values.len() != n * leaf_size {
+        // Leaf-major on disk, node-major in memory: `right_children` on a leaf
+        // holds that leaf's row in `leaf_weights` rather than a child id, which
+        // is how `MultiTargetTree` stores a tree whose leaves are vectors.
+        let rows = float_array(t, "leaf_weights")?;
+        if rows.len() % leaf_size != 0 {
             return Err(Error::ModelFormat(format!(
-                "`leaf_values` holds {} entries, expected {n} nodes x {leaf_size} outputs",
-                values.len()
+                "`leaf_weights` holds {} entries, not a multiple of {leaf_size} outputs",
+                rows.len()
             )));
+        }
+        let n_rows = rows.len() / leaf_size;
+        let mut values = vec![0.0f32; n * leaf_size];
+        for nid in 0..n {
+            if left[nid] >= 0 {
+                continue; // an internal node carries no leaf value
+            }
+            let row = right[nid];
+            if row < 0 || row as usize >= n_rows {
+                return Err(Error::ModelFormat(format!(
+                    "leaf {nid} names row {row} of {n_rows} in `leaf_weights`"
+                )));
+            }
+            let src = row as usize * leaf_size;
+            values[nid * leaf_size..(nid + 1) * leaf_size]
+                .copy_from_slice(&rows[src..src + leaf_size]);
         }
         tree.set_leaf_vectors(leaf_size, values);
     }

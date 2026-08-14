@@ -82,10 +82,15 @@ fn model(grow_policy: GrowPolicy, max_depth: u32, max_leaves: u32) -> String {
 /// Compare a policy's digests, reporting every mismatch at once.
 ///
 /// These pins move whenever the *binning* changes, because different cut values
-/// put rows in different bins. That is legitimate — the digests were last taken
-/// against the XGBoost 3.4.0 quantile sketch — so a wholesale mismatch here
-/// wants re-pinning, while a single one moving means the scheduling claim above
-/// has been broken. Reporting all of them is what tells those two apart.
+/// put rows in different bins — and also whenever the model *file* changes
+/// shape, since the digest is taken over the saved JSON. Both are legitimate
+/// and both move every pin at once, so a wholesale mismatch here wants
+/// re-pinning while a single one moving means the scheduling claim above has
+/// been broken. Reporting all of them is what tells those two apart.
+///
+/// Last re-pinned when the vector-leaf model format was aligned with
+/// upstream's, which dropped the always-empty leaf array from a scalar tree.
+/// The fits themselves did not move: the oracle files are what say so.
 fn assert_digests(policy: GrowPolicy, cases: &[(u32, u32, &str)]) {
     let mut wrong = Vec::new();
     for &(max_depth, max_leaves, expected) in cases {
@@ -110,9 +115,9 @@ fn depthwise_models_are_unchanged() {
     assert_digests(
         GrowPolicy::DepthWise,
         &[
-            (6, 0, "ce3c5fa0be9c7b33"),
-            (0, 32, "a3eb379392b890b6"),
-            (8, 64, "34359fa302cc0567"),
+            (6, 0, "3238676d5c7b571f"),
+            (0, 32, "58ff1165bcd6b610"),
+            (8, 64, "d5b5ba2ace6476d1"),
         ],
     );
 }
@@ -122,10 +127,10 @@ fn lossguide_models_are_unchanged() {
     assert_digests(
         GrowPolicy::LossGuide,
         &[
-            (0, 16, "224e7c05017f4455"),
-            (0, 64, "288e696e9f9161a5"),
-            (0, 256, "8c12ab3048eb4dee"),
-            (6, 64, "7d225dbf494d1445"),
+            (0, 16, "951d30ca423d879d"),
+            (0, 64, "ab47ac96ae4a0063"),
+            (0, 256, "f15fab677e57bf06"),
+            (6, 64, "629857552727447d"),
         ],
     );
 }

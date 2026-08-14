@@ -459,15 +459,21 @@ fn multi_output_tree_matches_with_regularisation_and_constraints() {
     compare_exact(&d, p.clone());
     compare_accuracy(&d, p, 3);
 
-    let p = vector_leaf(
-        TreeBoosterParameters::builder()
-            .monotone_constraints(
-                [Increasing, Unconstrained, Unconstrained, Unconstrained, Increasing].to_vec(),
-            )
-            .build()
-            .unwrap(),
-    );
-    compare_exact(&d, p);
+    // Depth by depth, so a divergence names the level it starts at rather than
+    // showing up as two trees of different sizes.
+    for max_depth in [1u32, 2, 3, 4, 6] {
+        eprintln!("--- constrained vector leaf at max_depth {max_depth}");
+        let p = vector_leaf(
+            TreeBoosterParameters::builder()
+                .max_depth(max_depth)
+                .monotone_constraints(
+                    [Increasing, Unconstrained, Unconstrained, Unconstrained, Increasing].to_vec(),
+                )
+                .build()
+                .unwrap(),
+        );
+        compare_exact(&d, p);
+    }
 }
 
 /// Column sampling draws per node, and the draw order is part of the model, so

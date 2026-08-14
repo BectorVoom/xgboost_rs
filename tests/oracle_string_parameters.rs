@@ -856,8 +856,8 @@ fn dump_one_case() {
     println!("            want {} {}", fixture["metric"], fixture["metric_history"]);
 
     let want = &fixture["trees"][0];
-    for key in ["left_children", "right_children", "split_indices", "split_conditions",
-                "default_left", "sum_hessian", "base_weights"] {
+    for key in ["left_children", "right_children", "parents", "split_indices",
+                "split_conditions", "default_left", "sum_hessian", "base_weights"] {
         println!("\n{key}\n  got  {}", got.first().map(|t| t[key].to_string()).unwrap_or_default());
         println!("  want {}", want[key]);
     }

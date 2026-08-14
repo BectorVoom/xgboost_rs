@@ -24,7 +24,7 @@
 use rayon::prelude::*;
 
 use super::model::RegTree;
-use super::param::{GradStats, TrainParam, calc_gain_given_weight, calc_weight};
+use super::param::{GradStats, TrainParam, calc_gain, calc_weight};
 use crate::data::DMatrix;
 use crate::gbm::feature_value;
 use crate::objective::GradientPair;
@@ -80,7 +80,7 @@ pub fn refresh(
 
     // Children always have a higher id than their parent, so one forward pass
     // is enough and the recursion upstream uses is unnecessary.
-    let gain = |s: &GradStats| calc_gain_given_weight(param, s, calc_weight(param, s));
+    let gain = |s: &GradStats| calc_gain(param, s);
     for nid in 0..n_nodes {
         let s = stats[nid];
         let weight = calc_weight(param, &s);

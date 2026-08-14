@@ -106,10 +106,16 @@ fn narrowed_div(a: f32, b: f32) -> f32 {
     a / b
 }
 
-/// Port of `tree::CalcGainGivenWeight`. The `max_delta_step == 0` branch
-/// narrows to `f32` *before* dividing, which is what keeps the reference's
-/// rounding; the other branch is all-`f32`.
+/// Port of `SplitEvaluator::CalcGainGivenWeight`.
+///
+/// The closed form `G²/(H+λ)` is the gain only when `w` really is the
+/// unconstrained optimum, so it is used only when nothing can have moved the
+/// weight away from it — neither `max_delta_step` nor a monotone box. It is
+/// preferred where it applies because it carries less floating point error,
+/// and it narrows to `f32` *before* dividing, which is what keeps the
+/// reference's rounding. The general branch is all-`f32`.
 #[cube]
+#[allow(clippy::too_many_arguments)]
 fn calc_gain_given_weight(
     g: f64,
     h: f64,
@@ -117,9 +123,10 @@ fn calc_gain_given_weight(
     lambda: f32,
     alpha: f32,
     #[comptime] has_mds: bool,
+    #[comptime] has_constraint: bool,
 ) -> f32 {
     if h > 0.0 {
-        if has_mds {
+        if has_mds || has_constraint {
             let gf = f32::cast_from(g);
             let hf = f32::cast_from(h);
             let aw = if w < 0.0 { -w } else { w };
@@ -224,8 +231,8 @@ fn consider_split(
     };
 
     if valid && monotone_ok {
-        let gain = calc_gain_given_weight(lg, lh, wl, lambda, alpha, has_mds)
-            + calc_gain_given_weight(rg, rh, wr, lambda, alpha, has_mds);
+        let gain = calc_gain_given_weight(lg, lh, wl, lambda, alpha, has_mds, has_constraint)
+            + calc_gain_given_weight(rg, rh, wr, lambda, alpha, has_mds, has_constraint);
         let chg = gain - parent_gain;
         if better(chg, rank, s_gain[t], s_rank[t]) {
             s_gain[t] = chg;
@@ -813,8 +820,8 @@ fn consider_split_multi(
         // the order `multi_split_gain` sums them in.
         gain.store(
             gain.read()
-                + calc_gain_given_weight(lgf, lhf, wl, lambda, alpha, has_mds)
-                + calc_gain_given_weight(rgf, rhf, wr, lambda, alpha, has_mds),
+                + calc_gain_given_weight(lgf, lhf, wl, lambda, alpha, has_mds, has_constraint)
+                + calc_gain_given_weight(rgf, rhf, wr, lambda, alpha, has_mds, has_constraint),
         );
 
         tt.store(target + 1u32);

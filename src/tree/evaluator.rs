@@ -13,7 +13,7 @@
 //!   two child weights. The clip is what stops a *later*, deeper split from
 //!   undoing the ordering an earlier one established.
 
-use super::param::{GradStats, TrainParam, calc_gain_given_weight, calc_weight};
+use super::param::{GradStats, TrainParam, calc_gain, calc_gain_given_weight, calc_weight};
 use crate::parameters::MonotoneConstraint;
 
 /// Per-node weight bounds plus the per-feature monotonicity directions.
@@ -90,10 +90,28 @@ impl SplitEvaluator {
         self.apply_bounds(nid, calc_weight(p, stats))
     }
 
+    /// Gain of `stats` at weight `w`, by whichever formula is valid here.
+    ///
+    /// `SplitEvaluator::CalcGainGivenWeight`: with no monotone constraint the
+    /// weight is the unconstrained optimum and the closed form applies, which
+    /// upstream prefers because it carries less floating point error. With a
+    /// constraint the weight may have been clipped into the node's box, and
+    /// the closed form would then report the gain of a weight the node is not
+    /// allowed to take — so the general form is used, and the clipped weight
+    /// is what makes a constrained split unprofitable.
+    #[inline]
+    fn gain_at(&self, p: &TrainParam, stats: &GradStats, w: f32) -> f32 {
+        if self.has_constraint {
+            calc_gain_given_weight(p, stats, w)
+        } else {
+            calc_gain(p, stats)
+        }
+    }
+
     /// Gain of `stats` evaluated at its own bounded weight.
     #[inline]
     pub fn calc_gain(&self, nid: usize, p: &TrainParam, stats: &GradStats) -> f32 {
-        calc_gain_given_weight(p, stats, self.calc_weight(nid, p, stats))
+        self.gain_at(p, stats, self.calc_weight(nid, p, stats))
     }
 
     /// Gain of splitting node `nid` on `fidx` into `left` and `right`, or
@@ -115,8 +133,7 @@ impl SplitEvaluator {
         }
         let wleft = self.calc_weight(nid, p, left);
         let wright = self.calc_weight(nid, p, right);
-        let gain =
-            calc_gain_given_weight(p, left, wleft) + calc_gain_given_weight(p, right, wright);
+        let gain = self.gain_at(p, left, wleft) + self.gain_at(p, right, wright);
 
         if !self.has_constraint {
             return gain;

@@ -191,14 +191,18 @@ pub fn calc_weight(p: &TrainParam, stats: &GradStats) -> f32 {
     dw as f32
 }
 
-/// Loss reduction contributed by a node with the given sums and weight.
+/// Loss reduction of a node whose weight is the *unconstrained* optimum.
 ///
-/// Mirrors `SplitEvaluator::CalcGainGivenWeight`, including the narrowing to
-/// `f32` before the division — that narrowing is what keeps average floating
-/// point error low upstream, and reproducing it is required for tie-for-tie
-/// agreement on split choices.
+/// `tree::CalcGain`. This is the closed form `G²/(H+λ)`, which is only the
+/// gain when the weight really is `-G/(H+λ)` — so it is not usable where a
+/// monotone box may have clipped the weight, and
+/// [`calc_gain_given_weight`] is used there instead.
+///
+/// The narrowing to `f32` *before* the division is upstream's and is kept:
+/// it is what keeps average floating point error low, and reproducing it is
+/// required for tie-for-tie agreement on split choices.
 #[inline]
-pub fn calc_gain_given_weight(p: &TrainParam, stats: &GradStats, w: f32) -> f32 {
+pub fn calc_gain(p: &TrainParam, stats: &GradStats) -> f32 {
     if stats.sum_hess <= 0.0 {
         return 0.0;
     }
@@ -208,7 +212,23 @@ pub fn calc_gain_given_weight(p: &TrainParam, stats: &GradStats, w: f32) -> f32 
         let den = (stats.sum_hess + p.reg_lambda as f64) as f32;
         return num / den;
     }
-    // `tree::CalcGainGivenWeight<ParamT, float>`: all-`f32` arithmetic.
+    calc_gain_given_weight(p, stats, calc_weight(p, stats))
+}
+
+/// Loss reduction contributed by a node **at the weight it will actually
+/// take**.
+///
+/// `tree::CalcGainGivenWeight<ParamT, float>`, all-`f32` arithmetic. Unlike
+/// [`calc_gain`] this reads `w`, which is the whole point: under a monotone
+/// constraint the weight is clipped into the node's box and the closed form
+/// — which assumes the unclipped optimum — would report a gain the split
+/// cannot deliver. Getting that wrong lets a constrained node split where
+/// upstream makes it a leaf.
+#[inline]
+pub fn calc_gain_given_weight(p: &TrainParam, stats: &GradStats, w: f32) -> f32 {
+    if stats.sum_hess <= 0.0 {
+        return 0.0;
+    }
     let (g, h) = (stats.sum_grad as f32, stats.sum_hess as f32);
     -(2.0 * g * w + (h + p.reg_lambda) * w * w + 2.0 * p.reg_alpha * w.abs())
 }
