@@ -92,7 +92,7 @@
 use std::time::Instant;
 
 use xgboost_rs::parameters::{
-    BoosterParameters, BoosterType, DartParameters, EvalMetric, FeatureSelector,
+    BoosterParameters, BoosterType, DartParameters, Device, EvalMetric, FeatureSelector,
     GeneralParameters, GrowPolicy, LearningTaskParameters, LinearBoosterParameters, LinearUpdater,
     MonotoneConstraint, MultiStrategy, Objective, SamplingMethod, TrainingParameters,
     TreeBoosterParameters,
@@ -109,11 +109,22 @@ struct Args {
     threads: u32,
     /// Only run groups whose name contains this.
     filter: Option<String>,
+    /// Which processor the sweep runs on. Every group runs on it, so the two
+    /// devices can be swept separately and their tables read side by side.
+    device: Device,
 }
 
 impl Default for Args {
     fn default() -> Self {
-        Self { rows: 200_000, features: 40, rounds: 10, repeats: 3, threads: 0, filter: None }
+        Self {
+            rows: 200_000,
+            features: 40,
+            rounds: 10,
+            repeats: 3,
+            threads: 0,
+            filter: None,
+            device: Device::Cpu,
+        }
     }
 }
 
@@ -132,6 +143,7 @@ fn parse_args() -> Args {
             "--repeats" => args.repeats = value().parse().unwrap(),
             "--threads" => args.threads = value().parse().unwrap(),
             "--filter" => args.filter = Some(value()),
+            "--device" => args.device = value().parse().expect("a device spelling"),
             other => panic!("unknown argument `{other}`"),
         }
         i += 2;
@@ -301,6 +313,7 @@ fn base_params(tree: TreeBoosterParameters, args: &Args) -> TrainingParameters {
             general: GeneralParameters {
                 nthread: args.threads,
                 verbosity: Verbosity::Silent,
+                device: args.device,
                 ..Default::default()
             },
             learning: LearningTaskParameters::default(),
@@ -355,12 +368,13 @@ fn main() {
     let d = make_data(args.rows, args.features);
 
     println!(
-        "rows={} features={} rounds={} repeats={} threads={}",
+        "rows={} features={} rounds={} repeats={} threads={} device={}",
         args.rows,
         args.features,
         args.rounds,
         args.repeats,
         if args.threads == 0 { xgboost_rs::num_threads() as u32 } else { args.threads },
+        args.device,
     );
     println!();
 

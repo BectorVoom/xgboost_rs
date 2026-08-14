@@ -287,10 +287,35 @@ fn uniform_int_below(rng: &mut Mt19937, n: u64) -> u64 {
 
 /// `std::shuffle`: Fisher-Yates, walking forwards and swapping each element
 /// with a uniformly chosen one at or before it.
+///
+/// Textbook Fisher-Yates draws one number per element. libstdc++ does not: when
+/// the engine's range covers `n²` — which `mt19937` does for every feature or
+/// row count XGBoost can express — it draws **one** number per *pair* of
+/// elements and splits it, `__gen_two_uniform_ints` in `<bits/stl_algo.h>`.
+/// The permutation that produces is a different one, and it is the permutation
+/// the reference binary produced, so it is the one reproduced here.
+///
+/// The pairing needs an even number of elements left to swap, so an even `n`
+/// does the first swap on its own before pairing off the rest.
 pub fn shuffle<T>(items: &mut [T], rng: &mut Mt19937) {
-    for i in 1..items.len() {
-        let j = uniform_int_below(rng, i as u64 + 1) as usize;
-        items.swap(i, j);
+    let n = items.len();
+    if n < 2 {
+        return;
+    }
+    let mut i = 1usize;
+    if n % 2 == 0 {
+        items.swap(i, uniform_int_below(rng, 2) as usize);
+        i += 1;
+    }
+    while i != n {
+        // One draw over `range * (range + 1)` outcomes, read as a two-digit
+        // number in base `range + 1`.
+        let range = i as u64 + 1;
+        let draw = uniform_int_below(rng, range * (range + 1));
+        items.swap(i, (draw / (range + 1)) as usize);
+        i += 1;
+        items.swap(i, (draw % (range + 1)) as usize);
+        i += 1;
     }
 }
 
