@@ -79,6 +79,22 @@ pub trait Objective {
         out: &mut Vec<GradientPair>,
     );
 
+    /// Whether this objective draws from the *session* random engine before
+    /// each gradient computation.
+    ///
+    /// Only `rank:*` under `lambdarank_pair_method=mean` does, and upstream
+    /// draws exactly then (`LambdaRankObj::GetGradient`). The draw has to stay
+    /// conditional: the engine is shared with column and row sampling, so an
+    /// unconditional one would shift every other objective's samples.
+    fn wants_pair_seed(&self) -> bool {
+        false
+    }
+
+    /// Hand over the draw [`wants_pair_seed`](Self::wants_pair_seed) asked for.
+    fn set_pair_seed(&mut self, seed: u32) {
+        let _ = seed;
+    }
+
     /// Map raw margins to the reported prediction scale.
     ///
     /// Takes a `Vec` because `multi:softmax` shortens it: one class index

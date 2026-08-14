@@ -148,11 +148,15 @@ pub struct LambdaRank {
     /// Present only for `lambdarank_unbiased`; sized on the first round, when
     /// the group sizes are known.
     bias: Option<PositionBias>,
+    /// The round's draw from the session engine, which seeds the per-group pair
+    /// sampler. Only `lambdarank_pair_method=mean` samples pairs, so only it
+    /// asks for one.
+    pair_seed: u32,
 }
 
 impl LambdaRank {
     pub fn new(loss: RankLoss, param: LambdaRankParameters) -> Self {
-        Self { loss, param, bias: None }
+        Self { loss, param, bias: None, pair_seed: 0 }
     }
 
     /// `RankingCache::MaxPositionSize` — how many positions the bias is
@@ -280,6 +284,16 @@ impl Objective for LambdaRank {
 
     fn num_output_group(&self, _info: &MetaInfo) -> usize {
         1
+    }
+
+    /// `LambdaRankObj::GetGradient` draws a seed only when it will sample
+    /// pairs, which is `mean` alone — `topk` enumerates them.
+    fn wants_pair_seed(&self) -> bool {
+        !self.has_truncation()
+    }
+
+    fn set_pair_seed(&mut self, seed: u32) {
+        self.pair_seed = seed;
     }
 
     fn get_gradient(&mut self, preds: &[f32], info: &MetaInfo, iter: i32, out: &mut Vec<GradientPair>) {
@@ -425,13 +439,11 @@ impl Objective for LambdaRank {
                     }
                 }
             } else {
-                // `mean`: sample pairs across relevance buckets. Upstream seeds
-                // this from the session engine, which advances every round;
-                // seeding from `(round, group)` instead keeps that
-                // round-to-round variation while making a fit reproducible
-                // without threading the engine into the objective.
-                let mut rnd =
-                    MinStdRand::new((iter as u32).wrapping_mul(1_000_003).wrapping_add(g as u32));
+                // `mean`: sample pairs across relevance buckets, from
+                // `std::minstd_rand rnd(seed + g)` — one engine per group, all
+                // of them offset from the single draw the round took out of the
+                // session engine.
+                let mut rnd = MinStdRand::new(self.pair_seed.wrapping_add(g as u32));
                 // Ranks sorted by label, descending: bucket boundaries.
                 let mut y_sorted: Vec<usize> = (0..cnt).collect();
                 y_sorted.sort_by(|&a, &b| {
@@ -478,12 +490,23 @@ impl Objective for LambdaRank {
                     norm = (1.0 + sum_lambda).log2() / sum_lambda;
                 }
             }
-            let scale = (norm * weight_norm) as f32 * group_weight(g);
-            if scale != 1.0 {
+            // Three `f32` multiplies, not one combined scale: upstream applies
+            // the normalisation in its own pass (and only when it is not 1),
+            // then the group weight and the weight norm in a second, and each
+            // `GradientPair::operator*` rounds to `f32`. Folding them into one
+            // factor rounds once instead of three times, which is enough to
+            // move a split threshold.
+            if norm != 1.0 {
+                let norm = norm as f32;
                 for p in g_out.iter_mut() {
-                    p.grad *= scale;
-                    p.hess *= scale;
+                    p.grad *= norm;
+                    p.hess *= norm;
                 }
+            }
+            let (w, w_norm) = (group_weight(g), weight_norm as f32);
+            for p in g_out.iter_mut() {
+                p.grad = p.grad * w * w_norm;
+                p.hess = p.hess * w * w_norm;
             }
         }
 

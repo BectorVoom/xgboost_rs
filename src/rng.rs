@@ -191,17 +191,24 @@ impl MinStdRand {
 
     /// A uniform integer in `[0, n)`, following libstdc++'s
     /// `uniform_int_distribution` rejection scheme. Returns `0` for `n == 0`.
+    ///
+    /// The distribution works in the engine's range *offset by its minimum*,
+    /// and this engine's is `[1, m - 1]`, not `[0, m - 1]`: the span is
+    /// `m - 2` and every draw has 1 subtracted before scaling. An engine whose
+    /// minimum is 0 — `mt19937`, which [`uniform_int_below`] serves — makes
+    /// both a no-op, which is why only this one has to say so.
     pub fn next_below(&mut self, n: usize) -> usize {
         if n <= 1 {
             return 0;
         }
         let range = n as u64;
-        let engine_range = Self::MODULUS - 1;
+        // `max() - min()`, with `max() == MODULUS - 1` and `min() == 1`.
+        let engine_range = Self::MODULUS - 2;
         let scaling = engine_range / range;
         let past = range * scaling;
-        let mut draw = self.next_u32() as u64;
+        let mut draw = self.next_u32() as u64 - 1;
         while draw >= past {
-            draw = self.next_u32() as u64;
+            draw = self.next_u32() as u64 - 1;
         }
         (draw / scaling) as usize
     }

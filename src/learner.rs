@@ -172,6 +172,14 @@ impl Learner {
             Some(b) if b.len() == n_groups => b.clone(),
             Some(b) => vec![b[0]; n_groups],
             None if self.boost_from_average => {
+                // `FitIntercept::InitEstimation` computes the gradients once on
+                // a throwaway copy of the objective — but the *engine* it draws
+                // its pair seed from is the session's, so the draw counts and
+                // the first round sees an engine one step further on.
+                if self.obj.wants_pair_seed() {
+                    let seed = self.ctx.rng().next_u32();
+                    self.obj.set_pair_seed(seed);
+                }
                 let mut estimated = self.obj.init_estimation(info);
                 let last = *estimated.last().unwrap_or(&0.5);
                 estimated.resize(n_groups, last);
@@ -209,6 +217,14 @@ impl Learner {
         // the residuals of a thinned ensemble.
         self.booster.pre_boost(&mut self.ctx, dtrain, &mut self.train_cache);
         let mut gpair: Vec<GradientPair> = Vec::new();
+        // `LambdaRankObj::GetGradient` takes one draw from the session engine
+        // before sampling its pairs, and only when it samples them. Taking it
+        // here keeps the engine's sequence — which the round's column and row
+        // samples continue — in upstream's order.
+        if self.obj.wants_pair_seed() {
+            let seed = self.ctx.rng().next_u32();
+            self.obj.set_pair_seed(seed);
+        }
         self.obj.get_gradient(&self.train_cache, dtrain.info(), iter, &mut gpair);
         self.booster.do_boost(&mut self.ctx, dtrain, &gpair, &mut self.train_cache)
     }
