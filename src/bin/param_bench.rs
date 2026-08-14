@@ -1,93 +1,30 @@
-//! Performance sweep over the fit parameters that change what the CPU `hist`
-//! path has to do.
+//! Performance sweep over the fit parameters that change how much work a fit
+//! does — on either device.
 //!
-//! Not every parameter costs anything — `eta` and `lambda` are arithmetic on
-//! numbers already loaded — so this covers the ones that change the *work*:
-//! the histogram size, the tree size, how many trees there are, how many rows
-//! and columns each split considers, and how many threads do it.
+//! Not every parameter costs anything: `eta` and `lambda` are arithmetic on
+//! numbers already loaded. This covers the ones that change the *work* — the
+//! histogram size, the tree size, how many trees there are, how many rows and
+//! columns each split considers, how many outputs a leaf carries, and how many
+//! threads do it.
 //!
 //! ```text
 //! cargo run --release --no-default-features --bin param_bench -- \
-//!     --rows 200000 --features 40 --rounds 10
+//!     --rows 200000 --features 40 --rounds 10 --device cpu
 //! ```
 //!
+//! `--device cuda` runs the same sweep on the device path, and needs the `gpu`
+//! feature (the default). A configuration the device refuses — `exact` — prints
+//! `refused` rather than aborting the group.
+//!
 //! Each configuration is timed best-of-`--repeats` whole fits, so every one
-//! pays its own quantile sketch and binning pass and none benefits from a
-//! cache another cannot use. `rel` is against the first row of the group.
+//! pays its own quantile sketch and binning pass and none benefits from a cache
+//! another cannot use. `rel` is against the first row of the group, and the
+//! train metric is printed beside it because a parameter that looks cheap by
+//! *fitting less* is not cheap.
 //!
-//! # Measured
-//!
-//! At `--rows 200000 --features 40 --rounds 10` on 8 threads, relative to the
-//! group's first row. Absolute times are machine-dependent; the ratios are the
-//! point, and they are what the implementation notes elsewhere refer to.
-//!
-//! | Group | What moves | Ratio |
-//! |---|---|---|
-//! | `tree_method` | `hist` -> `approx` (constant hessian) | 1.00x |
-//! | | `hist` -> `approx` (varying hessian) | 4.7x |
-//! | | `hist` -> `exact` | 9.7x |
-//! | `opt_dense_col` | `1.0` -> `0.5` on a 25%-sparse matrix | 0.56x |
-//! | `gblinear` | `cyclic` -> `thrifty` | 1.2x |
-//! | | `cyclic` -> `greedy` | 8.7x |
-//! | | `gbtree` -> `gblinear/cyclic` | 0.94x |
-//! | `max_bin` | 16 -> 512 | 1.6x |
-//! | `max_depth` | 4 -> 10 | 3.2x |
-//! | `grow_policy` | `depthwise` -> `lossguide`, 64 leaves | 1.6x |
-//! | `num_parallel_tree` | 1 -> 4 | 2.2x |
-//! | `num_class` | 2 -> 8 | 3.1x |
-//! | `dart` | `rate_drop` 0 -> 0.5 | 5.1x |
-//! | `categorical` | numeric -> partition, 64 categories | 1.20x |
-//! | | partition -> one-hot, 64 categories | 0.75x |
-//! | | `max_cat_threshold` 64 -> 4 | 0.81x |
-//! | `sparse_threshold` | `0` -> `1` (all columns sparse) | 1.06x |
-//! | `multi_strategy` | one tree per output -> vector leaf, 4 targets | 0.86x |
-//! | `nthread` | 1 -> 8 | 0.46x |
-//!
-//! Several of those deserve a note, because the number is the *point* of the
-//! parameter rather than an artefact:
-//!
-//! * **`approx` costs nothing extra under a constant hessian.** Its sketch is
-//!   weighted by the hessian, and `reg:squarederror`'s hessian is `1` for
-//!   every row in every round — so the sketch is the one `hist` already built
-//!   and it is not rebuilt. Give the hessian something to vary and the full
-//!   per-round re-sketch and re-bin appears, at 4.6x.
-//! * **`exact` is an order of magnitude slower**, which is the trade it makes:
-//!   every distinct value is a split candidate instead of one per bin, and
-//!   there is no binned matrix to compress the scan.
-//! * **`greedy` is quadratic in the feature count.** It re-scans the whole
-//!   matrix once per feature it selects; `thrifty` ranks every feature in a
-//!   single pass and then cycles that order, which is why it lands at 1.2x
-//!   rather than 8.5x. (The `gblinear` group's `rel` column is against a
-//!   `gbtree` reference row, so read those two ratios off the `cyclic` row.)
-//! * **The categorical enumerators trade cost against what they can express.**
-//!   Read the `train-metric` column, not just `rel`: with 64 categories,
-//!   one-hot is the *cheaper* of the two (0.90x against the numeric baseline
-//!   where partitioning is 1.20x) and fits 23x worse — 0.379 RMSE against
-//!   0.016 — because a one-hot split can only isolate one category at a time.
-//!   `max_cat_threshold=4` is the same trade in miniature: it recovers most of
-//!   the cost (1.00x) and gives up most of the fit (0.176). Paying 20% for a
-//!   split the data actually has is the whole reason the partition path
-//!   exists.
-//! * **`sparse_threshold` is a memory knob whose extreme costs memory.** Every
-//!   row of that group fits the identical model, so the only differences are
-//!   storage and probe cost. The case labels carry the layout: on a matrix
-//!   whose columns span the density range, the default `0.2` stores 7 of 40
-//!   columns sparsely for 13.4 MiB against 15.3 dense, while `1.0` stores 39
-//!   of 40 for **22.7 MiB** — larger than storing nothing sparsely at all.
-//!   A sparse column pays 4 bytes of row id per entry to save a 1-byte bin, so
-//!   past roughly 20% density it is a loss, which is exactly where upstream
-//!   puts the default. Time barely moves either way (1.06x across the range,
-//!   inside run-to-run noise), so this parameter is worth setting for memory
-//!   and not for speed.
-//! * **A vector leaf saves more the more targets there are.** One tree a round
-//!   instead of one per target, against a histogram pass per target that the
-//!   one-tree-per-target fit also pays: 0.99x at two targets, 0.86x at four.
-//!   The `train-metric` column stays level, so the saving is not bought by
-//!   fitting less.
-//! * **`max_cached_hist_node` is within noise here (1.02x across four orders
-//!   of magnitude).** It bounds resident memory on a wide tree rather than
-//!   buying speed, and the sweep is honest about that rather than implying a
-//!   speedup it does not produce.
+//! **The measurements live in `docs/parameter-performance.md`**, kept there
+//! rather than here so there is one copy of them and it sits next to the
+//! device comparison and the real-hardware GPU numbers.
 
 use std::time::Instant;
 
@@ -326,16 +263,23 @@ fn base_params(tree: TreeBoosterParameters, args: &Args) -> TrainingParameters {
 
 /// Best-of-N wall clock for a whole fit, with the final train RMSE so two rows
 /// can be checked for doing comparable work.
-fn time_fit(params: &TrainingParameters, d: &DMatrix, repeats: usize) -> (f64, f64) {
+/// `None` when the configuration is refused, which `--device cuda` does to the
+/// `exact` rows: a refusal is a fact about the device, not a reason to abort
+/// the sweep, so the row says so and the rest of the group still runs.
+fn time_fit(
+    params: &TrainingParameters,
+    d: &DMatrix,
+    repeats: usize,
+) -> Option<(f64, f64)> {
     let mut best = f64::INFINITY;
     let mut rmse = f64::NAN;
     for _ in 0..repeats {
         let t = Instant::now();
-        let (_, history) = api::train(params, d, &[(d, "train")]).unwrap();
+        let (_, history) = api::train(params, d, &[(d, "train")]).ok()?;
         best = best.min(t.elapsed().as_secs_f64());
         rmse = history.last().unwrap()[0].1;
     }
-    (best, rmse)
+    Some((best, rmse))
 }
 
 /// One configuration to time. `data` overrides the shared matrix for the
@@ -391,7 +335,10 @@ fn main() {
         let mut baseline = f64::NAN;
         for case in &group.cases {
             let matrix = case.data.as_ref().unwrap_or(&d);
-            let (seconds, score) = time_fit(&case.params, matrix, args.repeats);
+            let Some((seconds, score)) = time_fit(&case.params, matrix, args.repeats) else {
+                println!("{:<28} {:>9} {:>9} {:>8}   —", case.label, "refused", "—", "—");
+                continue;
+            };
             if baseline.is_nan() {
                 baseline = seconds;
             }

@@ -296,7 +296,7 @@ impl Objective for LambdaRank {
         self.pair_seed = seed;
     }
 
-    fn get_gradient(&mut self, preds: &[f32], info: &MetaInfo, iter: i32, out: &mut Vec<GradientPair>) {
+    fn get_gradient(&mut self, preds: &[f32], info: &MetaInfo, _iter: i32, out: &mut Vec<GradientPair>) {
         out.clear();
         out.resize(preds.len(), GradientPair::default());
         if preds.is_empty() {
