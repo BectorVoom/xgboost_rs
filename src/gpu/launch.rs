@@ -1,7 +1,8 @@
 //! Hardware-adaptive launch geometry.
 //!
-//! Every kernel in this module tree was written with `CubeDim::new_1d(256)` and
-//! a hand-rolled `div_ceil` cube count. 256 is a defensible guess for a
+//! Every kernel in `histogram.rs`, `quantiser.rs`, `evaluate_splits.rs` and
+//! `row_partitioner.rs` was written with `CubeDim::new_1d(256)` and a
+//! hand-rolled `div_ceil` cube count. 256 is a defensible guess for a
 //! discrete NVIDIA GPU — eight 32-lane warps — but it is a guess, and it is
 //! wrong in three ways that matter:
 //!
@@ -118,8 +119,34 @@ pub fn block_1d<R: Runtime>(client: &ComputeClient<R>, preferred: u32) -> u32 {
     let hardware = &client.properties().hardware;
     let plane = hardware.plane_size_max.max(1);
     let limit = hardware.max_units_per_cube.max(plane);
+    // Round the limit down to a whole number of planes too: clamping to a
+    // bare `limit` that isn't itself plane-aligned would hand back a block
+    // that is a whole number of planes right up until this `.min`, then isn't.
+    let limit = (limit / plane) * plane;
     // Whole planes, never more than the device allows, never fewer than one.
     (preferred / plane).max(1).saturating_mul(plane).min(limit)
+}
+
+/// Cube-count geometry for a kernel that maps one whole *cube* — not one unit
+/// — to one item of work, identified by the flattened cube index
+/// `CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_Z * CUBE_COUNT_X *
+/// CUBE_COUNT_Y`.
+///
+/// Spreads `cubes` across X, then Y, then Z so no axis exceeds the device's
+/// per-axis grid limit ([`elementwise`] does the equivalent for per-unit
+/// kernels). A partially-filled last row/plane can overprovision cubes past
+/// `cubes`, so the kernel must bounds-check the flattened index itself —
+/// there is no per-cube analogue of `ABSOLUTE_POS`'s implicit bound.
+pub fn cubes_1d<R: Runtime>(client: &ComputeClient<R>, cubes: u32) -> CubeCount {
+    if cubes == 0 {
+        return CubeCount::Static(1, 1, 1);
+    }
+    let max = client.properties().hardware.max_cube_count;
+    let x = cubes.min(max.0.max(1));
+    let rows = cubes.div_ceil(x);
+    let y = rows.min(max.1.max(1));
+    let z = rows.div_ceil(y).min(max.2.max(1));
+    CubeCount::Static(x, y, z)
 }
 
 /// The widest hardware-preferred vector width for `T` that divides every one of

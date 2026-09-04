@@ -276,10 +276,10 @@ pub fn subtract_batch_kernel(
     out_off: &Array<u32>,
     n_words: u32,
 ) {
-    // Not `ABSOLUTE_POS`: that is linear over the *whole* grid, and this grid
-    // has a second dimension, so it would fold the node index into the word
-    // index.
-    let i = CUBE_POS_X * CUBE_DIM_X + UNIT_POS_X;
+    // Not `ABSOLUTE_POS`: that is linear over the *whole* grid, and this
+    // grid's Y axis is the node index, so it would fold the node into the
+    // word index. Z, instead, is the overflow the X axis couldn't hold.
+    let i = (CUBE_POS_Z * CUBE_COUNT_X + CUBE_POS_X) * CUBE_DIM_X + UNIT_POS_X;
     if i < n_words {
         let node = CUBE_POS_Y as usize;
         // Read the offsets into locals: an index expression on the left of an
@@ -860,18 +860,19 @@ impl<R: Runtime> HistogramEngine<R> {
 
         // `elementwise` is not usable here: the kernel reads `CUBE_POS_Y` to
         // pick the node, so the cube count's Y axis is spoken for and the X
-        // axis cannot spill into it. Plane-align the block instead, and check
-        // the X axis rather than letting the backend reject the dispatch.
+        // axis cannot spill into it. Plane-align the block, and when the word
+        // count still overflows the X axis's grid limit, spill into Z instead
+        // — `subtract_batch_kernel` folds `CUBE_POS_Z` back into the word
+        // index, the same way `calculate_cube_count_elemwise` folds Y and Z
+        // back into `ABSOLUTE_POS`.
         let block = launch::block_1d(&self.client, BLOCK_THREADS);
-        let cubes_x = (n_words as u32).div_ceil(block).max(1);
-        debug_assert!(
-            cubes_x <= self.client.properties().hardware.max_cube_count.0,
-            "subtract_batch grid X ({cubes_x}) exceeds the device limit; \
-             split the batch or widen the block"
-        );
+        let total_cubes_x = (n_words as u32).div_ceil(block).max(1);
+        let max_cubes_x = self.client.properties().hardware.max_cube_count.0.max(1);
+        let cubes_x = total_cubes_x.min(max_cubes_x);
+        let cubes_z = total_cubes_x.div_ceil(cubes_x);
         subtract_batch_kernel::launch::<R>(
             &self.client,
-            CubeCount::Static(cubes_x, slots.len() as u32, 1),
+            CubeCount::Static(cubes_x, slots.len() as u32, cubes_z),
             CubeDim::new_1d(block),
             unsafe { ArrayArg::from_raw_parts(parent.clone(), parent_bins * 2) },
             unsafe { ArrayArg::from_raw_parts(frontier.clone(), frontier_bins * 2) },

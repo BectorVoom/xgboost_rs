@@ -32,6 +32,7 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 
 use super::ellpack::DeviceEllpack;
+use super::launch;
 use crate::error::Result;
 
 /// Threads per partitioning workgroup, and rows per tile.
@@ -146,43 +147,50 @@ pub fn count_tile_kernel(
     #[comptime] compressed: bool,
     #[comptime] block: usize,
 ) {
-    let tile = CUBE_POS_X;
-    let s = tile_seg[tile as usize];
-    let off = tile_off[tile as usize] + UNIT_POS_X;
-    let len = seg_len[s as usize];
+    // A whole cube, not a unit, maps to one tile, so an overprovisioned grid
+    // (`launch::cubes_1d` rounds the tile count up to a rectangle) can hand
+    // out cubes past the real tile count; skip them uniformly (every unit in
+    // the cube computes the same `tile`, so this branches the whole cube the
+    // same way and `sync_cube` below stays safe).
+    let tile = CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_Z * CUBE_COUNT_X * CUBE_COUNT_Y;
+    if tile < tile_seg.len() as u32 {
+        let s = tile_seg[tile as usize];
+        let off = tile_off[tile as usize] + UNIT_POS_X;
+        let len = seg_len[s as usize];
 
-    let mut s_flag = SharedMemory::<u32>::new(block);
-    let t = UNIT_POS_X as usize;
+        let mut s_flag = SharedMemory::<u32>::new(block);
+        let t = UNIT_POS_X as usize;
 
-    let live = off < len;
-    let flags = seg_flags[s as usize];
-    let left = if live {
-        goes_left(
-            gidx,
-            cut_ptrs,
-            cat_bits,
-            ridx[(seg_begin[s as usize] + off) as usize],
-            seg_fidx[s as usize],
-            seg_cond[s as usize],
-            (flags & 1u32) == 1u32,
-            (flags & 2u32) == 2u32,
-            seg_cat_base[s as usize],
-            row_stride,
-            base_rowid,
-            null_value,
-            dense,
-            compressed,
-        )
-    } else {
-        false.into()
-    };
-    s_flag[t] = u32::cast_from(left);
-    sync_cube();
+        let live = off < len;
+        let flags = seg_flags[s as usize];
+        let left = if live {
+            goes_left(
+                gidx,
+                cut_ptrs,
+                cat_bits,
+                ridx[(seg_begin[s as usize] + off) as usize],
+                seg_fidx[s as usize],
+                seg_cond[s as usize],
+                (flags & 1u32) == 1u32,
+                (flags & 2u32) == 2u32,
+                seg_cat_base[s as usize],
+                row_stride,
+                base_rowid,
+                null_value,
+                dense,
+                compressed,
+            )
+        } else {
+            false.into()
+        };
+        s_flag[t] = u32::cast_from(left);
+        sync_cube();
 
-    scan_flags(&mut s_flag, block);
+        scan_flags(&mut s_flag, block);
 
-    if UNIT_POS_X == block as u32 - 1u32 {
-        tile_left[tile as usize] = s_flag[t];
+        if UNIT_POS_X == block as u32 - 1u32 {
+            tile_left[tile as usize] = s_flag[t];
+        }
     }
 }
 
@@ -198,22 +206,26 @@ pub fn scan_tiles_kernel(
     seg_left: &mut Array<u32>,
     #[comptime] block: usize,
 ) {
-    let s = CUBE_POS_X;
-    let begin = seg_tile_begin[s as usize];
-    let end = seg_tile_begin[(s + 1u32) as usize];
+    // A whole cube maps to one segment; see `count_tile_kernel` for why an
+    // overprovisioned grid needs this guard.
+    let s = CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_Z * CUBE_COUNT_X * CUBE_COUNT_Y;
+    if s < seg_left.len() as u32 {
+        let begin = seg_tile_begin[s as usize];
+        let end = seg_tile_begin[(s + 1u32) as usize];
 
-    // Serial over the segment's tiles: there is one entry per tile, not per
-    // row, so this is a short loop even for a very wide segment.
-    if UNIT_POS_X == 0u32 {
-        let acc = RuntimeCell::<u32>::new(0u32);
-        let i = RuntimeCell::<u32>::new(begin);
-        while i.read() < end {
-            let k = i.read();
-            tile_base[k as usize] = acc.read();
-            acc.store(acc.read() + tile_left[k as usize]);
-            i.store(k + 1u32);
+        // Serial over the segment's tiles: there is one entry per tile, not
+        // per row, so this is a short loop even for a very wide segment.
+        if UNIT_POS_X == 0u32 {
+            let acc = RuntimeCell::<u32>::new(0u32);
+            let i = RuntimeCell::<u32>::new(begin);
+            while i.read() < end {
+                let k = i.read();
+                tile_base[k as usize] = acc.read();
+                acc.store(acc.read() + tile_left[k as usize]);
+                i.store(k + 1u32);
+            }
+            seg_left[s as usize] = acc.read();
         }
-        seg_left[s as usize] = acc.read();
     }
     comptime![let _ = block;];
 }
@@ -248,57 +260,61 @@ pub fn scatter_tile_kernel(
     #[comptime] compressed: bool,
     #[comptime] block: usize,
 ) {
-    let tile = CUBE_POS_X;
-    let s = tile_seg[tile as usize];
-    let toff = tile_off[tile as usize];
-    let off = toff + UNIT_POS_X;
-    let len = seg_len[s as usize];
-    let begin = seg_begin[s as usize];
+    // A whole cube maps to one tile; see `count_tile_kernel` for why an
+    // overprovisioned grid needs this guard.
+    let tile = CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_Z * CUBE_COUNT_X * CUBE_COUNT_Y;
+    if tile < tile_seg.len() as u32 {
+        let s = tile_seg[tile as usize];
+        let toff = tile_off[tile as usize];
+        let off = toff + UNIT_POS_X;
+        let len = seg_len[s as usize];
+        let begin = seg_begin[s as usize];
 
-    let mut s_flag = SharedMemory::<u32>::new(block);
-    let t = UNIT_POS_X as usize;
+        let mut s_flag = SharedMemory::<u32>::new(block);
+        let t = UNIT_POS_X as usize;
 
-    let live = off < len;
-    let row = if live { ridx[(begin + off) as usize] } else { 0u32.into() };
-    let flags = seg_flags[s as usize];
-    let left = if live {
-        goes_left(
-            gidx,
-            cut_ptrs,
-            cat_bits,
-            row,
-            seg_fidx[s as usize],
-            seg_cond[s as usize],
-            (flags & 1u32) == 1u32,
-            (flags & 2u32) == 2u32,
-            seg_cat_base[s as usize],
-            row_stride,
-            base_rowid,
-            null_value,
-            dense,
-            compressed,
-        )
-    } else {
-        false.into()
-    };
-    s_flag[t] = u32::cast_from(left);
-    sync_cube();
-
-    scan_flags(&mut s_flag, block);
-
-    if live {
-        // Inclusive scan minus this row's own flag gives its rank among the
-        // left-going rows of the tile.
-        let rank_left = s_flag[t] - u32::cast_from(left);
-        let base = tile_base[tile as usize];
-        let dst = if left {
-            begin + base + rank_left
+        let live = off < len;
+        let row = if live { ridx[(begin + off) as usize] } else { 0u32.into() };
+        let flags = seg_flags[s as usize];
+        let left = if live {
+            goes_left(
+                gidx,
+                cut_ptrs,
+                cat_bits,
+                row,
+                seg_fidx[s as usize],
+                seg_cond[s as usize],
+                (flags & 1u32) == 1u32,
+                (flags & 2u32) == 2u32,
+                seg_cat_base[s as usize],
+                row_stride,
+                base_rowid,
+                null_value,
+                dense,
+                compressed,
+            )
         } else {
-            // Rows before this one in the tile that went right, plus the tiles
-            // before it: `off - base` counts both.
-            begin + seg_left[s as usize] + (off - base) - rank_left
+            false.into()
         };
-        out[dst as usize] = row;
+        s_flag[t] = u32::cast_from(left);
+        sync_cube();
+
+        scan_flags(&mut s_flag, block);
+
+        if live {
+            // Inclusive scan minus this row's own flag gives its rank among
+            // the left-going rows of the tile.
+            let rank_left = s_flag[t] - u32::cast_from(left);
+            let base = tile_base[tile as usize];
+            let dst = if left {
+                begin + base + rank_left
+            } else {
+                // Rows before this one in the tile that went right, plus the
+                // tiles before it: `off - base` counts both.
+                begin + seg_left[s as usize] + (off - base) - rank_left
+            };
+            out[dst as usize] = row;
+        }
     }
 }
 
@@ -312,11 +328,16 @@ pub fn commit_tile_kernel(
     seg_begin: &Array<u32>,
     seg_len: &Array<u32>,
 ) {
-    let s = tile_seg[CUBE_POS_X as usize];
-    let off = tile_off[CUBE_POS_X as usize] + UNIT_POS_X;
-    if off < seg_len[s as usize] {
-        let i = (seg_begin[s as usize] + off) as usize;
-        ridx[i] = scratch[i];
+    // A whole cube maps to one tile; see `count_tile_kernel` for why an
+    // overprovisioned grid needs this guard.
+    let tile = CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_Z * CUBE_COUNT_X * CUBE_COUNT_Y;
+    if tile < tile_seg.len() as u32 {
+        let s = tile_seg[tile as usize];
+        let off = tile_off[tile as usize] + UNIT_POS_X;
+        if off < seg_len[s as usize] {
+            let i = (seg_begin[s as usize] + off) as usize;
+            ridx[i] = scratch[i];
+        }
     }
 }
 
@@ -384,7 +405,7 @@ impl<R: Runtime> RowPartitioner<R> {
             return Ok(Vec::new());
         }
         let c = &self.client;
-        let block = PART_BLOCK;
+        let block = launch::block_1d(c, PART_BLOCK);
 
         // Tile table: every segment is cut into `ceil(len / block)` tiles, and
         // tiles of every segment are launched together so the top of the tree
@@ -442,7 +463,7 @@ impl<R: Runtime> RowPartitioner<R> {
 
         count_tile_kernel::launch::<R>(
             c,
-            CubeCount::Static(n_tiles as u32, 1, 1),
+            launch::cubes_1d(c, n_tiles as u32),
             CubeDim::new_1d(block),
             unsafe { ArrayArg::from_raw_parts(self.ridx.clone(), self.n_rows) },
             unsafe { ArrayArg::from_raw_parts(ell.gidx.clone(), ell.gidx_len) },
@@ -467,7 +488,7 @@ impl<R: Runtime> RowPartitioner<R> {
 
         scan_tiles_kernel::launch::<R>(
             c,
-            CubeCount::Static(n_seg as u32, 1, 1),
+            launch::cubes_1d(c, n_seg as u32),
             CubeDim::new_1d(block),
             unsafe { ArrayArg::from_raw_parts(d_tile_left, n_tiles) },
             unsafe { ArrayArg::from_raw_parts(d_seg_tile_begin, n_seg + 1) },
@@ -478,7 +499,7 @@ impl<R: Runtime> RowPartitioner<R> {
 
         scatter_tile_kernel::launch::<R>(
             c,
-            CubeCount::Static(n_tiles as u32, 1, 1),
+            launch::cubes_1d(c, n_tiles as u32),
             CubeDim::new_1d(block),
             unsafe { ArrayArg::from_raw_parts(self.ridx.clone(), self.n_rows) },
             unsafe { ArrayArg::from_raw_parts(self.scratch.clone(), self.n_rows) },
@@ -509,7 +530,7 @@ impl<R: Runtime> RowPartitioner<R> {
         // host round trip beyond the small per-segment counts below.
         commit_tile_kernel::launch::<R>(
             c,
-            CubeCount::Static(n_tiles as u32, 1, 1),
+            launch::cubes_1d(c, n_tiles as u32),
             CubeDim::new_1d(block),
             unsafe { ArrayArg::from_raw_parts(self.scratch.clone(), self.n_rows) },
             unsafe { ArrayArg::from_raw_parts(self.ridx.clone(), self.n_rows) },
