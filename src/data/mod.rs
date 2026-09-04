@@ -123,16 +123,6 @@ impl MetaInfo {
         self.feature_types.iter().any(|t| *t == FeatureType::Categorical)
     }
 
-    /// Name of column `f`, falling back to `f{index}` when the matrix is
-    /// unnamed — the same fallback XGBoost's feature-importance dictionary and
-    /// tree dumps use.
-    pub fn feature_name(&self, f: usize) -> String {
-        match self.feature_names.get(f) {
-            Some(name) => name.clone(),
-            None => format!("f{f}"),
-        }
-    }
-
     /// Query-group row ranges, defaulting to one group over every row.
     ///
     /// `LambdaRankObj` treats an unset group as a single query, which makes an

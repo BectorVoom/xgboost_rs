@@ -202,12 +202,12 @@ impl Learner {
 
         // A model takes its column names and types from the matrix it was
         // fitted on, as `xgboost.train` does through `Booster.feature_names`
-        // and `.feature_types`. A learner that already has them — one loaded
-        // from a saved model, then continued — keeps its own.
-        if self.feature_names.is_empty() {
+        // and `.feature_types`. A learner that already has either — one
+        // loaded from a saved model, then continued — keeps its own pair
+        // rather than mixing in the continuing matrix's, since a name and
+        // its type must describe the same column.
+        if self.feature_names.is_empty() && self.feature_types.is_empty() {
             self.feature_names = info.feature_names.clone();
-        }
-        if self.feature_types.is_empty() {
             self.feature_types =
                 info.feature_types.iter().map(|t| t.as_str().to_owned()).collect();
         }
@@ -320,6 +320,18 @@ impl Learner {
     /// `process_type=update`, where the new parameters describe how to rewrite
     /// the old trees rather than how to grow new ones.
     pub fn continue_from(&mut self, base: &Self) -> Result<()> {
+        let self_features = self.booster.num_feature();
+        let base_features = base.booster().num_feature();
+        if self_features != base_features {
+            return Err(Error::invalid(
+                "booster",
+                format!(
+                    "cannot continue from a model with {base_features} features using a matrix \
+                     with {self_features} columns; the base model's trees already refer to its \
+                     own column indices"
+                ),
+            ));
+        }
         match (&mut self.booster, base.booster()) {
             (Booster::Tree(dst), Booster::Tree(src)) => {
                 dst.model = src.model.clone();
@@ -350,11 +362,13 @@ impl Learner {
         // model; re-estimating it here would shift every existing tree.
         self.base_score_override = Some(base.base_score.clone());
         // The columns are the base model's columns, so its names and types win
-        // over the continuing matrix's — the trees already refer to them.
-        if !base.feature_names.is_empty() {
+        // over the continuing matrix's — the trees already refer to them. Both
+        // are taken from base together, even when one half is unset, so a
+        // name and its type always describe the same source matrix rather
+        // than `configure` later mixing a base-derived name with a
+        // dtrain-derived type (or vice versa).
+        if !base.feature_names.is_empty() || !base.feature_types.is_empty() {
             self.feature_names = base.feature_names.clone();
-        }
-        if !base.feature_types.is_empty() {
             self.feature_types = base.feature_types.clone();
         }
         Ok(())

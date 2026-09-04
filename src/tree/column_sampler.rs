@@ -20,12 +20,10 @@ use std::sync::Arc;
 
 use crate::rng::{Mt19937, canonical_f32_from_mt, shuffle};
 
+use super::param::RT_EPS;
+
 /// A shared, ascending list of candidate feature indices.
 pub type FeatureSet = Arc<Vec<u32>>;
-
-/// `xgboost::kRtEps`, the floor upstream puts under a sampling weight so a
-/// zero-weight column keeps a (vanishing) chance rather than dividing by zero.
-const K_RT_EPS: f32 = 1e-6;
 
 /// Draws the feature sets a tree, a level and a node may split on.
 #[derive(Clone, Debug, Default)]
@@ -143,7 +141,7 @@ fn weighted_sample(
         .iter()
         .enumerate()
         .map(|(i, &feature)| {
-            let w = feature_weights[feature as usize].max(K_RT_EPS);
+            let w = feature_weights[feature as usize].max(RT_EPS);
             let u = canonical_f32_from_mt(rng);
             (u.ln() / w, i)
         })

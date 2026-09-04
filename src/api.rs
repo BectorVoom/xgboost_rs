@@ -130,6 +130,16 @@ impl Booster {
         if want.is_empty() || got.is_empty() || want == got.as_slice() {
             return Ok(());
         }
+        if want.len() != got.len() {
+            return Err(Error::invalid(
+                "validate_features",
+                format!(
+                    "the model names {} features, the matrix names {}",
+                    want.len(),
+                    got.len()
+                ),
+            ));
+        }
         let mismatched: Vec<String> = want
             .iter()
             .zip(got)

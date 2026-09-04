@@ -315,8 +315,9 @@ pub fn load_model(text: &str) -> Result<Booster> {
 
     let mut learner =
         Learner::from_model(obj, vec![metric], GradientBooster::Tree(gbm), base_score)?;
-    learner.set_feature_names(parse_string_array(learner_json, "feature_names")?);
-    learner.set_feature_types(parse_feature_types(learner_json)?);
+    let (feature_names, feature_types) = parse_feature_meta(learner_json, num_feature)?;
+    learner.set_feature_names(feature_names);
+    learner.set_feature_types(feature_types);
     Ok(Booster::from_learner(learner))
 }
 
@@ -346,12 +347,47 @@ fn parse_string_array(learner_json: &Value, field: &str) -> Result<Vec<String>> 
 /// came in saying `int` goes back out saying `int`; the check is only that
 /// every one of them is a type this crate could act on.
 fn parse_feature_types(learner_json: &Value) -> Result<Vec<String>> {
-    let types = parse_string_array(learner_json, "feature_types")?;
-    for name in &types {
-        crate::data::FeatureType::parse(name)
-            .map_err(|e| Error::ModelFormat(e.to_string()))?;
+    let Some(array) = learner_json.get("feature_types").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    array
+        .iter()
+        .map(|v| {
+            let s = v
+                .as_str()
+                .ok_or_else(|| Error::ModelFormat("`feature_types` holds a non-string".into()))?;
+            crate::data::FeatureType::parse(s).map_err(|e| Error::ModelFormat(e.to_string()))?;
+            Ok(s.to_owned())
+        })
+        .collect()
+}
+
+/// The `feature_names`/`feature_types` header pair, each checked against
+/// `num_feature` the same way `tree_info`/`weight_drop` are checked against
+/// `trees.len()` a few lines up.
+///
+/// Absent, `null` and `[]` all mean "unset" for either array, which is what
+/// upstream writes for a model fitted through the C API without that
+/// information; a present array must name exactly one entry per feature.
+fn parse_feature_meta(
+    learner_json: &Value,
+    num_feature: usize,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let feature_names = parse_string_array(learner_json, "feature_names")?;
+    if !feature_names.is_empty() && feature_names.len() != num_feature {
+        return Err(Error::ModelFormat(format!(
+            "feature_names has {} entries for {num_feature} features",
+            feature_names.len()
+        )));
     }
-    Ok(types)
+    let feature_types = parse_feature_types(learner_json)?;
+    if !feature_types.is_empty() && feature_types.len() != num_feature {
+        return Err(Error::ModelFormat(format!(
+            "feature_types has {} entries for {num_feature} features",
+            feature_types.len()
+        )));
+    }
+    Ok((feature_names, feature_types))
 }
 
 /// Parse a `gblinear` model.
@@ -405,8 +441,9 @@ fn load_linear_model(learner_json: &Value) -> Result<Booster> {
         GradientBooster::Linear(Box::new(GBLinear::from_model(model))),
         base_score,
     )?;
-    learner.set_feature_names(parse_string_array(learner_json, "feature_names")?);
-    learner.set_feature_types(parse_feature_types(learner_json)?);
+    let (feature_names, feature_types) = parse_feature_meta(learner_json, num_feature)?;
+    learner.set_feature_names(feature_names);
+    learner.set_feature_types(feature_types);
     Ok(Booster::from_learner(learner))
 }
 
