@@ -30,6 +30,7 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 
 use super::ellpack::EllpackMatrix;
+use super::launch;
 use super::{DeviceGpairs, DeviceHistogram, DeviceRows, GradientPairInt64};
 use crate::error::{Error, Result};
 
@@ -247,11 +248,17 @@ pub fn hist_kernel(
 /// histogram kernel only adds. Filling it host-side and uploading costs a
 /// transfer of the whole frontier per level — ~105 MB at depth 10 — for a
 /// buffer whose contents are known.
+///
+/// Vectorised: this is a pure store-bandwidth kernel over the largest buffer
+/// the fit allocates, so it writes `Vector`s rather than words — one 128-bit
+/// store per unit where the device supports it instead of four 32-bit ones.
+/// `n_lines` counts vectors, not words; the caller picks a width that divides
+/// the buffer exactly, falling back to 1 when it does not.
 #[cube(launch)]
-pub fn zero_u32_kernel(buf: &mut Array<u32>, n: u32) {
+pub fn zero_u32_kernel<N: Size>(buf: &mut Array<Vector<u32, N>>, n_lines: u32) {
     let i = ABSOLUTE_POS as u32;
-    if i < n {
-        buf[i as usize] = 0u32;
+    if i < n_lines {
+        buf[i as usize] = Vector::<u32, N>::new(0u32);
     }
 }
 
@@ -755,10 +762,11 @@ impl<R: Runtime> HistogramEngine<R> {
         let n_words = parent.n_bins * 2;
         let out = self.client.empty(n_words * core::mem::size_of::<i64>());
 
+        let (cube_count, cube_dim) = launch::elementwise(&self.client, n_words);
         subtract_hist_kernel::launch::<R>(
             &self.client,
-            CubeCount::Static((n_words as u32).div_ceil(BLOCK_THREADS).max(1), 1, 1),
-            CubeDim::new_1d(BLOCK_THREADS),
+            cube_count,
+            cube_dim,
             unsafe { ArrayArg::from_raw_parts(parent.handle.clone(), n_words) },
             unsafe { ArrayArg::from_raw_parts(built.handle.clone(), n_words) },
             unsafe { ArrayArg::from_raw_parts(out.clone(), n_words) },
@@ -790,10 +798,11 @@ impl<R: Runtime> HistogramEngine<R> {
     ) {
         // Each bin is one interleaved `[grad, hess]` i64 pair.
         let n_words = self.n_bins * 2;
+        let (cube_count, cube_dim) = launch::elementwise(&self.client, n_words);
         subtract_within_kernel::launch::<R>(
             &self.client,
-            CubeCount::Static((n_words as u32).div_ceil(BLOCK_THREADS).max(1), 1, 1),
-            CubeDim::new_1d(BLOCK_THREADS),
+            cube_count,
+            cube_dim,
             unsafe { ArrayArg::from_raw_parts(parent.clone(), parent_bins * 2) },
             unsafe { ArrayArg::from_raw_parts(frontier.clone(), frontier_bins * 2) },
             parent_slot * 2,
@@ -804,14 +813,24 @@ impl<R: Runtime> HistogramEngine<R> {
     }
 
     /// A zeroed buffer of `words` `u32`, filled on device.
+    ///
+    /// The grid here is the one that overflows: a depth-10 frontier is ~26M
+    /// words, and a `div_ceil` into X alone asks for 102,540 cubes against a
+    /// 65,535-per-axis limit, which wgpu rejects outright. `elementwise` folds
+    /// the excess into Y and Z, which `ABSOLUTE_POS` flattens back.
     pub fn zeroed(&self, words: usize) -> Handle {
         let h = self.client.empty(words * core::mem::size_of::<u32>());
+        let line = launch::line_size_for::<R, u32>(&self.client, &[words]);
+        let n_lines = words / line;
+        let (cube_count, cube_dim) = launch::elementwise(&self.client, n_lines);
         zero_u32_kernel::launch::<R>(
             &self.client,
-            CubeCount::Static((words as u32).div_ceil(BLOCK_THREADS).max(1), 1, 1),
-            CubeDim::new_1d(BLOCK_THREADS),
+            cube_count,
+            cube_dim,
+            line,
+            // Scalar count, not line count: the JIT divides by the width.
             unsafe { ArrayArg::from_raw_parts(h.clone(), words) },
-            words as u32,
+            n_lines as u32,
         );
         h
     }
@@ -839,14 +858,21 @@ impl<R: Runtime> HistogramEngine<R> {
         let db = self.client.create_from_slice(bytemuck::cast_slice(&b));
         let dobuf = self.client.create_from_slice(bytemuck::cast_slice(&o));
 
+        // `elementwise` is not usable here: the kernel reads `CUBE_POS_Y` to
+        // pick the node, so the cube count's Y axis is spoken for and the X
+        // axis cannot spill into it. Plane-align the block instead, and check
+        // the X axis rather than letting the backend reject the dispatch.
+        let block = launch::block_1d(&self.client, BLOCK_THREADS);
+        let cubes_x = (n_words as u32).div_ceil(block).max(1);
+        debug_assert!(
+            cubes_x <= self.client.properties().hardware.max_cube_count.0,
+            "subtract_batch grid X ({cubes_x}) exceeds the device limit; \
+             split the batch or widen the block"
+        );
         subtract_batch_kernel::launch::<R>(
             &self.client,
-            CubeCount::Static(
-                (n_words as u32).div_ceil(BLOCK_THREADS).max(1),
-                slots.len() as u32,
-                1,
-            ),
-            CubeDim::new_1d(BLOCK_THREADS),
+            CubeCount::Static(cubes_x, slots.len() as u32, 1),
+            CubeDim::new_1d(block),
             unsafe { ArrayArg::from_raw_parts(parent.clone(), parent_bins * 2) },
             unsafe { ArrayArg::from_raw_parts(frontier.clone(), frontier_bins * 2) },
             unsafe { ArrayArg::from_raw_parts(dp, slots.len()) },

@@ -283,3 +283,40 @@ fn builder_rejects_bad_shapes() {
         Err(xgboost_rs::Error::GpairCount { expected: 16, got: 3 })
     ));
 }
+
+/// A depth-10 frontier is ~26M `u32` words. Sizing that grid with a `div_ceil`
+/// into X alone asks for more than 65,535 cubes, which wgpu rejects with a
+/// validation error rather than clamping — so the clear used to abort the
+/// process on a deep enough tree. `gpu::launch::elementwise` spreads the count
+/// across the other axes instead.
+#[test]
+fn zeroed_clears_a_buffer_too_large_for_one_grid_axis() {
+    let client = client();
+    let matrix = random_matrix(64, 4, 8, 0.0, EllpackLayout::Dense, 1);
+    let engine = HistogramBuilder::new(&client).build(&matrix).unwrap();
+
+    // Comfortably past 65_535 * 256, the largest a single-axis grid of the
+    // old fixed 256-unit block could address.
+    let words = 70_000usize * 256;
+    let handle = engine.zeroed(words);
+
+    let got: Vec<u32> = bytemuck::cast_slice(&client.read_one_unchecked(handle)).to_vec();
+    assert_eq!(got.len(), words);
+    assert!(got.iter().all(|w| *w == 0), "buffer was not fully cleared");
+}
+
+/// The vectorised clear may only use a width that divides the buffer exactly;
+/// a partial trailing vector would run off the end of the allocation.
+#[test]
+fn zeroed_handles_lengths_no_vector_width_divides() {
+    let client = client();
+    let matrix = random_matrix(64, 4, 8, 0.0, EllpackLayout::Dense, 1);
+    let engine = HistogramBuilder::new(&client).build(&matrix).unwrap();
+
+    for words in [1usize, 2, 3, 5, 7, 255, 257, 1023] {
+        let handle = engine.zeroed(words);
+        let got: Vec<u32> = bytemuck::cast_slice(&client.read_one_unchecked(handle)).to_vec();
+        assert_eq!(got.len(), words, "words={words}");
+        assert!(got.iter().all(|w| *w == 0), "words={words} not fully cleared");
+    }
+}

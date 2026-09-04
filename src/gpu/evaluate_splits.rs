@@ -1516,10 +1516,11 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
         let dl_d = c.create_from_slice(bytemuck::cast_slice(&default_left));
         let out = c.empty(n * 4 * size_of::<i64>());
 
+        let (cube_count, cube_dim) = super::launch::elementwise(c, n);
         multi_child_sums_kernel::launch::<R>(
             c,
-            CubeCount::Static((n as u32).div_ceil(EVAL_BLOCK).max(1), 1, 1),
-            CubeDim::new_1d(EVAL_BLOCK),
+            cube_count,
+            cube_dim,
             unsafe { ArrayArg::from_raw_parts(scan.prefix.clone(), scan.bins * 2) },
             unsafe { ArrayArg::from_raw_parts(self.cut_ptrs.clone(), self.n_features + 1) },
             unsafe { ArrayArg::from_raw_parts(base_d, n_nodes) },

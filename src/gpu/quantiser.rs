@@ -162,12 +162,11 @@ pub fn quantise_to_device<R: Runtime>(
     let in_handle = client.create_from_slice(bytemuck::cast_slice(&interleaved));
     let out_handle = client.empty(n * core::mem::size_of::<GradientPairInt64>());
 
-    let cube_dim = 256;
-    let cube_count = (n as u32).div_ceil(cube_dim).max(1);
+    let (cube_count, cube_dim) = super::launch::elementwise(client, n);
     quantise_gpair_kernel::launch::<R>(
         client,
-        CubeCount::Static(cube_count, 1, 1),
-        CubeDim::new_1d(cube_dim),
+        cube_count,
+        cube_dim,
         unsafe { ArrayArg::from_raw_parts(in_handle, 2 * n) },
         unsafe { ArrayArg::from_raw_parts(out_handle.clone(), 2 * n) },
         quantiser.to_fixed_point.grad,
