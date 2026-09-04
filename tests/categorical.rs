@@ -244,12 +244,17 @@ fn categorical_trees_survive_a_save_and_load() {
     let text = fitted.save_model();
     assert!(text.contains("\"split_type\""), "the model records split kinds");
 
+    // Which columns hold category codes is part of the model, not only of the
+    // matrix it was fitted on: the file records it and a reload keeps it.
+    assert_eq!(fitted.feature_types(), ["c"]);
+
     let loaded = Booster::load_model(&text).unwrap();
     assert_eq!(
         fitted.predict(&d),
         loaded.predict(&d),
         "a reloaded categorical model must predict the same"
     );
+    assert_eq!(loaded.feature_types(), ["c"]);
     assert_eq!(text, loaded.save_model(), "the round trip is stable");
 }
 

@@ -25,6 +25,38 @@ pub enum FeatureType {
     Categorical,
 }
 
+impl FeatureType {
+    /// The spelling a model file uses for this type.
+    ///
+    /// XGBoost writes the string the caller gave it, so a numerical column may
+    /// be recorded as any of `int`, `float`, `i` or `q`. This crate's enum
+    /// makes no distinction between them, so it writes `q` — the general
+    /// "quantitative" spelling — and reads all four back as [`Numerical`].
+    ///
+    /// [`Numerical`]: FeatureType::Numerical
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Numerical => "q",
+            Self::Categorical => "c",
+        }
+    }
+
+    /// Parse one of the five spellings `common::LoadFeatureType` accepts.
+    ///
+    /// Anything else is an error rather than a guess: upstream makes it fatal,
+    /// because a type it cannot read is a column it would silently mis-split.
+    pub fn parse(name: &str) -> Result<Self> {
+        match name {
+            "c" => Ok(Self::Categorical),
+            "int" | "float" | "i" | "q" => Ok(Self::Numerical),
+            other => Err(Error::invalid(
+                "feature_types",
+                format!("`{other}` is not a feature type; use one of int, float, i, q, c"),
+            )),
+        }
+    }
+}
+
 /// Labels and per-row metadata attached to a [`DMatrix`].
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MetaInfo {
@@ -46,6 +78,14 @@ pub struct MetaInfo {
     pub group_ptr: Vec<usize>,
     /// Per-column feature type. Empty means "every column numerical".
     pub feature_types: Vec<FeatureType>,
+    /// Per-column name. Empty means "unnamed", which is what an unset
+    /// `feature_names` is upstream; the columns are then reported as `f0`,
+    /// `f1`, … wherever a name is needed.
+    pub feature_names: Vec<String>,
+    /// Per-column sampling weight, read by `colsample_bytree` / `bylevel` /
+    /// `bynode`. Empty means "every column equally likely", which is what
+    /// XGBoost's empty `MetaInfo::feature_weights` means.
+    pub feature_weights: Vec<f32>,
 }
 
 impl MetaInfo {
@@ -81,6 +121,16 @@ impl MetaInfo {
     /// enumerators onto their partition-based path.
     pub fn has_categorical(&self) -> bool {
         self.feature_types.iter().any(|t| *t == FeatureType::Categorical)
+    }
+
+    /// Name of column `f`, falling back to `f{index}` when the matrix is
+    /// unnamed — the same fallback XGBoost's feature-importance dictionary and
+    /// tree dumps use.
+    pub fn feature_name(&self, f: usize) -> String {
+        match self.feature_names.get(f) {
+            Some(name) => name.clone(),
+            None => format!("f{f}"),
+        }
     }
 
     /// Query-group row ranges, defaulting to one group over every row.
@@ -342,6 +392,77 @@ impl DMatrix {
         Ok(())
     }
 
+    /// Name each column, as XGBoost's `DMatrix.feature_names` does.
+    ///
+    /// Names are carried into the model a fit produces, and from there they
+    /// key [`Booster::get_score`] and are what `validate_features` checks a
+    /// prediction matrix against. They are metadata only: no split, gain or
+    /// prediction depends on them.
+    ///
+    /// Mirrors upstream's `feature_names` setter: one name per column, all
+    /// distinct, and none containing `[`, `]` or `<` — those three would be
+    /// unparseable in a tree dump, where a name appears inside `f[x<v]`.
+    /// Passing an empty slice clears the names.
+    ///
+    /// [`Booster::get_score`]: crate::Booster::get_score
+    pub fn set_feature_names<S: AsRef<str>>(&mut self, names: &[S]) -> Result<()> {
+        if names.is_empty() {
+            self.info.feature_names.clear();
+            return Ok(());
+        }
+        if names.len() != self.info.num_col {
+            return Err(Error::DataShape { expected: self.info.num_col, got: names.len() });
+        }
+        let mut seen = std::collections::HashSet::with_capacity(names.len());
+        for (i, name) in names.iter().enumerate() {
+            let name = name.as_ref();
+            if let Some(bad) = name.chars().find(|c| matches!(c, '[' | ']' | '<')) {
+                return Err(Error::invalid(
+                    "feature_names",
+                    format!("name for feature {i} (`{name}`) contains `{bad}`; a feature name \
+                             may not contain `[`, `]` or `<`"),
+                ));
+            }
+            if !seen.insert(name) {
+                return Err(Error::invalid(
+                    "feature_names",
+                    format!("`{name}` is used for more than one feature; names must be unique"),
+                ));
+            }
+        }
+        self.info.feature_names = names.iter().map(|n| n.as_ref().to_owned()).collect();
+        Ok(())
+    }
+
+    /// Weight each column for column sampling, as XGBoost's
+    /// `DMatrix.set_info(feature_weights=...)` does.
+    ///
+    /// A weight only ever matters when some `colsample_*` ratio is below 1:
+    /// the sample is then drawn *proportionally to these weights* instead of
+    /// uniformly, so a heavier column is likelier to be a candidate. A weight
+    /// of zero does not exclude a column outright — upstream floors every
+    /// weight at `kRtEps` before drawing, so a zero-weight column is merely
+    /// last in line — and passing an empty slice clears the weights.
+    ///
+    /// Mirrors `MetaInfo::Validate`: one weight per column, none negative.
+    pub fn set_feature_weights(&mut self, w: &[f32]) -> Result<()> {
+        if w.is_empty() {
+            self.info.feature_weights.clear();
+            return Ok(());
+        }
+        if w.len() != self.info.num_col {
+            return Err(Error::DataShape { expected: self.info.num_col, got: w.len() });
+        }
+        if let Some(bad) = w.iter().position(|v| !(v.is_finite() && *v >= 0.0)) {
+            return Err(Error::invalid(
+                "feature_weights",
+                format!("weight for feature {bad} is {}; must be finite and >= 0", w[bad]),
+            ));
+        }
+        self.info.feature_weights = w.to_vec();
+        Ok(())
+    }
+
     pub fn set_weights(&mut self, w: &[f32]) -> Result<()> {
         if w.len() != self.info.num_row {
             return Err(Error::DataShape { expected: self.info.num_row, got: w.len() });
@@ -408,6 +529,25 @@ fn is_missing(v: f32, missing: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The five spellings `LoadFeatureType` accepts, and nothing else.
+    #[test]
+    fn feature_types_parse_every_spelling_upstream_accepts() {
+        for name in ["int", "float", "i", "q"] {
+            assert_eq!(FeatureType::parse(name).unwrap(), FeatureType::Numerical, "{name}");
+        }
+        assert_eq!(FeatureType::parse("c").unwrap(), FeatureType::Categorical);
+
+        // `q` and `c` are what this crate writes, so both must round-trip.
+        for t in [FeatureType::Numerical, FeatureType::Categorical] {
+            assert_eq!(FeatureType::parse(t.as_str()).unwrap(), t);
+        }
+
+        for bad in ["", "C", "categorical", "quantitative", "num"] {
+            let err = FeatureType::parse(bad).unwrap_err().to_string();
+            assert!(err.contains("feature_types"), "{bad}: {err}");
+        }
+    }
 
     #[test]
     fn dense_drops_missing_and_reports_density() {

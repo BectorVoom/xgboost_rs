@@ -222,6 +222,12 @@ pub struct TreeBoosterParameters {
     /// How rows are drawn when `subsample < 1`.
     pub sampling_method: SamplingMethod,
     /// Column subsample ratio, drawn once per tree.
+    ///
+    /// All three column ratios draw uniformly unless the matrix carries
+    /// [`DMatrix::set_feature_weights`], which makes the draw proportional to
+    /// those weights.
+    ///
+    /// [`DMatrix::set_feature_weights`]: crate::DMatrix::set_feature_weights
     pub colsample_bytree: f32,
     /// Column subsample ratio, drawn once per depth level.
     pub colsample_bylevel: f32,

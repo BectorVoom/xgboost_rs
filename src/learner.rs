@@ -33,6 +33,15 @@ pub struct Learner {
     base_score_override: Option<Vec<f32>>,
     /// Whether the intercept may be estimated from the labels at all.
     boost_from_average: bool,
+    /// Column names, picked up from the training matrix at configure time and
+    /// carried into the saved model. Empty for an unnamed fit.
+    feature_names: Vec<String>,
+    /// Column types in their *file* spelling, which is how upstream's
+    /// `Learner::feature_types_` holds them: a model records the string it was
+    /// given, so one loaded from XGBoost may say `int` or `float` where a fit
+    /// here writes `q`. The typed view the splitters read lives on the matrix,
+    /// as `MetaInfo::feature_types`.
+    feature_types: Vec<String>,
     configured: bool,
     /// Margin cache for the training matrix, updated in place each round.
     train_cache: Vec<f32>,
@@ -56,6 +65,8 @@ impl Learner {
             base_margin: vec![0.5],
             base_score_override: base_score.map(|b| vec![b]),
             boost_from_average: true,
+            feature_names: Vec::new(),
+            feature_types: Vec::new(),
             configured: false,
             train_cache: Vec::new(),
         }
@@ -79,6 +90,8 @@ impl Learner {
             base_margin: vec![0.5],
             base_score_override: base_score.map(|b| vec![b]),
             boost_from_average: true,
+            feature_names: Vec::new(),
+            feature_types: Vec::new(),
             configured: false,
             train_cache: Vec::new(),
         }
@@ -142,6 +155,28 @@ impl Learner {
         &self.metrics
     }
 
+    /// The model's column names, or empty when the fit was unnamed.
+    pub fn feature_names(&self) -> &[String] {
+        &self.feature_names
+    }
+
+    /// The model's column types, in the model file's spelling — `c` for a
+    /// categorical column. Empty when the fit declared none.
+    pub fn feature_types(&self) -> &[String] {
+        &self.feature_types
+    }
+
+    /// Name the model's columns. Called when a saved model is loaded; a fit
+    /// takes them from its training matrix instead.
+    pub(crate) fn set_feature_names(&mut self, names: Vec<String>) {
+        self.feature_names = names;
+    }
+
+    /// Type the model's columns, likewise.
+    pub(crate) fn set_feature_types(&mut self, types: Vec<String>) {
+        self.feature_types = types;
+    }
+
     pub fn boosted_rounds(&self) -> usize {
         self.booster.boosted_rounds()
     }
@@ -164,6 +199,18 @@ impl Learner {
             });
         }
         self.obj.validate_data(info)?;
+
+        // A model takes its column names and types from the matrix it was
+        // fitted on, as `xgboost.train` does through `Booster.feature_names`
+        // and `.feature_types`. A learner that already has them — one loaded
+        // from a saved model, then continued — keeps its own.
+        if self.feature_names.is_empty() {
+            self.feature_names = info.feature_names.clone();
+        }
+        if self.feature_types.is_empty() {
+            self.feature_types =
+                info.feature_types.iter().map(|t| t.as_str().to_owned()).collect();
+        }
 
         let n_groups = self.obj.num_output_group(info).max(1);
         self.booster.set_num_output_group(n_groups);
@@ -302,6 +349,14 @@ impl Learner {
         // The intercept was estimated once, by the fit that produced the base
         // model; re-estimating it here would shift every existing tree.
         self.base_score_override = Some(base.base_score.clone());
+        // The columns are the base model's columns, so its names and types win
+        // over the continuing matrix's — the trees already refer to them.
+        if !base.feature_names.is_empty() {
+            self.feature_names = base.feature_names.clone();
+        }
+        if !base.feature_types.is_empty() {
+            self.feature_types = base.feature_types.clone();
+        }
         Ok(())
     }
 
@@ -335,6 +390,8 @@ impl Learner {
             base_score,
             base_margin,
             boost_from_average: true,
+            feature_names: Vec::new(),
+            feature_types: Vec::new(),
             configured: false,
             train_cache: Vec::new(),
         })

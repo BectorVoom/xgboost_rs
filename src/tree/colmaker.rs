@@ -141,10 +141,11 @@ impl<'a> ColMaker<'a> {
                 param.interaction_constraints.as_ref(),
                 n_features,
             ),
-            column_sampler: ColumnSampler::new(
+            column_sampler: ColumnSampler::weighted(
                 param.colsample_bynode,
                 param.colsample_bylevel,
                 param.colsample_bytree,
+                &dmat.info().feature_weights,
             ),
         }
     }

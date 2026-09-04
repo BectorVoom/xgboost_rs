@@ -179,6 +179,27 @@ fn feature_importance_is_the_weight_vector() {
     assert!(err.contains("gblinear"), "{err}");
 }
 
+/// A named matrix keys the coefficient dictionary by name, and the names
+/// survive the model file — the tree path's behaviour, on the booster that
+/// builds its keys separately.
+#[test]
+fn feature_importance_uses_the_matrix_feature_names() {
+    let mut d = linear_data(300);
+    d.set_feature_names(&["slope", "drop", "nudge"]).unwrap();
+    let p = params(LinearBoosterParameters::builder().eta(0.5).build().unwrap(), 200);
+    let (booster, _) = api::train(&p, &d, &[]).unwrap();
+
+    let score = booster.get_score("weight").unwrap();
+    assert_eq!(score.len(), 3);
+    assert!((score["slope"] - 2.0).abs() < 0.05);
+    assert!((score["drop"] + 3.0).abs() < 0.05);
+    assert!((score["nudge"] - 0.5).abs() < 0.05);
+
+    let reloaded = xgboost_rs::Booster::load_model(&booster.save_model()).unwrap();
+    assert_eq!(reloaded.feature_names(), ["slope", "drop", "nudge"]);
+    assert_eq!(reloaded.get_score("weight").unwrap(), score);
+}
+
 #[test]
 fn the_prediction_kinds_a_linear_model_cannot_answer_are_refused() {
     let d = linear_data(100);

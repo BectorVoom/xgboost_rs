@@ -28,6 +28,18 @@
 //! JSON by [`PredictParameters::to_predict_config`] instead of through
 //! [`ToConfig`].
 //!
+//! Three settings XGBoost documents alongside these are properties of the
+//! *data* rather than the `Learner`, and live on the matrix instead:
+//! [`DMatrix::set_feature_weights`] (which biases the `colsample_*` draws),
+//! [`DMatrix::set_feature_types`] (which marks the categorical columns
+//! `max_cat_to_onehot` and `max_cat_threshold` then apply to) and
+//! [`DMatrix::set_feature_names`] (which names the columns for importances and
+//! for `validate_features`).
+//!
+//! [`DMatrix::set_feature_weights`]: crate::DMatrix::set_feature_weights
+//! [`DMatrix::set_feature_types`]: crate::DMatrix::set_feature_types
+//! [`DMatrix::set_feature_names`]: crate::DMatrix::set_feature_names
+//!
 //! # CPU and GPU
 //!
 //! The device is one parameter, [`Device`], and it changes what the rest mean.

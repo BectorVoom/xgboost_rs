@@ -37,8 +37,8 @@ fn save_linear_model(learner: &Learner, linear: &GBLinear) -> String {
     let doc = json!({
         "learner": {
             "attributes": {},
-            "feature_names": [],
-            "feature_types": [],
+            "feature_names": learner.feature_names(),
+            "feature_types": learner.feature_types(),
             "gradient_booster": {
                 "name": "gblinear",
                 "model": {
@@ -90,8 +90,8 @@ fn save_tree_model(booster: &Booster) -> String {
     let doc = json!({
         "learner": {
             "attributes": {},
-            "feature_names": [],
-            "feature_types": [],
+            "feature_names": learner.feature_names(),
+            "feature_types": learner.feature_types(),
             "gradient_booster": {
                 "model": {
                     "gbtree_model_param": {
@@ -313,9 +313,45 @@ pub fn load_model(text: &str) -> Result<Booster> {
     gbm.model =
         GBTreeModel { tree_weight, trees, tree_info, num_feature, num_parallel_tree, num_output_group };
 
-    let learner =
+    let mut learner =
         Learner::from_model(obj, vec![metric], GradientBooster::Tree(gbm), base_score)?;
+    learner.set_feature_names(parse_string_array(learner_json, "feature_names")?);
+    learner.set_feature_types(parse_feature_types(learner_json)?);
     Ok(Booster::from_learner(learner))
+}
+
+/// A string array of the learner header, if the model carries one.
+///
+/// Absent, `null` and `[]` all mean "unset", which is what upstream writes for
+/// a model fitted through the C API without that information. A non-string
+/// entry is a malformed file rather than something to guess at.
+fn parse_string_array(learner_json: &Value, field: &str) -> Result<Vec<String>> {
+    let Some(array) = learner_json.get(field).and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    array
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| Error::ModelFormat(format!("`{field}` holds a non-string")))
+        })
+        .collect()
+}
+
+/// The `feature_types` array, checked against the five spellings upstream
+/// accepts.
+///
+/// The strings are kept as written rather than normalised, so a model that
+/// came in saying `int` goes back out saying `int`; the check is only that
+/// every one of them is a type this crate could act on.
+fn parse_feature_types(learner_json: &Value) -> Result<Vec<String>> {
+    let types = parse_string_array(learner_json, "feature_types")?;
+    for name in &types {
+        crate::data::FeatureType::parse(name)
+            .map_err(|e| Error::ModelFormat(e.to_string()))?;
+    }
+    Ok(types)
 }
 
 /// Parse a `gblinear` model.
@@ -363,12 +399,14 @@ fn load_linear_model(learner_json: &Value) -> Result<Booster> {
     let metric = crate::metric::create(&obj.default_metric())?;
     let model =
         GBLinearModel { weight, num_feature, num_output_group, num_boosted_rounds };
-    let learner = Learner::from_model(
+    let mut learner = Learner::from_model(
         obj,
         vec![metric],
         GradientBooster::Linear(Box::new(GBLinear::from_model(model))),
         base_score,
     )?;
+    learner.set_feature_names(parse_string_array(learner_json, "feature_names")?);
+    learner.set_feature_types(parse_feature_types(learner_json)?);
     Ok(Booster::from_learner(learner))
 }
 

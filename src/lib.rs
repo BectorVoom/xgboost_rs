@@ -45,7 +45,8 @@
 //!
 //! **Tree booster** — `eta`, `gamma`, `max_depth`, `max_leaves`, `max_bin`,
 //! `grow_policy`, `min_child_weight`, `lambda`, `alpha`, `max_delta_step`,
-//! `subsample` with either `sampling_method`, all three `colsample_*` ratios,
+//! `subsample` with either `sampling_method`, all three `colsample_*` ratios
+//! (weighted by the matrix's `feature_weights` when it carries them),
 //! `num_parallel_tree`, `monotone_constraints`, `interaction_constraints` and
 //! `max_cached_hist_node`.
 //!
@@ -90,6 +91,16 @@
 //! **Training loop** — `num_boost_round`, `early_stopping_rounds`,
 //! `verbose_eval` and `maximize`.
 //!
+//! **Matrix metadata** — everything a `DMatrix` carries: `label` (single and
+//! multi-target), `weight`, `base_margin`, `group`/`qid`, the two AFT label
+//! bounds, `feature_types` (which is what marks a column categorical),
+//! `feature_weights` and `feature_names`. Names and types are part of the
+//! *model*, not just of the matrix: a fit takes both from `dtrain` and saves
+//! them in the model file, names key [`Booster::get_score`] and are what
+//! `validate_features` checks a prediction matrix against.
+//! [`Booster::get_score`] reports all five importance types — `weight`, `gain`,
+//! `total_gain`, `cover`, `total_cover`.
+//!
 //! ## What is rejected rather than ignored
 //!
 //! A parameter that selects an algorithm this crate does not have is an error
@@ -101,8 +112,9 @@
 //! `max_cat_threshold`, `use_rmm`, `fail_on_invalid_gpu_id` — are accepted but
 //! inert, as are the ones whose stage this fit does not run
 //! (`default_direction` and `opt_dense_col` outside `exact`, `refresh_leaf`
-//! without `refresh`, `max_bin` under `exact`). Setting `validate_parameters`
-//! makes the fit say so, naming each one.
+//! without `refresh`, `max_bin` under `exact`, `feature_weights` with every
+//! `colsample_*` left at 1). Setting `validate_parameters` makes the fit say
+//! so, naming each one.
 //!
 //! Two further modules stand beside them:
 //!

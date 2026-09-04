@@ -105,6 +105,44 @@ impl Booster {
         tree.apply_training_dropout(seed, dmat, values);
     }
 
+    /// Check a prediction matrix against the model, as
+    /// `Booster._validate_features` does: the column count always, and the
+    /// column *names* whenever both the model and the matrix have them.
+    ///
+    /// Names are compared in order, because a column's meaning here is its
+    /// position — a matrix whose names are merely a permutation of the model's
+    /// would predict nonsense, so it is rejected rather than reordered. A
+    /// matrix that is simply unnamed is accepted: it carries no claim to
+    /// contradict.
+    fn validate_features(&self, dmat: &DMatrix) -> Result<()> {
+        if dmat.num_col() != self.num_features() {
+            return Err(Error::invalid(
+                "validate_features",
+                format!(
+                    "the model has {} features, the matrix has {}",
+                    self.num_features(),
+                    dmat.num_col()
+                ),
+            ));
+        }
+        let want = self.feature_names();
+        let got = &dmat.info().feature_names;
+        if want.is_empty() || got.is_empty() || want == got.as_slice() {
+            return Ok(());
+        }
+        let mismatched: Vec<String> = want
+            .iter()
+            .zip(got)
+            .enumerate()
+            .filter(|(_, (w, g))| w != g)
+            .map(|(i, (w, g))| format!("feature {i}: model `{w}`, matrix `{g}`"))
+            .collect();
+        Err(Error::invalid(
+            "validate_features",
+            format!("feature name mismatch: {}", mismatched.join("; ")),
+        ))
+    }
+
     /// The tree ensemble, or an error naming the booster that has none.
     fn tree_model(&self) -> Result<&crate::gbm::GBTree> {
         self.learner.gbm().ok_or_else(|| {
@@ -122,15 +160,8 @@ impl Booster {
     /// being accepted and ignored.
     pub fn predict_with(&self, params: &PredictParameters, dmat: &DMatrix) -> Result<Prediction> {
         params.validate()?;
-        if params.validate_features && dmat.num_col() != self.num_features() {
-            return Err(Error::invalid(
-                "validate_features",
-                format!(
-                    "the model has {} features, the matrix has {}",
-                    self.num_features(),
-                    dmat.num_col()
-                ),
-            ));
+        if params.validate_features {
+            self.validate_features(dmat)?;
         }
         let n_rows = dmat.num_row();
         let n_groups = self.learner.num_output_group();
@@ -334,10 +365,53 @@ impl Booster {
         Self { learner, best_iteration: None, best_score: None }
     }
 
-    /// Feature importance, keyed `"f{index}"` as XGBoost reports it.
+    /// The model's column names, or empty when it was fitted on an unnamed
+    /// matrix.
     ///
-    /// `"weight"` counts splits per feature; `"gain"` averages the loss
-    /// reduction of those splits.
+    /// A fit takes these from `dtrain`, exactly as `xgboost.train` takes them
+    /// through `Booster.feature_names`, and they survive [`Booster::save_model`].
+    pub fn feature_names(&self) -> &[String] {
+        self.learner.feature_names()
+    }
+
+    /// The model's column types in the model file's spelling — `c` for a
+    /// categorical column, one of `q`, `int`, `float` or `i` for a numerical
+    /// one. Empty when the fit declared none.
+    ///
+    /// A fit takes these from `dtrain`'s [`FeatureType`]s, which have no
+    /// int/float distinction, so it writes `q` for every numerical column; a
+    /// model loaded from XGBoost keeps whichever of the four it was saved with.
+    ///
+    /// [`FeatureType`]: crate::FeatureType
+    pub fn feature_types(&self) -> &[String] {
+        self.learner.feature_types()
+    }
+
+    /// Name of feature `f`, which is the model's own name for it when it has
+    /// one and `f{index}` when it does not.
+    fn feature_key(&self, f: usize) -> String {
+        match self.feature_names().get(f) {
+            Some(name) => name.clone(),
+            None => format!("f{f}"),
+        }
+    }
+
+    /// Feature importance, keyed by [`Booster::feature_names`] — or `"f{index}"`
+    /// for a model fitted on an unnamed matrix, as XGBoost falls back to.
+    ///
+    /// The five types `Booster.get_score` defines, all computed over the
+    /// internal nodes that split on a feature:
+    ///
+    /// | `importance_type` | Value |
+    /// |---|---|
+    /// | `weight` | how many splits used the feature |
+    /// | `gain` | mean loss reduction of those splits |
+    /// | `total_gain` | summed loss reduction |
+    /// | `cover` | mean hessian sum reaching those splits |
+    /// | `total_cover` | summed hessian sum |
+    ///
+    /// A feature nothing splits on is absent rather than zero, which is what
+    /// upstream's dictionary does too.
     pub fn get_score(&self, importance_type: &str) -> Result<BTreeMap<String, f64>> {
         // `GBLinear::FeatureScore` defines only `weight`, and defines it as the
         // model's own coefficients rather than a split count.
@@ -354,9 +428,10 @@ impl Booster {
             let n_groups = linear.model.num_output_group;
             return Ok((0..linear.model.num_feature)
                 .flat_map(|f| {
+                    let name = self.feature_key(f);
                     (0..n_groups).map(move |g| {
                         let key =
-                            if n_groups == 1 { format!("f{f}") } else { format!("f{f}-{g}") };
+                            if n_groups == 1 { name.clone() } else { format!("{name}-{g}") };
                         (key, f, g)
                     })
                 })
@@ -365,6 +440,7 @@ impl Booster {
         }
         let mut counts: BTreeMap<u32, f64> = BTreeMap::new();
         let mut gains: BTreeMap<u32, f64> = BTreeMap::new();
+        let mut covers: BTreeMap<u32, f64> = BTreeMap::new();
         for tree in &self.tree_model()?.model.trees {
             for (nid, node) in tree.nodes.iter().enumerate() {
                 if node.is_leaf() {
@@ -372,16 +448,30 @@ impl Booster {
                 }
                 *counts.entry(node.split_index).or_default() += 1.0;
                 *gains.entry(node.split_index).or_default() += tree.stats[nid].loss_chg as f64;
+                *covers.entry(node.split_index).or_default() += tree.stats[nid].sum_hess as f64;
             }
         }
+        // `gain`/`cover` are the totals averaged over the splits that produced
+        // them, so both share `counts` as the divisor.
+        let mean = |totals: &BTreeMap<u32, f64>| -> BTreeMap<String, f64> {
+            totals.iter().map(|(f, v)| (self.feature_key(*f as usize), v / counts[f])).collect()
+        };
+        let total = |totals: &BTreeMap<u32, f64>| -> BTreeMap<String, f64> {
+            totals.iter().map(|(f, v)| (self.feature_key(*f as usize), *v)).collect()
+        };
         let out = match importance_type {
-            "weight" => counts.iter().map(|(f, c)| (format!("f{f}"), *c)).collect(),
-            "gain" => gains.iter().map(|(f, g)| (format!("f{f}"), g / counts[f])).collect(),
-            "total_gain" => gains.iter().map(|(f, g)| (format!("f{f}"), *g)).collect(),
+            "weight" => total(&counts),
+            "gain" => mean(&gains),
+            "total_gain" => total(&gains),
+            "cover" => mean(&covers),
+            "total_cover" => total(&covers),
             other => {
                 return Err(Error::invalid(
                     "importance_type",
-                    format!("`{other}` is not supported; use weight, gain or total_gain"),
+                    format!(
+                        "`{other}` is not supported; use weight, gain, total_gain, cover or \
+                         total_cover"
+                    ),
                 ));
             }
         };
@@ -499,7 +589,7 @@ pub fn train_from(
             eprintln!("[xgboost_rs] WARNING: {warning}");
         }
         if general.validate_parameters {
-            for name in unused_parameters(params, tree, dtrain.info().has_categorical()) {
+            for name in unused_parameters(params, tree, dtrain.info()) {
                 eprintln!(
                     "[xgboost_rs] WARNING: parameter `{name}` was set but nothing in this \
                      fit consumed it"
@@ -801,10 +891,21 @@ fn check_supported_tree_options(
 fn unused_parameters(
     params: &TrainingParameters,
     tree: Option<&TreeBoosterParameters>,
-    has_categorical: bool,
+    info: &crate::data::MetaInfo,
 ) -> Vec<String> {
     let mut unused = Vec::new();
     let default = TreeBoosterParameters::default();
+    let has_categorical = info.has_categorical();
+
+    // `feature_weights` only ever changes a *column sample*, so a fit that
+    // samples every column — or has no columns to sample, as `gblinear` — reads
+    // it nowhere.
+    let samples_columns = tree.is_some_and(|t| {
+        t.colsample_bytree < 1.0 || t.colsample_bylevel < 1.0 || t.colsample_bynode < 1.0
+    });
+    if !info.feature_weights.is_empty() && !samples_columns {
+        unused.push("feature_weights".to_owned());
+    }
 
     if let Some(tree) = tree {
         let updaters =

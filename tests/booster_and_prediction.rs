@@ -390,6 +390,144 @@ fn validate_features_rejects_a_mismatched_matrix() {
     assert!(booster.predict_with(&unchecked, &other).is_ok());
 }
 
+// --------------------------------------------- feature names and types --
+
+/// Names travel from the training matrix into the model, key the importance
+/// dictionary, and survive a save/load round trip.
+#[test]
+fn feature_names_reach_the_model_and_its_importances() {
+    const NAMES: [&str; 3] = ["age", "income", "tenure"];
+    let mut d = data(200, 3);
+    d.set_feature_names(&NAMES).unwrap();
+
+    let booster = train(&tree(6), &d);
+    assert_eq!(booster.feature_names(), NAMES);
+
+    let score = booster.get_score("gain").unwrap();
+    assert!(!score.is_empty(), "the model must split on something");
+    for key in score.keys() {
+        assert!(NAMES.contains(&key.as_str()), "unexpected importance key `{key}`");
+    }
+
+    // An unnamed fit keeps XGBoost's `f{index}` fallback.
+    let unnamed = train(&tree(6), &data(200, 3));
+    assert!(unnamed.feature_names().is_empty());
+    assert!(unnamed.get_score("gain").unwrap().keys().all(|k| k.starts_with('f')));
+
+    let reloaded = Booster::load_model(&booster.save_model()).unwrap();
+    assert_eq!(reloaded.feature_names(), NAMES);
+    assert_eq!(reloaded.get_score("weight").unwrap(), booster.get_score("weight").unwrap());
+}
+
+/// `validate_features` compares names, not just the column count — a matrix
+/// whose columns are named differently is a different matrix.
+#[test]
+fn validate_features_rejects_mismatched_names() {
+    let mut d = data(80, 3);
+    d.set_feature_names(&["a", "b", "c"]).unwrap();
+    let booster = train(&tree(3), &d);
+
+    let checking = PredictParameters::default();
+    booster.predict_with(&checking, &d).unwrap();
+
+    let mut renamed = data(80, 3);
+    renamed.set_feature_names(&["a", "z", "c"]).unwrap();
+    match booster.predict_with(&checking, &renamed) {
+        Ok(_) => panic!("a matrix with a different feature name should be rejected"),
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(msg.contains("feature 1") && msg.contains('b') && msg.contains('z'), "{msg}");
+        }
+    }
+
+    // An unnamed matrix makes no claim to contradict, so it still predicts.
+    booster.predict_with(&checking, &data(80, 3)).unwrap();
+
+    // And the check can be turned off, as for the column-count case.
+    let unchecked = PredictParameters::builder().validate_features(false).build().unwrap();
+    booster.predict_with(&unchecked, &renamed).unwrap();
+}
+
+#[test]
+fn malformed_feature_names_are_rejected() {
+    let mut d = data(20, 3);
+
+    let err = d.set_feature_names(&["a", "b"]).unwrap_err().to_string();
+    assert!(err.contains('3') && err.contains('2'), "{err}");
+
+    let err = d.set_feature_names(&["a", "b", "a"]).unwrap_err().to_string();
+    assert!(err.contains("unique"), "{err}");
+
+    for bad in ["x[0]", "a<b", "]"] {
+        let err = d.set_feature_names(&["a", "b", bad]).unwrap_err().to_string();
+        assert!(err.contains("feature_names"), "{bad}: {err}");
+    }
+
+    assert!(d.info().feature_names.is_empty(), "a rejection must not half-apply");
+
+    // An empty slice clears rather than fails.
+    d.set_feature_names(&["a", "b", "c"]).unwrap();
+    d.set_feature_names::<&str>(&[]).unwrap();
+    assert!(d.info().feature_names.is_empty());
+}
+
+/// Column types reach the model and survive its file, in the spelling the
+/// model format uses.
+#[test]
+fn feature_types_reach_the_model_and_its_file() {
+    use xgboost_rs::FeatureType::{Categorical, Numerical};
+
+    let mut d = data(200, 3);
+    d.set_feature_types(&[Numerical, Categorical, Numerical]).unwrap();
+    // Column 1 is read as category codes now, so it must hold whole codes.
+    let booster = train(&tree(4), &d);
+    assert_eq!(booster.feature_types(), ["q", "c", "q"]);
+
+    let text = booster.save_model();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["learner"]["feature_types"], serde_json::json!(["q", "c", "q"]));
+
+    let reloaded = Booster::load_model(&text).unwrap();
+    assert_eq!(reloaded.feature_types(), ["q", "c", "q"]);
+    assert_eq!(text, reloaded.save_model(), "the round trip is stable");
+
+    // A fit that declared no types records none, rather than inventing `q`s.
+    assert!(train(&tree(4), &data(200, 3)).feature_types().is_empty());
+}
+
+/// XGBoost records the type string it was *given*, so a model may say `int`,
+/// `float` or `i` where a fit here would say `q`. Those must come back out
+/// unchanged rather than normalised — a re-saved model should still be the
+/// model that was loaded.
+#[test]
+fn a_loaded_model_keeps_the_type_spellings_it_came_with() {
+    let booster = train(&tree(3), &data(120, 3));
+    let mut json: serde_json::Value = serde_json::from_str(&booster.save_model()).unwrap();
+    json["learner"]["feature_types"] = serde_json::json!(["int", "float", "i"]);
+
+    let loaded = Booster::load_model(&json.to_string()).unwrap();
+    assert_eq!(loaded.feature_types(), ["int", "float", "i"]);
+
+    let resaved: serde_json::Value = serde_json::from_str(&loaded.save_model()).unwrap();
+    assert_eq!(resaved["learner"]["feature_types"], serde_json::json!(["int", "float", "i"]));
+}
+
+#[test]
+fn a_model_naming_an_unreadable_feature_type_is_rejected() {
+    let booster = train(&tree(3), &data(120, 3));
+    let mut json: serde_json::Value = serde_json::from_str(&booster.save_model()).unwrap();
+    json["learner"]["feature_types"] = serde_json::json!(["q", "categorical", "q"]);
+
+    let err = match Booster::load_model(&json.to_string()) {
+        Ok(_) => panic!("`categorical` is not one of the five spellings"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("categorical") && err.contains('c'), "{err}");
+
+    json["learner"]["feature_types"] = serde_json::json!(["q", 3, "q"]);
+    assert!(Booster::load_model(&json.to_string()).is_err(), "a non-string is malformed");
+}
+
 /// Leaf prediction cannot start part-way through the model, and says so.
 #[test]
 fn leaf_prediction_rejects_a_non_zero_range_start() {

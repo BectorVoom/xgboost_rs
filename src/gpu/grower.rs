@@ -265,10 +265,11 @@ impl<R: Runtime> GpuHistGrower<R> {
             n_rows: dmat.num_row(),
             n_features,
             n_bins: cuts.total_bins(),
-            column_sampler: ColumnSampler::new(
+            column_sampler: ColumnSampler::weighted(
                 param.colsample_bynode,
                 param.colsample_bylevel,
                 param.colsample_bytree,
+                &dmat.info().feature_weights,
             ),
             constraints: InteractionConstraints::new(
                 param.interaction_constraints.as_ref(),

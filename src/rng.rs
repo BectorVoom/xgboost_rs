@@ -26,6 +26,12 @@
 //! therefore reproducible run to run here, and statistically identical to
 //! upstream, but a fit with `colsample_* < 1` is not guaranteed to pick the
 //! same columns as a given XGBoost build.
+//!
+//! *Weighted* column sampling is the exception: with `feature_weights` set,
+//! upstream draws through `std::uniform_real_distribution<float>` rather than
+//! shuffling, and that is `generate_canonical` — fully specified. So the
+//! columns a weighted sample keeps ([`canonical_f32_from_mt`]) are the columns
+//! upstream keeps, whatever standard library it was built against.
 
 /// `std::mt19937`, the engine behind XGBoost's `Context::Rng()`.
 ///
@@ -197,8 +203,15 @@ impl MinStdRand {
     /// `m - 2` and every draw has 1 subtracted before scaling. An engine whose
     /// minimum is 0 — `mt19937`, which [`uniform_int_below`] serves — makes
     /// both a no-op, which is why only this one has to say so.
+    ///
+    /// `n == 1` has only one answer but is **not** short-circuited: the C++
+    /// distribution still calls the engine, and the caller — the `mean`
+    /// LambdaMART pair sampler — keeps drawing from that same engine for the
+    /// rest of its query group. Skipping the draw would leave every later pair
+    /// in the group reading a different number. Only `n == 0`, which no caller
+    /// produces, answers without touching the engine.
     pub fn next_below(&mut self, n: usize) -> usize {
-        if n <= 1 {
+        if n == 0 {
             return 0;
         }
         let range = n as u64;
@@ -262,6 +275,20 @@ pub fn canonical_f64_from_mt(rng: &mut Mt19937) -> f64 {
     let sum = lo + hi * 4_294_967_296.0;
     let u = sum / 18_446_744_073_709_551_616.0;
     if u >= 1.0 { F64_JUST_BELOW_ONE } else { u }
+}
+
+/// `std::generate_canonical<float, 24, std::mt19937>`, i.e. what
+/// `std::uniform_real_distribution<float>{0, 1}` reduces to.
+///
+/// A `float` mantissa is 24 bits and the engine's range is 2^32, so the
+/// standard's `k = ceil(bits / log2(range))` is a **single** draw — unlike the
+/// two [`canonical_f64_from_mt`] takes. Weighted column sampling draws one of
+/// these per candidate feature, so the draw count is what keeps its engine
+/// stream aligned with upstream's.
+#[inline]
+pub fn canonical_f32_from_mt(rng: &mut Mt19937) -> f32 {
+    let u = rng.next_u32() as f32 / 4_294_967_296.0;
+    if u >= 1.0 { F32_JUST_BELOW_ONE } else { u }
 }
 
 /// A uniform integer in `[0, n)`, following libstdc++'s
@@ -430,6 +457,26 @@ mod tests {
         assert!((rate - 0.25).abs() < 0.01, "rate {rate}");
     }
 
+    /// One engine draw, scaled into `[0, 1)`. The draw *count* is the part
+    /// that has to be right, so it is asserted directly rather than inferred
+    /// from the value.
+    #[test]
+    fn canonical_f32_takes_one_draw_and_stays_in_the_unit_interval() {
+        let mut rng = Mt19937::new(0);
+        let u = canonical_f32_from_mt(&mut rng);
+        assert_eq!(u, 2_357_136_044u32 as f32 / 4_294_967_296.0);
+
+        let mut counted = Mt19937::new(0);
+        counted.next_u32();
+        assert_eq!(rng.next_u32(), counted.next_u32(), "exactly one draw consumed");
+
+        let mut rng = Mt19937::new(7);
+        for _ in 0..10_000 {
+            let u = canonical_f32_from_mt(&mut rng);
+            assert!((0.0..1.0).contains(&u), "{u}");
+        }
+    }
+
     #[test]
     fn shuffle_is_a_permutation_and_depends_on_the_engine() {
         let mut a: Vec<u32> = (0..64).collect();
@@ -454,6 +501,30 @@ mod tests {
         let mut one = vec![7u32];
         shuffle(&mut one, &mut rng);
         assert_eq!(one, vec![7]);
+    }
+
+    /// A single-outcome draw still costs an engine step.
+    ///
+    /// `std::uniform_int_distribution<T>(0, 0)` has one answer but still calls
+    /// the engine, and the `mean` LambdaMART pair sampler keeps drawing from
+    /// that engine for the rest of its query group — so answering `0` for free
+    /// shifts every later pair in the group. It is what made
+    /// `lambdarank_pair_method=mean` diverge from XGBoost on exactly the groups
+    /// where a relevance bucket left one document outside it.
+    #[test]
+    fn a_single_outcome_draw_still_advances_the_engine() {
+        let mut rng = MinStdRand::new(7);
+        assert_eq!(rng.next_below(1), 0);
+        let mut stepped = MinStdRand::new(7);
+        stepped.next_u32();
+        assert_eq!(rng.next_u32(), stepped.next_u32());
+
+        // Same for the mt19937 distribution, which never took the shortcut.
+        let mut rng = Mt19937::new(7);
+        assert_eq!(uniform_int_below(&mut rng, 1), 0);
+        let mut stepped = Mt19937::new(7);
+        stepped.next_u32();
+        assert_eq!(rng.next_u32(), stepped.next_u32());
     }
 
     #[test]

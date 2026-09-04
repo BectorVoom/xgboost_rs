@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{CASES, f32_array, load_data, load_json};
+use common::{CASES, f32_array, load_data, load_json, u32_array};
 use serde_json::Value;
 use xgboost_rs::parameters::{
     BoosterParameters, EvalMetric, LearningTaskParameters, Objective, TrainingParameters,
@@ -187,6 +187,61 @@ fn feature_importance_matches_xgboost() {
         }
     }
     assert!(failures.is_empty(), "feature importance differs:\n{}", failures.join("\n"));
+}
+
+/// `cover` and `total_cover` against the fixture's own node statistics.
+///
+/// The fixture is a pinned XGBoost model dump, so its `sum_hessian` array *is*
+/// upstream's answer; summing it per split feature is exactly what
+/// `Booster.get_score` does. Comparing against it therefore pins two things at
+/// once — the aggregation, and the per-node covers this crate computes — even
+/// though `gen_fixtures.py` records no `score_cover` of its own.
+///
+/// `weighted` is the case that makes this more than a row count: with row
+/// weights the hessians are no longer all 1, so a cover is a real weighted sum.
+#[test]
+fn cover_importance_matches_xgboost() {
+    for (case, data) in CASES {
+        let (booster, _, fixture, _) = train_case(case, data);
+
+        let mut counts: std::collections::BTreeMap<u32, f64> = Default::default();
+        let mut covers: std::collections::BTreeMap<u32, f64> = Default::default();
+        for tree in fixture["trees"].as_array().unwrap() {
+            let left = tree["left_children"].as_array().unwrap();
+            let indices = u32_array(&tree["split_indices"]);
+            let hess = f32_array(&tree["sum_hessian"]);
+            for (nid, l) in left.iter().enumerate() {
+                if l.as_i64().unwrap() == -1 {
+                    continue;
+                }
+                *counts.entry(indices[nid]).or_default() += 1.0;
+                *covers.entry(indices[nid]).or_default() += hess[nid] as f64;
+            }
+        }
+
+        for kind in ["cover", "total_cover"] {
+            let got = booster.get_score(kind).unwrap();
+            assert_eq!(got.len(), covers.len(), "{case}: {kind} covers a different feature set");
+            for (feature, total) in &covers {
+                let want =
+                    if kind == "cover" { total / counts[feature] } else { *total };
+                let g = got[&format!("f{feature}")];
+                assert!(
+                    (g - want).abs() <= 1e-5 * want.abs().max(1.0),
+                    "{case}: {kind} for f{feature}: {g} != {want}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn unknown_importance_types_are_rejected_by_name() {
+    let (booster, ..) = train_case("dense_small_b16_d3", "dense_small");
+    let err = booster.get_score("total_weight").unwrap_err().to_string();
+    for expected in ["weight", "gain", "total_gain", "cover", "total_cover"] {
+        assert!(err.contains(expected), "`{expected}` missing from the message: {err}");
+    }
 }
 
 #[test]

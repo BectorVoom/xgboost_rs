@@ -100,6 +100,20 @@ fn split_features(booster: &Booster) -> BTreeSet<u32> {
     used
 }
 
+/// The fraction of the model's splits that fall on `features`.
+///
+/// A count rather than a set, because what column weighting changes is *how
+/// often* a column is a candidate, not whether it can ever be one.
+fn split_share(booster: &Booster, features: &[u32]) -> f64 {
+    let counts = booster.get_score("weight").unwrap();
+    let total: f64 = counts.values().sum();
+    if total == 0.0 {
+        return 0.0;
+    }
+    let hit: f64 = features.iter().filter_map(|f| counts.get(&format!("f{f}"))).sum();
+    hit / total
+}
+
 /// The leaf values of the first tree, in node order.
 fn leaves(booster: &Booster, tree_idx: usize) -> Vec<f32> {
     let model: serde_json::Value = serde_json::from_str(&booster.save_model()).unwrap();
@@ -271,6 +285,103 @@ fn the_column_ratios_compose() {
     let used = split_features(&booster);
     assert!(!used.is_empty(), "the tree must still grow");
     assert!(used.len() <= 5, "nothing outside the per-tree sample may be used: {used:?}");
+}
+
+/// `feature_weights` steers *which* columns a sample keeps. Every column here
+/// carries real signal, so an unweighted fit spreads its splits over all of
+/// them; weighting a handful heavily should concentrate the splits there.
+#[test]
+fn feature_weights_steer_the_column_sample() {
+    const COLS: usize = 12;
+    let heavy: [u32; 3] = [1, 5, 9];
+
+    let mut weighted = data(2000, COLS);
+    let w: Vec<f32> =
+        (0..COLS).map(|c| if heavy.contains(&(c as u32)) { 100.0 } else { 1.0 }).collect();
+    weighted.set_feature_weights(&w).unwrap();
+
+    let tree = TreeBoosterParameters { colsample_bynode: 0.25, ..Default::default() };
+    let p = params(tree, 6);
+
+    let plain_share = split_share(&train(&p, &data(2000, COLS)), &heavy);
+    let weighted_share = split_share(&train(&p, &weighted), &heavy);
+
+    assert!(
+        weighted_share > plain_share + 0.25,
+        "weighted fit used the heavy columns for {weighted_share:.2} of its splits, \
+         unweighted {plain_share:.2}"
+    );
+}
+
+/// A weight of zero is a strong preference, not a mask: upstream floors every
+/// weight at `kRtEps`, so the column stays reachable — just barely. What must
+/// hold is that the fit still trains, and stops leaning on it.
+#[test]
+fn a_zero_feature_weight_all_but_removes_a_column() {
+    const COLS: usize = 8;
+    let mut d = data(2000, COLS);
+    // Column 0 is the strongest signal (`data` weights features by 1/(c+1)),
+    // so an unweighted fit leans on it hardest — the clearest thing to starve.
+    let mut w = vec![1.0f32; COLS];
+    w[0] = 0.0;
+    d.set_feature_weights(&w).unwrap();
+
+    let tree = TreeBoosterParameters { colsample_bynode: 0.5, ..Default::default() };
+    let p = params(tree, 6);
+
+    let plain = split_share(&train(&p, &data(2000, COLS)), &[0]);
+    let starved = split_share(&train(&p, &d), &[0]);
+    assert!(plain > 0.2, "the unweighted fit should favour column 0, got {plain:.2}");
+    assert!(starved < 0.02, "a zero-weight column should all but vanish, got {starved:.2}");
+    assert!(!split_features(&train(&p, &d)).is_empty(), "the fit must still grow trees");
+}
+
+/// Weights are a *sampling* preference, so with nothing being sampled they can
+/// change nothing — and the fit must be the identical model, not merely a
+/// similar one.
+#[test]
+fn feature_weights_do_nothing_without_column_sampling() {
+    let mut d = data(1000, 6);
+    let plain = train(&params(TreeBoosterParameters::default(), 4), &data(1000, 6));
+    d.set_feature_weights(&[1.0, 50.0, 1.0, 50.0, 1.0, 50.0]).unwrap();
+    let weighted = train(&params(TreeBoosterParameters::default(), 4), &d);
+    assert_eq!(plain.save_model(), weighted.save_model());
+}
+
+#[test]
+fn weighted_column_sampling_is_reproducible_and_seed_dependent() {
+    let mut d = data(1000, 10);
+    d.set_feature_weights(&[1.0, 9.0, 2.0, 8.0, 3.0, 7.0, 4.0, 6.0, 5.0, 5.0]).unwrap();
+
+    let tree = TreeBoosterParameters { colsample_bytree: 0.5, ..Default::default() };
+    let p = params(tree, 5);
+    assert_eq!(train(&p, &d).save_model(), train(&p, &d).save_model());
+
+    let mut other = p.clone();
+    other.booster.learning.seed = 11;
+    assert_ne!(train(&p, &d).save_model(), train(&other, &d).save_model());
+}
+
+#[test]
+fn malformed_feature_weights_are_rejected() {
+    let mut d = data(100, 4);
+
+    let err = d.set_feature_weights(&[1.0, 1.0, 1.0]).unwrap_err().to_string();
+    assert!(err.contains('4') && err.contains('3'), "{err}");
+
+    let err = d.set_feature_weights(&[1.0, -1.0, 1.0, 1.0]).unwrap_err().to_string();
+    assert!(err.contains("feature_weights") && err.contains('1'), "{err}");
+
+    let err = d.set_feature_weights(&[1.0, 1.0, f32::NAN, 1.0]).unwrap_err().to_string();
+    assert!(err.contains("feature_weights"), "{err}");
+
+    // None of the rejections may have half-applied.
+    assert!(d.info().feature_weights.is_empty());
+
+    // An empty slice clears rather than fails, which is how a caller undoes it.
+    d.set_feature_weights(&[1.0, 2.0, 3.0, 4.0]).unwrap();
+    d.set_feature_weights(&[]).unwrap();
+    assert!(d.info().feature_weights.is_empty());
 }
 
 #[test]
