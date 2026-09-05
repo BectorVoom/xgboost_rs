@@ -87,6 +87,9 @@ fn fit_both(
 /// the tree agrees exactly. This is the strong claim, so it is checked on every
 /// parameter combination below.
 fn compare_exact(dmat: &DMatrix, tree: TreeBoosterParameters) {
+    if !has_f64() {
+        return;
+    }
     let ((cpu_nodes, cpu_pred), (gpu_nodes, gpu_pred)) = fit_both(dmat, tree, 1);
     assert_eq!(gpu_nodes, cpu_nodes, "node counts");
     assert_eq!(gpu_pred, cpu_pred, "predictions");
@@ -103,6 +106,9 @@ fn compare_exact(dmat: &DMatrix, tree: TreeBoosterParameters) {
 /// configurations, the largest gap is 2% of train RMSE, and it favours the
 /// device; the bound below is set just above that.
 fn compare_accuracy(dmat: &DMatrix, tree: TreeBoosterParameters, rounds: u32) {
+    if !has_f64() {
+        return;
+    }
     let ((_, cpu_pred), (_, gpu_pred)) = fit_both(dmat, tree, rounds);
     let labels = &dmat.info().labels;
     let rmse = |p: &[f32]| -> f64 {
@@ -113,6 +119,15 @@ fn compare_accuracy(dmat: &DMatrix, tree: TreeBoosterParameters, rounds: u32) {
     let (c, g) = (rmse(&cpu_pred), rmse(&gpu_pred));
     assert!(g <= c * 1.03, "device fit is worse: train rmse cpu {c} vs gpu {g}");
     assert!(c <= g * 1.03, "device fit diverged further than expected: cpu {c} vs gpu {g}");
+}
+
+/// The split gain arithmetic, the quantiser and the linear solver are ports of
+/// XGBoost's `double`, so a backend with no `f64` cannot run them and refuses
+/// at construction with `Error::NoF64Support`. Metal is that backend: MSL has
+/// no `double` at all. Nothing to compare there — see
+/// `xgboost_rs::gpu::supports_f64`.
+fn has_f64() -> bool {
+    xgboost_rs::gpu::supports_f64(&xgboost_rs::gpu::default_client(0))
 }
 
 #[test]
@@ -263,6 +278,9 @@ fn approx_matches_with_missing_values_and_lossguide() {
 /// the re-sketch — which would leave the per-round path untested.
 #[test]
 fn approx_re_sketches_every_round_on_both_devices() {
+    if !has_f64() {
+        return;
+    }
     let d = {
         let mut d = data(1500, 5, 0.0, 71);
         // Labels in {0, 1} so the logistic hessian p(1-p) moves with the fit.
@@ -530,4 +548,24 @@ fn rejects_sycl() {
         Ok(_) => panic!("a SYCL fit must be refused"),
     };
     assert!(err.to_string().contains("SYCL"), "{err}");
+}
+
+/// A backend with no `f64` refuses a device fit by name rather than failing
+/// inside a launch, and a backend with one trains. Pins both halves, so the
+/// skips the other tests take on Metal are not the only thing asserting it.
+#[test]
+fn a_backend_without_f64_refuses_the_fit() {
+    let dmat = data(200, 4, 0.0, 5);
+    let params = params(Device::cuda(0), TreeBoosterParameters::default(), 1);
+    let outcome = api::train(&params, &dmat, &[]);
+
+    if has_f64() {
+        assert!(outcome.is_ok(), "a backend with f64 must train");
+    } else {
+        assert!(
+            matches!(outcome, Err(xgboost_rs::Error::NoF64Support)),
+            "a backend without f64 must refuse by name, got {}",
+            outcome.err().map_or("Ok(..)".to_owned(), |e| e.to_string())
+        );
+    }
 }

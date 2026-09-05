@@ -8,10 +8,9 @@
 //! same directions, same shape — with leaf values agreeing to the 1e-5 the
 //! oracle tests use.
 
-use cubecl::Runtime;
 use cubecl::prelude::*;
-use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 
+use xgboost_rs::gpu::DefaultRuntime as R;
 use xgboost_rs::data::cuts::build_cuts;
 use xgboost_rs::data::gradient_index::build_gradient_index;
 use xgboost_rs::objective::GradientPair;
@@ -22,10 +21,10 @@ use xgboost_rs::tree::model::RegTree;
 use xgboost_rs::tree::param::{GrowPolicy, TrainParam};
 use xgboost_rs::{Context, DMatrix};
 
-type R = WgpuRuntime;
-
+/// A client on whichever backend this build resolved to: CUDA, wgpu/Vulkan
+/// or the CubeCL CPU runtime. The kernels under test are the same either way.
 fn client() -> ComputeClient<R> {
-    R::client(&WgpuDevice::default())
+    xgboost_rs::gpu::default_client(0)
 }
 
 struct Rng(u64);
@@ -67,6 +66,9 @@ fn context() -> Context {
 
 /// Grow the same tree both ways and compare.
 fn compare(dmat: &DMatrix, gpair: &[GradientPair], param: TrainParam, max_bin: u32) {
+    if !has_f64() {
+        return;
+    }
     let cuts = build_cuts(dmat, max_bin).unwrap();
 
     let gi = build_gradient_index(dmat, &cuts).unwrap();
@@ -100,6 +102,15 @@ fn compare(dmat: &DMatrix, gpair: &[GradientPair], param: TrainParam, max_bin: u
             assert_eq!(g.right, c.right, "node {nid} right child");
         }
     }
+}
+
+/// The split gain arithmetic, the quantiser and the linear solver are ports of
+/// XGBoost's `double`, so a backend with no `f64` cannot run them and refuses
+/// at construction with `Error::NoF64Support`. Metal is that backend: MSL has
+/// no `double` at all. Nothing to compare there — see
+/// `xgboost_rs::gpu::supports_f64`.
+fn has_f64() -> bool {
+    xgboost_rs::gpu::supports_f64(&xgboost_rs::gpu::default_client(0))
 }
 
 #[test]
@@ -210,6 +221,9 @@ fn honours_max_bin() {
 /// walking the tree.
 #[test]
 fn leaf_segments_cover_every_row_once() {
+    if !has_f64() {
+        return;
+    }
     let (d, gpair) = data(3000, 6, 0.2, 41);
     let cuts = build_cuts(&d, 64).unwrap();
     let param = TrainParam::default();

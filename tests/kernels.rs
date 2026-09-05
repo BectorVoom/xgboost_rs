@@ -3,23 +3,35 @@
 //!
 //! GPU histograms must match the sequential CPU sums *exactly* (i64 equality).
 
-use cubecl::Runtime;
-use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
-
-use xgboost_rs::gpu::ellpack::EllpackLayout;
-use xgboost_rs::gpu::histogram::{HistogramBuilder, supports_native_i64_atomics};
+use xgboost_rs::gpu::DefaultRuntime as R;
+use xgboost_rs::gpu::ellpack::{DeviceEllpack, EllpackLayout, natural_bits};
+use xgboost_rs::gpu::histogram::{
+    HistogramBuilder, supports_atomic_add_u32, supports_native_i64_atomics,
+};
 use xgboost_rs::gpu::quantiser::{GradientQuantiser, quantise};
 use xgboost_rs::gpu::{GradientPair, GradientPairInt64};
 use xgboost_rs::reference::{cpu_histogram, random_gpairs, random_matrix};
 
-type R = WgpuRuntime;
-
+/// A client on whichever backend this build resolved to: CUDA, wgpu/Vulkan
+/// or the CubeCL CPU runtime. The kernels under test are the same either way.
 fn client() -> cubecl::prelude::ComputeClient<R> {
-    R::client(&WgpuDevice::default())
+    xgboost_rs::gpu::default_client(0)
+}
+
+/// The split gain arithmetic, the quantiser and the linear solver are ports of
+/// XGBoost's `double`, so a backend with no `f64` cannot run them and refuses
+/// at construction with `Error::NoF64Support`. Metal is that backend: MSL has
+/// no `double` at all. Nothing to compare there — see
+/// `xgboost_rs::gpu::supports_f64`.
+fn has_f64() -> bool {
+    xgboost_rs::gpu::supports_f64(&xgboost_rs::gpu::default_client(0))
 }
 
 #[test]
 fn quantise_matches_host_reference() {
+    if !has_f64() {
+        return;
+    }
     let client = client();
     let gpairs = random_gpairs(4096, 7);
     let quantiser = GradientQuantiser::new(&gpairs, gpairs.len() as u64);
@@ -33,6 +45,9 @@ fn quantise_matches_host_reference() {
 
 #[test]
 fn quantise_preserves_positive_curvature() {
+    if !has_f64() {
+        return;
+    }
     let client = client();
     // A hessian small enough to truncate to 0 must be bumped to 1.
     let mut gpairs = random_gpairs(64, 11);
@@ -92,10 +107,21 @@ fn run_histogram_case(layout: EllpackLayout, sparsity: f32, force_global: bool) 
     // A node containing every third row, as row partitioning would produce.
     let ridx: Vec<u32> = (0..n_rows as u32).step_by(3).collect();
 
-    let engine = HistogramBuilder::new(&client)
-        .force_global(force_global)
-        .build(&matrix)
-        .unwrap();
+    let built = HistogramBuilder::new(&client).force_global(force_global).build(&matrix);
+
+    // Global-memory accumulation is built on atomic adds. A runtime without
+    // them has no such path, and says so rather than quietly building the
+    // histogram some other way.
+    if force_global && !supports_atomic_add_u32(&client) {
+        assert!(
+            matches!(built, Err(xgboost_rs::Error::NoGlobalHistogramPath)),
+            "a runtime with no atomics must refuse force_global, got {}",
+            built.err().map_or("Ok(engine)".to_owned(), |e| e.to_string())
+        );
+        return;
+    }
+
+    let engine = built.unwrap();
     assert_eq!(engine.uses_shared_memory(), !force_global);
 
     let gpu = engine.build(&quantised, &ridx).unwrap();
@@ -171,6 +197,62 @@ fn histogram_carry_propagation() {
     assert_eq!(gpu, cpu);
 }
 
+/// The packed device matrix, at every width `load_bin` has a shape for: 8 bits
+/// (256-bin data with no hole), 9 bits (the same with the missing sentinel,
+/// so an entry straddles word boundaries), 16, and the unpacked 32. The width
+/// is forced rather than left to `device_bits`, so every shape runs on this
+/// runtime whichever it would pick for itself, and the sparse layout's global
+/// bins take the two-word path at 13 bits.
+#[test]
+fn histogram_reads_every_packed_width() {
+    let client = client();
+    let (n_rows, n_features, bins) = (3000, 6, 256);
+    let cases = [
+        (0.0, EllpackLayout::Dense, 8),
+        (0.25, EllpackLayout::DenseCompressed, 9),
+        (0.25, EllpackLayout::DenseCompressed, 16),
+        (0.25, EllpackLayout::DenseCompressed, 32),
+        (0.5, EllpackLayout::Sparse, 13),
+    ];
+    for (sparsity, layout, bits) in cases {
+        let matrix = random_matrix(n_rows, n_features, bins, sparsity, layout, 33);
+        assert!(natural_bits(&matrix) <= bits, "{layout:?} needs {} bits", natural_bits(&matrix));
+        let gpairs = random_gpairs(n_rows, 35);
+        let quantiser = GradientQuantiser::new(&gpairs, n_rows as u64);
+        let quantised = quantise::<R>(&client, &gpairs, &quantiser);
+        let ridx: Vec<u32> = (0..n_rows as u32).filter(|r| r % 5 != 1).collect();
+
+        let ell = DeviceEllpack::upload_with_bits(&client, &matrix, bits);
+        assert_eq!(ell.bits, bits);
+        let engine = HistogramBuilder::new(&client).build_shared(&matrix, &ell).unwrap();
+        assert_eq!(
+            engine.build(&quantised, &ridx).unwrap(),
+            cpu_histogram(&matrix, &quantised, &ridx),
+            "layout {layout:?} at {bits} bits"
+        );
+    }
+}
+
+/// Enough rows that the atomic-free path cuts a node into several row chunks,
+/// each accumulated by its own unit and merged afterwards; the atomic path's
+/// grid-strided tile loop walks the same rows. Both have to give the oracle.
+#[test]
+fn histogram_many_row_chunks() {
+    let client = client();
+    let (n_rows, n_features, bins) = (50_000, 8, 24);
+    let matrix = random_matrix(n_rows, n_features, bins, 0.0, EllpackLayout::Dense, 21);
+    let gpairs = random_gpairs(n_rows, 19);
+    let quantiser = GradientQuantiser::new(&gpairs, n_rows as u64);
+    let quantised = quantise::<R>(&client, &gpairs, &quantiser);
+    let ridx: Vec<u32> = (0..n_rows as u32).filter(|r| r % 7 != 0).collect();
+
+    let engine = HistogramBuilder::new(&client).build(&matrix).unwrap();
+    assert_eq!(
+        engine.build(&quantised, &ridx).unwrap(),
+        cpu_histogram(&matrix, &quantised, &ridx)
+    );
+}
+
 #[test]
 fn subtraction_trick() {
     let client = client();
@@ -208,7 +290,22 @@ fn histogram_sparse_forces_global_when_bins_exceed_shmem() {
     let quantised = quantise::<R>(&client, &gpairs, &quantiser);
     let ridx: Vec<u32> = (0..n_rows as u32).step_by(3).collect();
 
-    let engine = HistogramBuilder::new(&client).shmem_bytes(4096).build(&matrix).unwrap();
+    let built = HistogramBuilder::new(&client).shmem_bytes(4096).build(&matrix);
+
+    // A runtime with no atomics privatises the whole histogram in global
+    // memory, one copy per work item, so there is no budget to overflow: the
+    // engine builds, and has to match the oracle like any other.
+    if !supports_atomic_add_u32(&client) {
+        let engine = built.unwrap();
+        assert!(engine.uses_shared_memory(), "private partials are the privatised path");
+        assert_eq!(
+            engine.build(&quantised, &ridx).unwrap(),
+            cpu_histogram(&matrix, &quantised, &ridx)
+        );
+        return;
+    }
+
+    let engine = built.unwrap();
     assert!(!engine.uses_shared_memory(), "sparse+overflow must use global path");
 
     let gpu = engine.build(&quantised, &ridx).unwrap();

@@ -38,10 +38,28 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 
 use super::GradientPairInt64;
+use super::launch;
 use crate::error::Result;
 
-/// Threads per split-evaluation workgroup.
+/// Threads per split-evaluation workgroup a device with planes is *asked* for.
+///
+/// Not the number a launch uses: every launch site runs this through
+/// [`launch::scan_block_1d`], which adapts it to the runtime and guarantees the
+/// power of two the scan and reduction loops need. A plane-less runtime gets a
+/// far smaller block, and gets the same answer — the scans are exact `i64`, so
+/// nothing here depends on how the bins were split across units.
 pub const EVAL_BLOCK: u32 = 256;
+
+/// `i64` words per node in [`reduce_candidates_kernel`]'s packed output.
+const SPLIT_WORDS: usize = 5;
+
+/// Per-unit scratch slots the serial (non-cooperative) shape declares.
+///
+/// An upper bound on the elementwise cube width, not the width itself: it is a
+/// comptime argument, so pinning it keeps the kernel to one compilation even as
+/// the frontier changes the launch geometry from level to level. Matches
+/// `launch`'s ceiling on a plane-less workgroup.
+const SERIAL_SLOTS: usize = 64;
 
 // --------------------------------------------------------- split maths ----
 //
@@ -178,28 +196,39 @@ fn better(gain: f32, rank: u32, best_gain: f32, best_rank: u32) -> bool {
     gain > best_gain || (gain == best_gain && rank < best_rank)
 }
 
-/// Score one candidate split and keep it if it beats this thread's best.
+/// Whether a bin holds any row of the node.
+///
+/// A bin with no rows adds nothing to the running sums, so the split *after*
+/// it is the split after the previous bin — same child sums, same gain — at
+/// a later rank, and [`better`] keeps the earlier of two equal candidates. So
+/// an empty bin's candidate can never win, in either scan direction, and is
+/// not scored. The reference scan scores it and rejects it by rank; the
+/// result is identical, and at depth, where a node of a few hundred rows
+/// spreads over thousands of bins, most of the search is skipped. Both words
+/// are tested: a row with zero hessian still carries a gradient.
+#[cube]
+fn bin_is_live(g: i64, h: i64) -> bool {
+    g != 0i64 || h != 0i64
+}
+
+/// Score one candidate split: its gain over the parent, or zero when it is
+/// not a valid split.
 ///
 /// Folds in `tree::IsValidSplit` and the monotone direction check the way
-/// `CalcSplitGain` does — a rejected split simply never reaches [`better`],
-/// which is equivalent to upstream returning `-inf` and failing `is_finite`.
+/// `CalcSplitGain` does, and tests validity *first*: a rejected candidate then
+/// costs two comparisons rather than two Newton steps and two gains, and on a
+/// small node most of a feature's bins are rejected at one end or the other.
+/// Zero is the right answer for "rejected" — the search is seeded at
+/// `SplitEntry::default()`, gain 0 at rank 0, and [`better`] accepts only a
+/// strict improvement, so a zero never displaces anything. That is what
+/// upstream's `-inf` failing `is_finite` amounts to.
 #[cube]
 #[allow(clippy::too_many_arguments)]
-fn consider_split(
-    s_gain: &mut SharedMemory<f32>,
-    s_rank: &mut SharedMemory<u32>,
-    s_bin: &mut SharedMemory<u32>,
-    s_dir: &mut SharedMemory<u32>,
-    s_left: &mut SharedMemory<i64>,
+fn split_gain(
     lg: f64,
     lh: f64,
     rg: f64,
     rh: f64,
-    lg_i: i64,
-    lh_i: i64,
-    rank: u32,
-    bin: u32,
-    dir: u32,
     parent_gain: f32,
     lower: f32,
     upper: f32,
@@ -210,39 +239,59 @@ fn consider_split(
     min_child_weight: f32,
     #[comptime] has_constraint: bool,
     #[comptime] has_mds: bool,
-) {
-    let t = UNIT_POS_X as usize;
-    let mcw = f64::cast_from(min_child_weight);
-
-    let wl = child_weight(
-        lg, lh, lower, upper, lambda, alpha, max_delta_step, has_constraint, has_mds,
-    );
-    let wr = child_weight(
-        rg, rh, lower, upper, lambda, alpha, max_delta_step, has_constraint, has_mds,
-    );
-
+) -> f32 {
     // `tree::IsValidSplit`: both children must carry hessian, and at least
-    // `min_child_weight` of it. Then the monotone direction check.
+    // `min_child_weight` of it.
+    let mcw = f64::cast_from(min_child_weight);
     let valid = lh > 0.0 && rh > 0.0 && lh >= mcw && rh >= mcw;
-    let monotone_ok = if has_constraint {
-        (monotone == 0i32) || (monotone > 0i32 && wl <= wr) || (monotone < 0i32 && wl >= wr)
-    } else {
-        true.into()
-    };
-
-    if valid && monotone_ok {
-        let gain = calc_gain_given_weight(lg, lh, wl, lambda, alpha, has_mds, has_constraint)
-            + calc_gain_given_weight(rg, rh, wr, lambda, alpha, has_mds, has_constraint);
-        let chg = gain - parent_gain;
-        if better(chg, rank, s_gain[t], s_rank[t]) {
-            s_gain[t] = chg;
-            s_rank[t] = rank;
-            s_bin[t] = bin;
-            s_dir[t] = dir;
-            s_left[t * 2usize] = lg_i;
-            s_left[t * 2usize + 1] = lh_i;
+    if valid {
+        if has_constraint || has_mds {
+            let wl = child_weight(
+                lg, lh, lower, upper, lambda, alpha, max_delta_step, has_constraint, has_mds,
+            );
+            let wr = child_weight(
+                rg, rh, lower, upper, lambda, alpha, max_delta_step, has_constraint, has_mds,
+            );
+            let monotone_ok = if has_constraint {
+                (monotone == 0i32)
+                    || (monotone > 0i32 && wl <= wr)
+                    || (monotone < 0i32 && wl >= wr)
+            } else {
+                true.into()
+            };
+            if monotone_ok {
+                let gain = calc_gain_given_weight(
+                    lg, lh, wl, lambda, alpha, has_mds, has_constraint,
+                ) + calc_gain_given_weight(
+                    rg, rh, wr, lambda, alpha, has_mds, has_constraint,
+                );
+                gain - parent_gain
+            } else {
+                0.0f32.into()
+            }
+        } else {
+            // Nothing can move a child's weight off the unconstrained optimum,
+            // so the gain is the closed form and the weights are never needed.
+            // `calc_gain_given_weight` would compute them anyway — two `f64`
+            // divisions per candidate that the JIT does not remove as dead,
+            // because they sit behind a branch on `h > 0`. Both children are
+            // known positive here (`valid`), so this is the same closed form.
+            closed_form_gain(lg, lh, lambda, alpha) + closed_form_gain(rg, rh, lambda, alpha)
+                - parent_gain
         }
+    } else {
+        0.0f32.into()
     }
+}
+
+/// `CalcGainGivenWeight`'s closed form `L1(G)² / (H + λ)` for a child whose
+/// hessian is already known positive: the `h > 0` branch of
+/// [`calc_gain_given_weight`] with neither `max_delta_step` nor a monotone
+/// box, kept as one expression so both call sites round identically.
+#[cube]
+fn closed_form_gain(g: f64, h: f64, lambda: f32, alpha: f32) -> f32 {
+    let num = threshold_l1(g, alpha);
+    narrowed_div(f32::cast_from(num * num), f32::cast_from(h + f64::cast_from(lambda)))
 }
 
 /// Inclusive prefix scan of one tile of bins, in shared memory.
@@ -303,8 +352,37 @@ fn reduce_best(
 
 /// Evaluate every split of one `(node, feature)` pair.
 ///
-/// Grid is `(n_nodes, n_features)`: `CUBE_POS_X` selects the node, `CUBE_POS_Y`
-/// the feature, mirroring the `dim3` launch of `EvaluateSplitsKernel`.
+/// # Two shapes, one body
+///
+/// `coop` is the *cooperation width* — how many units share one
+/// `(node, feature)` — and it is comptime, so a build only ever emits one of
+/// the two:
+///
+/// * **`coop`** — grid `(n_nodes, n_features)`, `CUBE_POS_X` the node and
+///   `CUBE_POS_Y` the feature, mirroring the `dim3` launch of
+///   `EvaluateSplitsKernel`. The cube's units split the feature's bins between
+///   them, exchange the running sum through `s_scan`/`s_carry`, and finish with
+///   a `reduce_best` over `s_gain`. This is what a GPU wants: the work of one
+///   pair is only a few hundred bins, so spreading it over a workgroup is the
+///   only way to fill the machine.
+/// * **not `coop`** — one *unit* owns a whole pair, indexed by `ABSOLUTE_POS`,
+///   and walks its bins with an ordinary running accumulator. No scan, no
+///   reduction, no `sync_cube`, and the shared arrays degrade to per-unit
+///   scratch that no other unit addresses. This is what a runtime whose units
+///   are OS threads wants, because there a barrier costs a scheduler quantum
+///   (see [`launch::cooperative`]) and a kernel that synchronises cannot be
+///   given more than one unit — which leaves it no parallelism at all.
+///
+/// The two agree bit for bit, and not by luck: every candidate is scored by the
+/// same [`consider_split`], off exact `i64` prefix sums, and `better` is a total
+/// order on `(gain, rank)`, so the winner does not depend on the order the
+/// candidates were visited or on how they were split across units. That is the
+/// same property the module docs already rest on for the block size.
+///
+/// Measured on the CPU runtime, 8 cores, 256 nodes x 64 features x 256 bins:
+/// 81.8 ms cooperative, 18.3 ms serial, identical results. In a depth-10 fit
+/// the whole `evaluate` call goes 2.63 s -> 1.67 s (`train_bench`, 15 rounds),
+/// the rest being the per-call uploads and readbacks the shape does not touch.
 ///
 /// Both scan directions run, exactly as `EnumerateForward` / `EnumerateBackward`
 /// do, and the backward pass is skipped when the feature's bins already account
@@ -312,14 +390,17 @@ fn reduce_best(
 /// value in this node.
 ///
 /// * `hist` — interleaved `[grad, hess]` `i64` per bin, one block of bins per
-///   node; `node_hist_base` gives each node's first bin.
+///   node; `node_hist_base` gives each node's first bin. Two scalar loads,
+///   not one `Vector<i64, 2>`: on the CPU runtime the vector view was
+///   measured 38% *slower* here (the lane extracts cost more than the load
+///   they save at `-O0`), the opposite of the histogram kernel's result.
 /// * `feature_mask` — per `(node, feature)`, zero for a feature this node may
 ///   not split on (column sampling and interaction constraints, applied host
 ///   side exactly as `HistGrower::constraints.query` does).
 /// * outputs — one candidate per `(node, feature)`, later reduced by
 ///   [`reduce_candidates_kernel`]. `out_left` holds the *quantised* left child
 ///   sum; the right child is the parent minus it.
-#[cube(launch)]
+#[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_feature_kernel(
     hist: &Array<i64>,
@@ -344,13 +425,29 @@ pub fn evaluate_feature_kernel(
     max_delta_step: f32,
     min_child_weight: f32,
     n_features: u32,
+    n_cands: u32,
     #[comptime] has_constraint: bool,
     #[comptime] has_mds: bool,
+    #[comptime] coop: bool,
     #[comptime] block: usize,
 ) {
-    let node = CUBE_POS_X;
-    let fidx = CUBE_POS_Y;
-    let cand = (node * n_features + fidx) as usize;
+    // Cooperation width, comptime. `coop` — a whole cube walks one
+    // `(node, feature)`, splitting its bins across the units and exchanging the
+    // running sum through shared memory. Otherwise one *unit* owns the whole
+    // pair and walks its bins serially, and the launch is elementwise. See the
+    // module docs for why the second shape exists.
+    let raw_cand = if coop { CUBE_POS_X * n_features + CUBE_POS_Y } else { ABSOLUTE_POS as u32 };
+    // An elementwise grid overprovisions and a cooperative one is exact, so
+    // only the second shape needs a bound. A dead unit is folded onto candidate
+    // 0 rather than branched away, so that every index below stays in range;
+    // its result is simply not written out.
+    let live_cand = coop || raw_cand < n_cands;
+    let cand_ix = if live_cand { raw_cand } else { 0u32.into() };
+    let cand = cand_ix as usize;
+    // The cooperative grid already carries the two coordinates on its axes;
+    // only the flattened one has to divide them back out.
+    let node = if coop { CUBE_POS_X } else { cand_ix / n_features };
+    let fidx = if coop { CUBE_POS_Y } else { cand_ix - node * n_features };
 
     let mut s_gain = SharedMemory::<f32>::new(block);
     let mut s_rank = SharedMemory::<u32>::new(block);
@@ -362,15 +459,16 @@ pub fn evaluate_feature_kernel(
     let mut s_carry = SharedMemory::<i64>::new(2usize);
 
     let t = UNIT_POS_X as usize;
-    // Seed of `SplitEntry::default()`: gain 0 at rank 0. Rank 0 is what makes
-    // ties never replace the seed, so — as upstream — a split has to be a
-    // *strict* improvement to be recorded at all.
-    s_gain[t] = 0.0f32;
-    s_rank[t] = 0u32;
-    s_bin[t] = 0u32;
-    s_dir[t] = 0u32;
-    s_left[t * 2usize] = 0i64;
-    s_left[t * 2usize + 1] = 0i64;
+    // This unit's running best, in registers; it reaches the shared slot only
+    // once the scans are done. Seeded at `SplitEntry::default()`: gain 0 at
+    // rank 0, which is what makes ties never replace the seed, so — as
+    // upstream — a split has to be a *strict* improvement to be recorded.
+    let best_gain = RuntimeCell::<f32>::new(0.0f32);
+    let best_rank = RuntimeCell::<u32>::new(0u32);
+    let best_bin = RuntimeCell::<u32>::new(0u32);
+    let best_dir = RuntimeCell::<u32>::new(0u32);
+    let best_lg = RuntimeCell::<i64>::new(0i64);
+    let best_lh = RuntimeCell::<i64>::new(0i64);
 
     let masked = feature_mask[cand] == 0u32;
 
@@ -390,24 +488,83 @@ pub fn evaluate_feature_kernel(
     let mono = monotone[fidx as usize];
 
     // ---- forward scan: `left_sum` grows over ascending bins ----
-    if UNIT_POS_X == 0u32 {
-        s_carry[0usize] = 0i64;
-        s_carry[1usize] = 0i64;
+    //
+    // Serial when one unit owns the pair: the running sum is an ordinary
+    // accumulator, so there is no tile, no shared scan buffer and no barrier.
+    // The candidate arithmetic is `consider_split`, identical to the
+    // cooperative path below — only the walk differs.
+    let fwd_g = RuntimeCell::<i64>::new(0i64);
+    let fwd_h = RuntimeCell::<i64>::new(0i64);
+    if !coop {
+        let i = RuntimeCell::<u32>::new(0u32);
+        while i.read() < n_bins_feature {
+            let b = i.read();
+            let cell = (base + ibegin + b) as usize;
+            let bg = hist[cell * 2usize];
+            let bh = hist[cell * 2usize + 1];
+            let lg_i = fwd_g.read() + bg;
+            let lh_i = fwd_h.read() + bh;
+            fwd_g.store(lg_i);
+            fwd_h.store(lh_i);
+            // An empty bin leaves the sums where they were, so its candidate
+            // is the previous bin's split at a later rank, and `better` would
+            // never take it: skipping it is exact, and at depth most of a
+            // node's bins are empty. See `bin_is_live`.
+            if bin_is_live(bg, bh) {
+                let rg_i = pg - lg_i;
+                let rh_i = ph - lh_i;
+                let chg = split_gain(
+                    f64::cast_from(lg_i) * to_float_grad,
+                    f64::cast_from(lh_i) * to_float_hess,
+                    f64::cast_from(rg_i) * to_float_grad,
+                    f64::cast_from(rh_i) * to_float_hess,
+                    parent_gain,
+                    lower,
+                    upper,
+                    mono,
+                    lambda,
+                    alpha,
+                    max_delta_step,
+                    min_child_weight,
+                    has_constraint,
+                    has_mds,
+                );
+                if better(chg, b, best_gain.read(), best_rank.read()) {
+                    best_gain.store(chg);
+                    best_rank.store(b);
+                    best_bin.store(ibegin + b);
+                    best_dir.store(0u32);
+                    best_lg.store(lg_i);
+                    best_lh.store(lh_i);
+                }
+            }
+            i.store(b + 1u32);
+        }
     }
-    sync_cube();
+
+    if coop {
+        if UNIT_POS_X == 0u32 {
+            s_carry[0usize] = 0i64;
+            s_carry[1usize] = 0i64;
+        }
+        sync_cube();
 
     let tile = RuntimeCell::<u32>::new(0u32);
     while tile.read() < n_bins_feature {
         let i = tile.read() + UNIT_POS_X;
         let live = i < n_bins_feature;
         let cell = (base + ibegin + i) as usize;
-        s_scan[t * 2usize] = if live { hist[cell * 2usize] } else { 0i64.into() };
-        s_scan[t * 2usize + 1] = if live { hist[cell * 2usize + 1] } else { 0i64.into() };
+        let own_g = if live { hist[cell * 2usize] } else { 0i64.into() };
+        let own_h = if live { hist[cell * 2usize + 1] } else { 0i64.into() };
+        s_scan[t * 2usize] = own_g;
+        s_scan[t * 2usize + 1] = own_h;
         sync_cube();
 
         scan_tile(&mut s_scan, block);
 
-        if live {
+        // An empty bin's prefix is its left neighbour's, whose unit scores
+        // the same split at a lower rank; see `bin_is_live`.
+        if live && bin_is_live(own_g, own_h) {
             let lg_i = s_carry[0usize] + s_scan[t * 2usize];
             let lh_i = s_carry[1usize] + s_scan[t * 2usize + 1];
             // The sibling is subtracted in *fixed point* and decoded once, as
@@ -415,21 +572,11 @@ pub fn evaluate_feature_kernel(
             // `f64` would round differently.
             let rg_i = pg - lg_i;
             let rh_i = ph - lh_i;
-            consider_split(
-                &mut s_gain,
-                &mut s_rank,
-                &mut s_bin,
-                &mut s_dir,
-                &mut s_left,
+            let chg = split_gain(
                 f64::cast_from(lg_i) * to_float_grad,
                 f64::cast_from(lh_i) * to_float_hess,
                 f64::cast_from(rg_i) * to_float_grad,
                 f64::cast_from(rh_i) * to_float_hess,
-                lg_i,
-                lh_i,
-                i,
-                ibegin + i,
-                0u32,
                 parent_gain,
                 lower,
                 upper,
@@ -441,6 +588,14 @@ pub fn evaluate_feature_kernel(
                 has_constraint,
                 has_mds,
             );
+            if better(chg, i, best_gain.read(), best_rank.read()) {
+                best_gain.store(chg);
+                best_rank.store(i);
+                best_bin.store(ibegin + i);
+                best_dir.store(0u32);
+                best_lg.store(lg_i);
+                best_lh.store(lh_i);
+            }
         }
 
         sync_cube();
@@ -451,13 +606,67 @@ pub fn evaluate_feature_kernel(
         sync_cube();
         tile.store(tile.read() + block as u32);
     }
+    }
 
     // The feature has missing rows in this node exactly when its bins do not
-    // account for the node's whole sum.
-    let has_missing = (s_carry[0usize] != pg || s_carry[1usize] != ph) && !masked;
+    // account for the node's whole sum. Each walk left that total where it
+    // accumulated it — the shared carry, or the serial accumulator.
+    let tot_g = if coop { s_carry[0usize] } else { fwd_g.read() };
+    let tot_h = if coop { s_carry[1usize] } else { fwd_h.read() };
+    let has_missing = (tot_g != pg || tot_h != ph) && !masked;
 
     // ---- backward scan: only needed when there are missing rows ----
-    if has_missing {
+    if has_missing && !coop {
+        let bwd_g = RuntimeCell::<i64>::new(0i64);
+        let bwd_h = RuntimeCell::<i64>::new(0i64);
+        let s = RuntimeCell::<u32>::new(0u32);
+        while s.read() < n_bins_feature {
+            let step = s.read();
+            // Descending bin order; the accumulator is the *right* side.
+            let b = n_bins_feature - 1u32 - step;
+            let cell = (base + ibegin + b) as usize;
+            let bg = hist[cell * 2usize];
+            let bh = hist[cell * 2usize + 1];
+            let rg_i = bwd_g.read() + bg;
+            let rh_i = bwd_h.read() + bh;
+            bwd_g.store(rg_i);
+            bwd_h.store(rh_i);
+            if bin_is_live(bg, bh) {
+                let lg_i = pg - rg_i;
+                let lh_i = ph - rh_i;
+                let chg = split_gain(
+                    f64::cast_from(lg_i) * to_float_grad,
+                    f64::cast_from(lh_i) * to_float_hess,
+                    f64::cast_from(rg_i) * to_float_grad,
+                    f64::cast_from(rh_i) * to_float_hess,
+                    parent_gain,
+                    lower,
+                    upper,
+                    mono,
+                    lambda,
+                    alpha,
+                    max_delta_step,
+                    min_child_weight,
+                    has_constraint,
+                    has_mds,
+                );
+                // Backward candidates rank after every forward one, so a tie
+                // keeps the forward split — `update_entry`'s rule.
+                let rank = n_bins_feature + step;
+                if better(chg, rank, best_gain.read(), best_rank.read()) {
+                    best_gain.store(chg);
+                    best_rank.store(rank);
+                    best_bin.store(ibegin + b);
+                    best_dir.store(1u32);
+                    best_lg.store(lg_i);
+                    best_lh.store(lh_i);
+                }
+            }
+            s.store(step + 1u32);
+        }
+    }
+
+    if has_missing && coop {
         if UNIT_POS_X == 0u32 {
             s_carry[0usize] = 0i64;
             s_carry[1usize] = 0i64;
@@ -471,35 +680,25 @@ pub fn evaluate_feature_kernel(
             // Descending bin order.
             let i = if live { n_bins_feature - 1u32 - step } else { 0u32.into() };
             let cell = (base + ibegin + i) as usize;
-            s_scan[t * 2usize] = if live { hist[cell * 2usize] } else { 0i64.into() };
-            s_scan[t * 2usize + 1] = if live { hist[cell * 2usize + 1] } else { 0i64.into() };
+            let own_g = if live { hist[cell * 2usize] } else { 0i64.into() };
+            let own_h = if live { hist[cell * 2usize + 1] } else { 0i64.into() };
+            s_scan[t * 2usize] = own_g;
+            s_scan[t * 2usize + 1] = own_h;
             sync_cube();
 
             scan_tile(&mut s_scan, block);
 
-            if live {
+            if live && bin_is_live(own_g, own_h) {
                 // Scanning backwards the accumulator is the *right* side.
                 let rg_i = s_carry[0usize] + s_scan[t * 2usize];
                 let rh_i = s_carry[1usize] + s_scan[t * 2usize + 1];
                 let lg_i = pg - rg_i;
                 let lh_i = ph - rh_i;
-                consider_split(
-                    &mut s_gain,
-                    &mut s_rank,
-                    &mut s_bin,
-                    &mut s_dir,
-                    &mut s_left,
+                let chg = split_gain(
                     f64::cast_from(lg_i) * to_float_grad,
                     f64::cast_from(lh_i) * to_float_hess,
                     f64::cast_from(rg_i) * to_float_grad,
                     f64::cast_from(rh_i) * to_float_hess,
-                    lg_i,
-                    lh_i,
-                    // Backward candidates rank after every forward one, so a
-                    // tie keeps the forward split — `update_entry`'s rule.
-                    n_bins_feature + step,
-                    ibegin + i,
-                    1u32,
                     parent_gain,
                     lower,
                     upper,
@@ -511,6 +710,17 @@ pub fn evaluate_feature_kernel(
                     has_constraint,
                     has_mds,
                 );
+                // Backward candidates rank after every forward one, so a
+                // tie keeps the forward split — `update_entry`'s rule.
+                let rank = n_bins_feature + step;
+                if better(chg, rank, best_gain.read(), best_rank.read()) {
+                    best_gain.store(chg);
+                    best_rank.store(rank);
+                    best_bin.store(ibegin + i);
+                    best_dir.store(1u32);
+                    best_lg.store(lg_i);
+                    best_lh.store(lh_i);
+                }
             }
 
             sync_cube();
@@ -523,11 +733,27 @@ pub fn evaluate_feature_kernel(
         }
     }
 
-    reduce_best(&mut s_gain, &mut s_rank, &mut s_bin, &mut s_dir, &mut s_left, block);
+    // The unit's best reaches its shared slot once, here.
+    s_gain[t] = best_gain.read();
+    s_rank[t] = best_rank.read();
+    s_bin[t] = best_bin.read();
+    s_dir[t] = best_dir.read();
+    s_left[t * 2usize] = best_lg.read();
+    s_left[t * 2usize + 1] = best_lh.read();
 
-    if UNIT_POS_X == 0u32 {
-        let bin = s_bin[0usize];
-        let default_left = s_dir[0usize] == 1u32;
+    // Only the cooperative walk spread the candidates across units, so only it
+    // has anything to reduce.
+    if coop {
+        reduce_best(&mut s_gain, &mut s_rank, &mut s_bin, &mut s_dir, &mut s_left, block);
+    }
+
+    // The winner is in slot 0 after that reduction; without it, each unit's own
+    // slot already holds its own candidate's winner.
+    let slot = (if coop { 0u32.into() } else { UNIT_POS_X }) as usize;
+    let writes = if coop { UNIT_POS_X == 0u32 } else { live_cand };
+    if writes {
+        let bin = s_bin[slot];
+        let default_left = s_dir[slot] == 1u32;
         // A backward split's threshold is the cut *before* the bin, which is
         // what `Cuts::backward_split_point` returns — the feature's minimum
         // when the bin is the first one.
@@ -541,34 +767,56 @@ pub fn evaluate_feature_kernel(
             cut_values[bin as usize]
         };
 
-        out_loss_chg[cand] = s_gain[0usize];
+        out_loss_chg[cand] = s_gain[slot];
         out_sindex[cand] = if default_left { fidx | (1u32 << 31u32) } else { fidx };
         out_split_value[cand] = value;
-        out_left[cand * 2usize] = s_left[0usize];
-        out_left[cand * 2usize + 1] = s_left[1usize];
+        out_left[cand * 2usize] = s_left[slot * 2usize];
+        out_left[cand * 2usize + 1] = s_left[slot * 2usize + 1];
+    }
+
+    // Hold the whole cube here while unit 0 reads slot 0. On a runtime that
+    // runs cubes sequentially out of one shared buffer (see the module docs),
+    // the other units would otherwise loop straight on to the next
+    // `(node, feature)` and re-seed `s_gain`/`s_carry` underneath this read.
+    //
+    // The serial walk needs none of it: every unit only ever touches its own
+    // slot, so nothing it writes is another unit's to read, in this cube or the
+    // next. That is the whole point of the shape — no barrier, so the launch
+    // can use every core.
+    if coop {
+        sync_cube();
     }
 }
 
 /// Reduce the per-feature candidates of each node to a single best split.
 ///
-/// One workgroup per node; ties resolve to the lower feature index, matching
-/// `SplitEntry::need_replace`.
-#[cube(launch)]
+/// Ties resolve to the lower feature index, matching `SplitEntry::need_replace`.
+/// Two shapes, as [`evaluate_feature_kernel`]: cooperative, a cube per node
+/// whose units stride the features and tree-reduce their bests; serial, a
+/// unit per node walking every feature, with no barrier.
+#[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub fn reduce_candidates_kernel(
     in_loss_chg: &Array<f32>,
     in_sindex: &Array<u32>,
     in_split_value: &Array<f32>,
     in_left: &Array<i64>,
-    // Packed so a batch costs two host round trips rather than four: floats
-    // in one buffer, integers in the other. Each read back is a full pipeline
-    // drain, and a level pays them per launch.
-    out_f32: &mut Array<f32>,
-    out_i64: &mut Array<i64>,
+    // Packed so a batch costs one host round trip rather than four: five
+    // `i64` per node, `[sindex, left_grad, left_hess, gain_bits, value_bits]`,
+    // the two floats carried as their `u32` bit patterns. Each read back is a
+    // full pipeline drain — on the CPU runtime, a thread hand-off — and a
+    // level pays it once.
+    out: &mut Array<i64>,
     n_features: u32,
+    n_nodes: u32,
+    #[comptime] coop: bool,
     #[comptime] block: usize,
 ) {
-    let node = CUBE_POS_X;
+    // The cooperative grid is exact; the elementwise one overprovisions, and a
+    // dead unit is folded onto node 0 so every index stays in range.
+    let raw_node = if coop { CUBE_POS_X } else { ABSOLUTE_POS as u32 };
+    let live = coop || raw_node < n_nodes;
+    let node = if live { raw_node } else { 0u32.into() };
 
     let mut s_gain = SharedMemory::<f32>::new(block);
     let mut s_rank = SharedMemory::<u32>::new(block);
@@ -586,7 +834,11 @@ pub fn reduce_candidates_kernel(
     s_left[t * 2usize] = 0i64;
     s_left[t * 2usize + 1] = 0i64;
 
-    let f = RuntimeCell::<u32>::new(UNIT_POS_X);
+    // The cube's units share a node's features in the cooperative shape; a
+    // unit takes them all in the serial one.
+    let first = if coop { UNIT_POS_X } else { 0u32.into() };
+    let stride = if coop { CUBE_DIM_X } else { 1u32.into() };
+    let f = RuntimeCell::<u32>::new(first);
     while f.read() < n_features {
         let fi = f.read();
         let idx = (node * n_features + fi) as usize;
@@ -600,36 +852,49 @@ pub fn reduce_candidates_kernel(
             s_left[t * 2usize] = in_left[idx * 2usize];
             s_left[t * 2usize + 1] = in_left[idx * 2usize + 1];
         }
-        f.store(fi + block as u32);
+        f.store(fi + stride);
     }
 
-    let stride = RuntimeCell::<u32>::new((block / 2usize) as u32);
-    while stride.read() > 0u32 {
-        let d = stride.read();
-        sync_cube();
-        if UNIT_POS_X < d {
-            let a = UNIT_POS_X as usize;
-            let b = (UNIT_POS_X + d) as usize;
-            if better(s_gain[b], s_rank[b], s_gain[a], s_rank[a]) {
-                s_gain[a] = s_gain[b];
-                s_rank[a] = s_rank[b];
-                s_sindex[a] = s_sindex[b];
-                s_value[a] = s_value[b];
-                s_left[a * 2usize] = s_left[b * 2usize];
-                s_left[a * 2usize + 1] = s_left[b * 2usize + 1];
+    if coop {
+        let half = RuntimeCell::<u32>::new((block / 2usize) as u32);
+        while half.read() > 0u32 {
+            let d = half.read();
+            sync_cube();
+            if UNIT_POS_X < d {
+                let a = UNIT_POS_X as usize;
+                let b = (UNIT_POS_X + d) as usize;
+                if better(s_gain[b], s_rank[b], s_gain[a], s_rank[a]) {
+                    s_gain[a] = s_gain[b];
+                    s_rank[a] = s_rank[b];
+                    s_sindex[a] = s_sindex[b];
+                    s_value[a] = s_value[b];
+                    s_left[a * 2usize] = s_left[b * 2usize];
+                    s_left[a * 2usize + 1] = s_left[b * 2usize + 1];
+                }
             }
+            half.store(d / 2u32);
         }
-        stride.store(d / 2u32);
+        sync_cube();
     }
-    sync_cube();
 
-    if UNIT_POS_X == 0u32 {
+    // The winner is in slot 0 after the reduction; without one, each unit's
+    // own slot holds its node's winner.
+    let slot = (if coop { 0u32.into() } else { UNIT_POS_X }) as usize;
+    let writes = if coop { UNIT_POS_X == 0u32 } else { live };
+    if writes {
         let n = node as usize;
-        out_f32[n * 2usize] = s_gain[0usize];
-        out_f32[n * 2usize + 1] = s_value[0usize];
-        out_i64[n * 3usize] = i64::cast_from(s_sindex[0usize]);
-        out_i64[n * 3usize + 1] = s_left[0usize];
-        out_i64[n * 3usize + 2] = s_left[1usize];
+        out[n * SPLIT_WORDS] = i64::cast_from(s_sindex[slot]);
+        out[n * SPLIT_WORDS + 1usize] = s_left[slot * 2usize];
+        out[n * SPLIT_WORDS + 2usize] = s_left[slot * 2usize + 1];
+        out[n * SPLIT_WORDS + 3usize] = i64::cast_from(u32::reinterpret(s_gain[slot]));
+        out[n * SPLIT_WORDS + 4usize] = i64::cast_from(u32::reinterpret(s_value[slot]));
+    }
+
+    // As in `evaluate_feature_kernel`: the next cube must not re-seed the
+    // shared slots while unit 0 is still reading this cube's winner. The
+    // serial shape shares nothing between units.
+    if coop {
+        sync_cube();
     }
 }
 
@@ -656,22 +921,38 @@ pub fn reduce_candidates_kernel(
 
 /// Inclusive prefix sums over each `(node, feature, target)` run of bins.
 ///
-/// Grid is `(n_nodes, n_features, n_targets)`. `out` has the same layout as
-/// `hist`: bin `b` of target `t` of the node at `node_hist_base[node]` lives at
-/// `node_hist_base[node] + t * node_bins + b`.
-#[cube(launch)]
+/// `out` has the same layout as `hist`: bin `b` of target `t` of the node at
+/// `node_hist_base[node]` lives at `node_hist_base[node] + t * node_bins + b`.
+///
+/// Two shapes: cooperative, grid `(n_nodes, n_features, n_targets)` with a
+/// cube scanning one run tile by tile through shared memory; serial, a unit
+/// per run indexed by `ABSOLUTE_POS` over `n_lanes = n_nodes * n_features *
+/// n_targets`, walking the bins with a running sum. Exact `i64` either way.
+#[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
+// The outer `if !coop` is a comptime branch and the inner one a runtime one;
+// they cannot be joined with `&&` across that boundary.
+#[allow(clippy::collapsible_if)]
 pub fn prefix_scan_kernel(
     hist: &Array<i64>,
     cut_ptrs: &Array<u32>,
     node_hist_base: &Array<u32>,
     out: &mut Array<i64>,
     node_bins: u32,
+    n_features: u32,
+    n_targets: u32,
+    n_lanes: u32,
+    #[comptime] coop: bool,
     #[comptime] block: usize,
 ) {
-    let node = CUBE_POS_X;
-    let fidx = CUBE_POS_Y;
-    let target = CUBE_POS_Z;
+    let lane = ABSOLUTE_POS as u32;
+    let live_lane = coop || lane < n_lanes;
+    let lane_ix = if live_lane { lane } else { 0u32.into() };
+    let lane_node = lane_ix / (n_features * n_targets);
+    let lane_rest = lane_ix - lane_node * (n_features * n_targets);
+    let node = if coop { CUBE_POS_X } else { lane_node };
+    let fidx = if coop { CUBE_POS_Y } else { lane_rest / n_targets };
+    let target = if coop { CUBE_POS_Z } else { lane_rest - (lane_rest / n_targets) * n_targets };
 
     let mut s_scan = SharedMemory::<i64>::new(block * 2usize);
     let mut s_carry = SharedMemory::<i64>::new(2usize);
@@ -681,35 +962,60 @@ pub fn prefix_scan_kernel(
     let n_bins_feature = cut_ptrs[(fidx + 1u32) as usize] - ibegin;
     let base = node_hist_base[node as usize] + target * node_bins;
 
-    if UNIT_POS_X == 0u32 {
-        s_carry[0usize] = 0i64;
-        s_carry[1usize] = 0i64;
+    if !coop {
+        if live_lane {
+            let g = RuntimeCell::<i64>::new(0i64);
+            let h = RuntimeCell::<i64>::new(0i64);
+            let i = RuntimeCell::<u32>::new(0u32);
+            while i.read() < n_bins_feature {
+                let cell = (base + ibegin + i.read()) as usize;
+                g.store(g.read() + hist[cell * 2usize]);
+                h.store(h.read() + hist[cell * 2usize + 1]);
+                out[cell * 2usize] = g.read();
+                out[cell * 2usize + 1] = h.read();
+                i.store(i.read() + 1u32);
+            }
+        }
     }
-    sync_cube();
 
-    let tile = RuntimeCell::<u32>::new(0u32);
-    while tile.read() < n_bins_feature {
-        let i = tile.read() + UNIT_POS_X;
-        let live = i < n_bins_feature;
-        let cell = (base + ibegin + i) as usize;
-        s_scan[t * 2usize] = if live { hist[cell * 2usize] } else { 0i64.into() };
-        s_scan[t * 2usize + 1] = if live { hist[cell * 2usize + 1] } else { 0i64.into() };
-        sync_cube();
-
-        scan_tile(&mut s_scan, block);
-
-        if live {
-            out[cell * 2usize] = s_carry[0usize] + s_scan[t * 2usize];
-            out[cell * 2usize + 1] = s_carry[1usize] + s_scan[t * 2usize + 1];
-        }
-
-        sync_cube();
-        if UNIT_POS_X == block as u32 - 1u32 {
-            s_carry[0usize] += s_scan[t * 2usize];
-            s_carry[1usize] += s_scan[t * 2usize + 1];
+    if coop {
+        if UNIT_POS_X == 0u32 {
+            s_carry[0usize] = 0i64;
+            s_carry[1usize] = 0i64;
         }
         sync_cube();
-        tile.store(tile.read() + block as u32);
+
+        let tile = RuntimeCell::<u32>::new(0u32);
+        while tile.read() < n_bins_feature {
+            let i = tile.read() + UNIT_POS_X;
+            let live = i < n_bins_feature;
+            let cell = (base + ibegin + i) as usize;
+            s_scan[t * 2usize] = if live { hist[cell * 2usize] } else { 0i64.into() };
+            s_scan[t * 2usize + 1] = if live { hist[cell * 2usize + 1] } else { 0i64.into() };
+            sync_cube();
+
+            scan_tile(&mut s_scan, block);
+
+            if live {
+                out[cell * 2usize] = s_carry[0usize] + s_scan[t * 2usize];
+                out[cell * 2usize + 1] = s_carry[1usize] + s_scan[t * 2usize + 1];
+            }
+
+            sync_cube();
+            if UNIT_POS_X == block as u32 - 1u32 {
+                s_carry[0usize] += s_scan[t * 2usize];
+                s_carry[1usize] += s_scan[t * 2usize + 1];
+            }
+            sync_cube();
+            tile.store(tile.read() + block as u32);
+        }
+
+        // The tile loop runs a different number of times per `(node, feature,
+        // target)`, so units leave it at different moments. Without this, a
+        // unit whose feature had fewer bins would reach the next cube's
+        // `s_carry` reset while a slower one was still scanning out of the
+        // same buffer.
+        sync_cube();
     }
 }
 
@@ -853,7 +1159,7 @@ fn consider_split_multi(
 /// [`multi_child_sums_kernel`], for the same reason `multi_child_sums` exists:
 /// a per-target vector cannot ride along on a candidate that is copied by the
 /// thousand.
-#[cube(launch)]
+#[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_feature_multi_kernel(
     prefix: &Array<i64>,
@@ -879,13 +1185,21 @@ pub fn evaluate_feature_multi_kernel(
     n_features: u32,
     n_targets: u32,
     node_bins: u32,
+    n_cands: u32,
     #[comptime] has_constraint: bool,
     #[comptime] has_mds: bool,
+    #[comptime] coop: bool,
     #[comptime] block: usize,
 ) {
-    let node = CUBE_POS_X;
-    let fidx = CUBE_POS_Y;
-    let cand = (node * n_features + fidx) as usize;
+    // Cooperation width, exactly as `evaluate_feature_kernel` states it: a
+    // cube per `(node, feature)`, or a unit per pair on an elementwise grid
+    // with a dead unit folded onto candidate 0.
+    let raw_cand = if coop { CUBE_POS_X * n_features + CUBE_POS_Y } else { ABSOLUTE_POS as u32 };
+    let live_cand = coop || raw_cand < n_cands;
+    let cand_ix = if live_cand { raw_cand } else { 0u32.into() };
+    let cand = cand_ix as usize;
+    let node = if coop { CUBE_POS_X } else { cand_ix / n_features };
+    let fidx = if coop { CUBE_POS_Y } else { cand_ix - node * n_features };
 
     let mut s_gain = SharedMemory::<f32>::new(block);
     let mut s_rank = SharedMemory::<u32>::new(block);
@@ -913,8 +1227,11 @@ pub fn evaluate_feature_multi_kernel(
     // ---- forward: the head of the feature's bins goes left ----
     //
     // No `sync_cube` inside either scan — the prefix sums are already on
-    // device — so the threads may stride through the bins independently.
-    let step = RuntimeCell::<u32>::new(UNIT_POS_X);
+    // device — so the threads may stride through the bins independently. In
+    // the serial shape the one unit takes every bin.
+    let first = if coop { UNIT_POS_X } else { 0u32.into() };
+    let stride = if coop { CUBE_DIM_X } else { 1u32.into() };
+    let step = RuntimeCell::<u32>::new(first);
     while step.read() < n_bins_feature {
         let i = step.read();
         consider_split_multi(
@@ -946,7 +1263,7 @@ pub fn evaluate_feature_multi_kernel(
             has_constraint,
             has_mds,
         );
-        step.store(i + block as u32);
+        step.store(i + stride);
     }
 
     // The feature has missing rows in this node exactly when its bins do not
@@ -973,7 +1290,7 @@ pub fn evaluate_feature_multi_kernel(
 
     // ---- backward: only needed when there are missing rows ----
     if has_missing {
-        let bstep = RuntimeCell::<u32>::new(UNIT_POS_X);
+        let bstep = RuntimeCell::<u32>::new(first);
         while bstep.read() < n_bins_feature {
             let s = bstep.read();
             consider_split_multi(
@@ -1007,15 +1324,21 @@ pub fn evaluate_feature_multi_kernel(
                 has_constraint,
                 has_mds,
             );
-            bstep.store(s + block as u32);
+            bstep.store(s + stride);
         }
     }
 
-    reduce_best(&mut s_gain, &mut s_rank, &mut s_bin, &mut s_dir, &mut s_left, block);
+    // Only the cooperative walk spread the candidates across units, so only it
+    // has anything to reduce; see `evaluate_feature_kernel`.
+    if coop {
+        reduce_best(&mut s_gain, &mut s_rank, &mut s_bin, &mut s_dir, &mut s_left, block);
+    }
 
-    if UNIT_POS_X == 0u32 {
-        let bin = s_bin[0usize];
-        let default_left = s_dir[0usize] == 1u32;
+    let slot = (if coop { 0u32.into() } else { UNIT_POS_X }) as usize;
+    let writes = if coop { UNIT_POS_X == 0u32 } else { live_cand };
+    if writes {
+        let bin = s_bin[slot];
+        let default_left = s_dir[slot] == 1u32;
         let value = if default_left {
             if bin == ibegin {
                 min_values[fidx as usize]
@@ -1026,11 +1349,17 @@ pub fn evaluate_feature_multi_kernel(
             cut_values[bin as usize]
         };
 
-        out_loss_chg[cand] = s_gain[0usize];
+        out_loss_chg[cand] = s_gain[slot];
         out_sindex[cand] = if default_left { fidx | (1u32 << 31u32) } else { fidx };
         out_split_value[cand] = value;
-        out_left[cand * 2usize] = s_left[0usize];
-        out_left[cand * 2usize + 1] = s_left[1usize];
+        out_left[cand * 2usize] = s_left[slot * 2usize];
+        out_left[cand * 2usize + 1] = s_left[slot * 2usize + 1];
+    }
+
+    // As in `evaluate_feature_kernel`: the next cube must not re-seed the
+    // shared slots while unit 0 is still reading this cube's winner.
+    if coop {
+        sync_cube();
     }
 }
 
@@ -1043,7 +1372,7 @@ pub fn evaluate_feature_multi_kernel(
 ///
 /// One thread per `(node, target)`; `out` holds `[left, right]` interleaved
 /// `[grad, hess]` per pair, so four `i64` each.
-#[cube(launch)]
+#[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub fn multi_child_sums_kernel(
     prefix: &Array<i64>,
@@ -1215,6 +1544,9 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
         min_values: &[f32],
         cfg: SplitConfig,
     ) -> Result<Self> {
+        if !super::supports_f64(&client) {
+            return Err(crate::error::Error::NoF64Support);
+        }
         let n_features = cut_ptrs.len() - 1;
         let mut monotone = cfg.monotone.clone();
         monotone.resize(n_features, 0);
@@ -1267,6 +1599,29 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
         debug_assert_eq!(feature_mask.len(), n_nodes * self.n_features);
 
         let c = &self.client;
+        let n_cand_u32 = (n_nodes * self.n_features) as u32;
+        // Cooperation width: a cube per `(node, feature)` where a barrier is
+        // cheap, a unit per pair where it is not. See `launch::cooperative`.
+        let coop = launch::cooperative(c);
+        let (eval_count, eval_dim) = if coop {
+            (
+                CubeCount::Static(n_nodes as u32, self.n_features as u32, 1),
+                CubeDim::new_1d(launch::scan_block_1d(c, EVAL_BLOCK)),
+            )
+        } else {
+            // A unit walks one feature's bins twice over (forward, then
+            // backward when the feature has missing rows), so it is worth far
+            // more than the one scalar operation `elementwise` assumes.
+            launch::elementwise_with_work(c, n_cand_u32 as usize, 2 * self.n_bins / self.n_features)
+        };
+        // `block` is a *comptime* argument, so every distinct value it takes is
+        // a separate kernel compilation — and on a JIT backend that is paid at
+        // run time, per level, as the frontier changes the elementwise cube
+        // width. In the serial shape `block` only has to be an upper bound on
+        // the number of per-unit scratch slots, so it is pinned to a constant
+        // and the kernel compiles once for the whole fit.
+        let eval_block = if coop { eval_dim.x as usize } else { SERIAL_SLOTS };
+        debug_assert!(eval_dim.x as usize <= eval_block);
         let base: Vec<u32> = nodes.iter().map(|n| n.hist_base).collect();
         let parent: Vec<i64> =
             nodes.iter().flat_map(|n| [n.parent_grad, n.parent_hess]).collect();
@@ -1289,67 +1644,104 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
 
         let has_mds = self.cfg.max_delta_step != 0.0;
 
-        evaluate_feature_kernel::launch::<R>(
-            c,
-            CubeCount::Static(n_nodes as u32, self.n_features as u32, 1),
-            CubeDim::new_1d(EVAL_BLOCK),
-            unsafe { ArrayArg::from_raw_parts(hist.clone(), hist_bins * 2) },
-            unsafe { ArrayArg::from_raw_parts(self.cut_ptrs.clone(), self.n_features + 1) },
-            unsafe { ArrayArg::from_raw_parts(self.cut_values.clone(), self.n_bins) },
-            unsafe { ArrayArg::from_raw_parts(self.min_values.clone(), self.n_features) },
-            unsafe { ArrayArg::from_raw_parts(base_d, n_nodes) },
-            unsafe { ArrayArg::from_raw_parts(parent_d, n_nodes * 2) },
-            unsafe { ArrayArg::from_raw_parts(gain_d, n_nodes) },
-            unsafe { ArrayArg::from_raw_parts(lower_d, n_nodes) },
-            unsafe { ArrayArg::from_raw_parts(upper_d, n_nodes) },
-            unsafe { ArrayArg::from_raw_parts(mask_d, n_cand) },
-            unsafe { ArrayArg::from_raw_parts(self.monotone.clone(), self.n_features) },
-            unsafe { ArrayArg::from_raw_parts(cand_chg.clone(), n_cand) },
-            unsafe { ArrayArg::from_raw_parts(cand_sindex.clone(), n_cand) },
-            unsafe { ArrayArg::from_raw_parts(cand_value.clone(), n_cand) },
-            unsafe { ArrayArg::from_raw_parts(cand_left.clone(), n_cand * 2) },
-            to_float_grad,
-            to_float_hess,
-            self.cfg.lambda,
-            self.cfg.alpha,
-            self.cfg.max_delta_step,
-            self.cfg.min_child_weight,
-            self.n_features as u32,
-            self.has_constraint,
-            has_mds,
-            EVAL_BLOCK as usize,
-        );
+        // SAFETY: the kernel guards every index against the lengths it is
+        // given; see the `gpu` module docs on unchecked launches.
+        unsafe {
+            evaluate_feature_kernel::launch_unchecked::<R>(
+                c,
+                eval_count,
+                eval_dim,
+                ArrayArg::from_raw_parts(hist.clone(), hist_bins * 2),
+                ArrayArg::from_raw_parts(self.cut_ptrs.clone(), self.n_features + 1),
+                ArrayArg::from_raw_parts(self.cut_values.clone(), self.n_bins),
+                ArrayArg::from_raw_parts(self.min_values.clone(), self.n_features),
+                ArrayArg::from_raw_parts(base_d, n_nodes),
+                ArrayArg::from_raw_parts(parent_d, n_nodes * 2),
+                ArrayArg::from_raw_parts(gain_d, n_nodes),
+                ArrayArg::from_raw_parts(lower_d, n_nodes),
+                ArrayArg::from_raw_parts(upper_d, n_nodes),
+                ArrayArg::from_raw_parts(mask_d, n_cand),
+                ArrayArg::from_raw_parts(self.monotone.clone(), self.n_features),
+                ArrayArg::from_raw_parts(cand_chg.clone(), n_cand),
+                ArrayArg::from_raw_parts(cand_sindex.clone(), n_cand),
+                ArrayArg::from_raw_parts(cand_value.clone(), n_cand),
+                ArrayArg::from_raw_parts(cand_left.clone(), n_cand * 2),
+                to_float_grad,
+                to_float_hess,
+                self.cfg.lambda,
+                self.cfg.alpha,
+                self.cfg.max_delta_step,
+                self.cfg.min_child_weight,
+                self.n_features as u32,
+                n_cand_u32,
+                self.has_constraint,
+                has_mds,
+                coop,
+                eval_block,
+            );
+        }
 
-        let best_f32 = c.empty(n_nodes * 2 * size_of::<f32>());
-        let best_i64 = c.empty(n_nodes * 3 * size_of::<i64>());
+        Ok(self.reduce_candidates(n_nodes, cand_chg, cand_sindex, cand_value, cand_left))
+    }
 
-        reduce_candidates_kernel::launch::<R>(
-            c,
-            CubeCount::Static(n_nodes as u32, 1, 1),
-            CubeDim::new_1d(EVAL_BLOCK),
-            unsafe { ArrayArg::from_raw_parts(cand_chg, n_cand) },
-            unsafe { ArrayArg::from_raw_parts(cand_sindex, n_cand) },
-            unsafe { ArrayArg::from_raw_parts(cand_value, n_cand) },
-            unsafe { ArrayArg::from_raw_parts(cand_left, n_cand * 2) },
-            unsafe { ArrayArg::from_raw_parts(best_f32.clone(), n_nodes * 2) },
-            unsafe { ArrayArg::from_raw_parts(best_i64.clone(), n_nodes * 3) },
-            self.n_features as u32,
-            EVAL_BLOCK as usize,
-        );
+    /// Reduce a batch's per-`(node, feature)` candidates to one per node and
+    /// read them back: the tail both evaluators share.
+    fn reduce_candidates(
+        &self,
+        n_nodes: usize,
+        cand_chg: Handle,
+        cand_sindex: Handle,
+        cand_value: Handle,
+        cand_left: Handle,
+    ) -> Vec<DeviceSplitCandidate> {
+        let c = &self.client;
+        let n_cand = n_nodes * self.n_features;
+        let best = c.empty(n_nodes * SPLIT_WORDS * size_of::<i64>());
 
-        let floats: Vec<f32> = read_vec(c, best_f32);
-        let ints: Vec<i64> = read_vec(c, best_i64);
+        // A cube per node where a barrier is cheap, a unit per node where it
+        // is not; `block` is only the cooperative cube width, and pinned to a
+        // constant bound on the serial scratch slots otherwise.
+        let coop = launch::cooperative(c);
+        let (count, dim, block) = if coop {
+            let block = launch::scan_block_1d(c, EVAL_BLOCK);
+            (CubeCount::Static(n_nodes as u32, 1, 1), CubeDim::new_1d(block), block as usize)
+        } else {
+            let (count, dim) = launch::elementwise_with_work(c, n_nodes, self.n_features);
+            (count, dim, SERIAL_SLOTS)
+        };
+        debug_assert!(dim.x as usize <= block);
 
-        Ok((0..n_nodes)
-            .map(|i| DeviceSplitCandidate {
-                loss_chg: floats[2 * i],
-                split_value: floats[2 * i + 1],
-                sindex: ints[3 * i] as u32,
-                left_grad: ints[3 * i + 1],
-                left_hess: ints[3 * i + 2],
+        // SAFETY: the kernel guards every index against the lengths it is
+        // given; see the `gpu` module docs on unchecked launches.
+        unsafe {
+            reduce_candidates_kernel::launch_unchecked::<R>(
+                c,
+                count,
+                dim,
+                ArrayArg::from_raw_parts(cand_chg, n_cand),
+                ArrayArg::from_raw_parts(cand_sindex, n_cand),
+                ArrayArg::from_raw_parts(cand_value, n_cand),
+                ArrayArg::from_raw_parts(cand_left, n_cand * 2),
+                ArrayArg::from_raw_parts(best.clone(), n_nodes * SPLIT_WORDS),
+                self.n_features as u32,
+                n_nodes as u32,
+                coop,
+                block,
+            );
+        }
+
+        let words: Vec<i64> = read_vec(c, best);
+        words
+            .chunks_exact(SPLIT_WORDS)
+            .map(|w| DeviceSplitCandidate {
+                sindex: w[0] as u32,
+                left_grad: w[1],
+                left_hess: w[2],
+                loss_chg: f32::from_bits(w[3] as u32),
+                split_value: f32::from_bits(w[4] as u32),
                 is_cat: false,
             })
-            .collect())
+            .collect()
     }
 
     /// [`evaluate`](Self::evaluate) for a vector-leaf tree.
@@ -1377,6 +1769,11 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
         debug_assert!(nodes.iter().all(|n| n.parent.len() == n_targets));
 
         let c = &self.client;
+        // Cooperation width, as `evaluate` chooses it; both kernels below take
+        // the same two shapes.
+        let coop = launch::cooperative(c);
+        let block = launch::scan_block_1d(c, EVAL_BLOCK);
+        let n_cand = n_nodes * self.n_features;
         let base: Vec<u32> = nodes.iter().map(|n| n.hist_base).collect();
         let parent: Vec<i64> =
             nodes.iter().flat_map(|n| n.parent.iter().flat_map(|p| [p.grad, p.hess])).collect();
@@ -1393,19 +1790,38 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
 
         // Same shape as the histogram it scans: one inclusive prefix per bin.
         let prefix = c.empty(hist_bins * 2 * size_of::<i64>());
-        prefix_scan_kernel::launch::<R>(
-            c,
-            CubeCount::Static(n_nodes as u32, self.n_features as u32, n_targets as u32),
-            CubeDim::new_1d(EVAL_BLOCK),
-            unsafe { ArrayArg::from_raw_parts(hist.clone(), hist_bins * 2) },
-            unsafe { ArrayArg::from_raw_parts(self.cut_ptrs.clone(), self.n_features + 1) },
-            unsafe { ArrayArg::from_raw_parts(base_d.clone(), n_nodes) },
-            unsafe { ArrayArg::from_raw_parts(prefix.clone(), hist_bins * 2) },
-            node_bins as u32,
-            EVAL_BLOCK as usize,
-        );
+        let n_runs = n_cand * n_targets;
+        let (scan_count, scan_dim, scan_block) = if coop {
+            (
+                CubeCount::Static(n_nodes as u32, self.n_features as u32, n_targets as u32),
+                CubeDim::new_1d(block),
+                block as usize,
+            )
+        } else {
+            // A unit walks one feature's bins once.
+            let (count, dim) = launch::elementwise_with_work(c, n_runs, self.n_bins / self.n_features);
+            (count, dim, 1)
+        };
+        // SAFETY: the kernel guards every index against the lengths it is
+        // given; see the `gpu` module docs on unchecked launches.
+        unsafe {
+            prefix_scan_kernel::launch_unchecked::<R>(
+                c,
+                scan_count,
+                scan_dim,
+                ArrayArg::from_raw_parts(hist.clone(), hist_bins * 2),
+                ArrayArg::from_raw_parts(self.cut_ptrs.clone(), self.n_features + 1),
+                ArrayArg::from_raw_parts(base_d.clone(), n_nodes),
+                ArrayArg::from_raw_parts(prefix.clone(), hist_bins * 2),
+                node_bins as u32,
+                self.n_features as u32,
+                n_targets as u32,
+                n_runs as u32,
+                coop,
+                scan_block,
+            );
+        }
 
-        let n_cand = n_nodes * self.n_features;
         let cand_chg = c.empty(n_cand * size_of::<f32>());
         let cand_sindex = c.empty(n_cand * size_of::<u32>());
         let cand_value = c.empty(n_cand * size_of::<f32>());
@@ -1413,70 +1829,65 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
 
         let has_mds = self.cfg.max_delta_step != 0.0;
 
-        evaluate_feature_multi_kernel::launch::<R>(
-            c,
-            CubeCount::Static(n_nodes as u32, self.n_features as u32, 1),
-            CubeDim::new_1d(EVAL_BLOCK),
-            unsafe { ArrayArg::from_raw_parts(prefix.clone(), hist_bins * 2) },
-            unsafe { ArrayArg::from_raw_parts(self.cut_ptrs.clone(), self.n_features + 1) },
-            unsafe { ArrayArg::from_raw_parts(self.cut_values.clone(), self.n_bins) },
-            unsafe { ArrayArg::from_raw_parts(self.min_values.clone(), self.n_features) },
-            unsafe { ArrayArg::from_raw_parts(base_d, n_nodes) },
-            unsafe { ArrayArg::from_raw_parts(parent_d, n_nodes * n_targets * 2) },
-            unsafe { ArrayArg::from_raw_parts(gain_d, n_nodes) },
-            unsafe { ArrayArg::from_raw_parts(lower_d, n_nodes) },
-            unsafe { ArrayArg::from_raw_parts(upper_d, n_nodes) },
-            unsafe { ArrayArg::from_raw_parts(mask_d, n_cand) },
-            unsafe { ArrayArg::from_raw_parts(cand_chg.clone(), n_cand) },
-            unsafe { ArrayArg::from_raw_parts(cand_sindex.clone(), n_cand) },
-            unsafe { ArrayArg::from_raw_parts(cand_value.clone(), n_cand) },
-            unsafe { ArrayArg::from_raw_parts(cand_left.clone(), n_cand * 2) },
-            to_float_grad,
-            to_float_hess,
-            self.cfg.lambda,
-            self.cfg.alpha,
-            self.cfg.max_delta_step,
-            self.cfg.min_child_weight,
-            self.n_features as u32,
-            n_targets as u32,
-            node_bins as u32,
-            self.has_constraint,
-            has_mds,
-            EVAL_BLOCK as usize,
-        );
+        let (eval_count, eval_dim, eval_block) = if coop {
+            (
+                CubeCount::Static(n_nodes as u32, self.n_features as u32, 1),
+                CubeDim::new_1d(block),
+                block as usize,
+            )
+        } else {
+            // A unit walks one feature's bins up to twice, reading every
+            // target's prefix at each.
+            let (count, dim) = launch::elementwise_with_work(
+                c,
+                n_cand,
+                2 * n_targets * self.n_bins / self.n_features,
+            );
+            (count, dim, SERIAL_SLOTS)
+        };
+        debug_assert!(eval_dim.x as usize <= eval_block);
 
-        let best_f32 = c.empty(n_nodes * 2 * size_of::<f32>());
-        let best_i64 = c.empty(n_nodes * 3 * size_of::<i64>());
+        // SAFETY: the kernel guards every index against the lengths it is
+        // given; see the `gpu` module docs on unchecked launches.
+        unsafe {
+            evaluate_feature_multi_kernel::launch_unchecked::<R>(
+                c,
+                eval_count,
+                eval_dim,
+                ArrayArg::from_raw_parts(prefix.clone(), hist_bins * 2),
+                ArrayArg::from_raw_parts(self.cut_ptrs.clone(), self.n_features + 1),
+                ArrayArg::from_raw_parts(self.cut_values.clone(), self.n_bins),
+                ArrayArg::from_raw_parts(self.min_values.clone(), self.n_features),
+                ArrayArg::from_raw_parts(base_d, n_nodes),
+                ArrayArg::from_raw_parts(parent_d, n_nodes * n_targets * 2),
+                ArrayArg::from_raw_parts(gain_d, n_nodes),
+                ArrayArg::from_raw_parts(lower_d, n_nodes),
+                ArrayArg::from_raw_parts(upper_d, n_nodes),
+                ArrayArg::from_raw_parts(mask_d, n_cand),
+                ArrayArg::from_raw_parts(cand_chg.clone(), n_cand),
+                ArrayArg::from_raw_parts(cand_sindex.clone(), n_cand),
+                ArrayArg::from_raw_parts(cand_value.clone(), n_cand),
+                ArrayArg::from_raw_parts(cand_left.clone(), n_cand * 2),
+                to_float_grad,
+                to_float_hess,
+                self.cfg.lambda,
+                self.cfg.alpha,
+                self.cfg.max_delta_step,
+                self.cfg.min_child_weight,
+                self.n_features as u32,
+                n_targets as u32,
+                node_bins as u32,
+                n_cand as u32,
+                self.has_constraint,
+                has_mds,
+                coop,
+                eval_block,
+            );
+        }
 
         // The per-feature reduction is target-blind: a candidate is already one
         // number by the time it gets here.
-        reduce_candidates_kernel::launch::<R>(
-            c,
-            CubeCount::Static(n_nodes as u32, 1, 1),
-            CubeDim::new_1d(EVAL_BLOCK),
-            unsafe { ArrayArg::from_raw_parts(cand_chg, n_cand) },
-            unsafe { ArrayArg::from_raw_parts(cand_sindex, n_cand) },
-            unsafe { ArrayArg::from_raw_parts(cand_value, n_cand) },
-            unsafe { ArrayArg::from_raw_parts(cand_left, n_cand * 2) },
-            unsafe { ArrayArg::from_raw_parts(best_f32.clone(), n_nodes * 2) },
-            unsafe { ArrayArg::from_raw_parts(best_i64.clone(), n_nodes * 3) },
-            self.n_features as u32,
-            EVAL_BLOCK as usize,
-        );
-
-        let floats: Vec<f32> = read_vec(c, best_f32);
-        let ints: Vec<i64> = read_vec(c, best_i64);
-
-        let candidates = (0..n_nodes)
-            .map(|i| DeviceSplitCandidate {
-                loss_chg: floats[2 * i],
-                split_value: floats[2 * i + 1],
-                sindex: ints[3 * i] as u32,
-                left_grad: ints[3 * i + 1],
-                left_hess: ints[3 * i + 2],
-                is_cat: false,
-            })
-            .collect();
+        let candidates = self.reduce_candidates(n_nodes, cand_chg, cand_sindex, cand_value, cand_left);
         Ok((candidates, MultiScan { prefix, bins: hist_bins }))
     }
 
@@ -1517,22 +1928,26 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
         let out = c.empty(n * 4 * size_of::<i64>());
 
         let (cube_count, cube_dim) = super::launch::elementwise(c, n);
-        multi_child_sums_kernel::launch::<R>(
-            c,
-            cube_count,
-            cube_dim,
-            unsafe { ArrayArg::from_raw_parts(scan.prefix.clone(), scan.bins * 2) },
-            unsafe { ArrayArg::from_raw_parts(self.cut_ptrs.clone(), self.n_features + 1) },
-            unsafe { ArrayArg::from_raw_parts(base_d, n_nodes) },
-            unsafe { ArrayArg::from_raw_parts(parent_d, n * 2) },
-            unsafe { ArrayArg::from_raw_parts(fidx_d, n_nodes) },
-            unsafe { ArrayArg::from_raw_parts(cond_d, n_nodes) },
-            unsafe { ArrayArg::from_raw_parts(dl_d, n_nodes) },
-            unsafe { ArrayArg::from_raw_parts(out.clone(), n * 4) },
-            n_targets as u32,
-            node_bins as u32,
-            n as u32,
-        );
+        // SAFETY: the kernel guards every index against the lengths it is
+        // given; see the `gpu` module docs on unchecked launches.
+        unsafe {
+            multi_child_sums_kernel::launch_unchecked::<R>(
+                c,
+                cube_count,
+                cube_dim,
+                ArrayArg::from_raw_parts(scan.prefix.clone(), scan.bins * 2),
+                ArrayArg::from_raw_parts(self.cut_ptrs.clone(), self.n_features + 1),
+                ArrayArg::from_raw_parts(base_d, n_nodes),
+                ArrayArg::from_raw_parts(parent_d, n * 2),
+                ArrayArg::from_raw_parts(fidx_d, n_nodes),
+                ArrayArg::from_raw_parts(cond_d, n_nodes),
+                ArrayArg::from_raw_parts(dl_d, n_nodes),
+                ArrayArg::from_raw_parts(out.clone(), n * 4),
+                n_targets as u32,
+                node_bins as u32,
+                n as u32,
+            );
+        }
 
         let words: Vec<i64> = read_vec(c, out);
         words
@@ -1551,3 +1966,4 @@ fn read_vec<R: Runtime, T: bytemuck::Pod>(client: &ComputeClient<R>, handle: Han
     let bytes = client.read_one_unchecked(handle);
     bytemuck::cast_slice(&bytes).to_vec()
 }
+

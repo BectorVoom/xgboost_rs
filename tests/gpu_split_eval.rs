@@ -6,19 +6,17 @@
 //! sums are exact, so agreement must be exact too: same feature, same
 //! threshold, same default direction, same `loss_chg` bits.
 
-use cubecl::Runtime;
-use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
-
+use xgboost_rs::gpu::DefaultRuntime as R;
 use xgboost_rs::gpu::GradientPairInt64;
 use xgboost_rs::gpu::evaluate_splits::{NodeInput, SplitConfig, SplitEvaluatorGpu};
 use xgboost_rs::parameters::MonotoneConstraint;
 use xgboost_rs::tree::evaluator::SplitEvaluator;
 use xgboost_rs::tree::param::{GradStats, SplitEntry, TrainParam};
 
-type R = WgpuRuntime;
-
+/// A client on whichever backend this build resolved to: CUDA, wgpu/Vulkan
+/// or the CubeCL CPU runtime. The kernels under test are the same either way.
 fn client() -> cubecl::prelude::ComputeClient<R> {
-    R::client(&WgpuDevice::default())
+    xgboost_rs::gpu::default_client(0)
 }
 
 /// xorshift, so a case is reproducible without pulling in a rng crate.
@@ -163,6 +161,9 @@ fn cpu_best_split(case: &Case, p: &TrainParam, ev: &SplitEvaluator, allowed: &[b
 
 /// Run both sides on one case and assert they agree.
 fn check(case: &Case, p: &TrainParam, constraints: &[MonotoneConstraint], allowed: &[bool]) {
+    if !has_f64() {
+        return;
+    }
     let n_features = case.cut_ptrs.len() - 1;
     let ev = SplitEvaluator::new(constraints, n_features);
 
@@ -261,6 +262,15 @@ fn all_allowed(n: usize) -> Vec<bool> {
     vec![true; n]
 }
 
+/// The split gain arithmetic, the quantiser and the linear solver are ports of
+/// XGBoost's `double`, so a backend with no `f64` cannot run them and refuses
+/// at construction with `Error::NoF64Support`. Metal is that backend: MSL has
+/// no `double` at all. Nothing to compare there — see
+/// `xgboost_rs::gpu::supports_f64`.
+fn has_f64() -> bool {
+    xgboost_rs::gpu::supports_f64(&xgboost_rs::gpu::default_client(0))
+}
+
 #[test]
 fn dense_features_no_missing_values() {
     let case = make_case(7, 8, &[32; 8], 0.0);
@@ -342,6 +352,9 @@ fn honours_the_feature_mask() {
 /// Several nodes in one launch must give the same answers as one at a time.
 #[test]
 fn batches_nodes_independently() {
+    if !has_f64() {
+        return;
+    }
     let case = make_case(41, 5, &[64; 5], 0.2);
     let n_features = 5;
     let p = TrainParam::default();

@@ -68,8 +68,9 @@ optimising against a target you do not match is optimising the wrong thing.
 
 The CubeCL kernels (ELLPACK quantisation, per-node histogram build, the
 subtraction trick) pass their full oracle — exact `i64` equality against a CPU
-reference — on the local Vulkan/lavapipe runtime: `cargo test --features gpu
---test kernels`, 14/14.
+reference — on the local Vulkan/lavapipe runtime: `cargo test --features vulkan
+--test kernels`. They pass the same oracle on the CubeCL CPU runtime, which is
+what a plain `cargo test --test kernels` now uses.
 
 They are **not yet wired into training**. `device=cuda` resolves to the
 `grow_gpu_hist` updater, which `api::train_from` refuses rather than silently

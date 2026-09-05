@@ -1,14 +1,14 @@
 use anyhow::Context;
-use cubecl::Runtime;
-use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 
 use xgboost_rs::gpu::GradientPair;
 use xgboost_rs::gpu::ellpack::{EllpackLayout, EllpackMatrix};
 use xgboost_rs::gpu::histogram::HistogramBuilder;
 use xgboost_rs::gpu::quantiser::{GradientQuantiser, quantise};
+use xgboost_rs::gpu::{BACKEND, DefaultRuntime, default_client};
 
 fn main() -> anyhow::Result<()> {
-    let client = WgpuRuntime::client(&WgpuDevice::default());
+    let client = default_client(0);
+    println!("backend: {BACKEND}");
 
     // Tiny dense demo: 6 rows x 2 features, 3 bins per feature.
     let matrix = EllpackMatrix {
@@ -25,7 +25,7 @@ fn main() -> anyhow::Result<()> {
         .collect();
 
     let quantiser = GradientQuantiser::new(&gpairs, gpairs.len() as u64);
-    let quantised = quantise::<WgpuRuntime>(&client, &gpairs, &quantiser);
+    let quantised = quantise::<DefaultRuntime>(&client, &gpairs, &quantiser);
     let ridx: Vec<u32> = (0..6).collect();
 
     let engine = HistogramBuilder::new(&client)

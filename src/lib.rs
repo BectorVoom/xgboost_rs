@@ -124,13 +124,43 @@
 //!   CPU code, no GPU toolchain required.
 //! * [`gpu`] — XGBoost's `gpu_hist` rewritten with CubeCL: the quantiser,
 //!   ELLPACK, histogram, split evaluator, row partitioner and the tree driver
-//!   that `device=cuda` runs.
-//!   The kernels are runtime-generic: they run on any CubeCL runtime
-//!   (Vulkan/wgpu by default, CUDA with the `cuda` cargo feature). Gated behind
-//!   the default-on `gpu` feature, because building CubeCL needs a backend
-//!   toolchain (on macOS, the Vulkan SDK) that CPU-only consumers should not
-//!   have to install. Build with `--no-default-features` to skip it; the
-//!   training path above never needs it.
+//!   that `device=cuda` runs. Gated behind the default-on `gpu` feature; build
+//!   with `--no-default-features` to skip it, as the training path above never
+//!   needs it.
+//!
+//! # One kernel source, CPU and GPU
+//!
+//! The [`gpu`] kernels are runtime-generic, and "runtime" includes the host.
+//! Every kernel is written once, over `R: Runtime`, and the backend is a cargo
+//! feature:
+//!
+//! | build | runs on | needs | trains? |
+//! | --- | --- | --- | --- |
+//! | default (`gpu` + `cpu`) | CubeCL CPU runtime | nothing | yes |
+//! | `--features metal` | wgpu with Metal Shading Language | nothing (macOS) | **no** — see below |
+//! | `--features vulkan` | wgpu with SPIR-V passthrough | the Vulkan SDK | yes |
+//! | `--features cuda` | CUDA | the CUDA toolkit | yes |
+//!
+//! The bottom row is what a real device fit wants; the top row is what makes
+//! the device code *buildable and testable anywhere*. `cargo test` on a laptop
+//! with no GPU toolchain at all now runs the same `gpu_hist` kernels a CUDA fit
+//! runs, and `tests/gpu_training.rs` checks that a `device=cuda` fit on them
+//! comes out bit-identical to the CPU fit — which is the whole point of
+//! quantising the gradients before accumulating them.
+//!
+//! Two things about a host runtime reach into the kernels rather than staying
+//! in the launcher, and [`gpu`]'s module docs give the detail: `SharedMemory` is
+//! reused across cubes when cubes execute sequentially, so every kernel that
+//! declares one ends with a `sync_cube`; and a "unit" is an OS thread when the
+//! runtime has no SIMD planes, so [`gpu::launch`] sizes a workgroup from the
+//! runtime's own properties rather than from a constant.
+//!
+//! What a host runtime cannot do, it refuses by name rather than mis-fitting:
+//! CubeCL's CPU backend implements no atomics, so the histogram takes an
+//! atomic-free accumulation path
+//! ([`hist_atomic_free_kernel`](fn@gpu::histogram::hist_atomic_free_kernel))
+//! and the global-memory path is an [`Error::NoGlobalHistogramPath`] instead of
+//! a silent substitution.
 //!
 //! # Agreement with XGBoost
 //!

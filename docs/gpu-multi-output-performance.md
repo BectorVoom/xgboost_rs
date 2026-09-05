@@ -229,7 +229,7 @@ What survives the caveat:
 The tables came from a temporary integration test driving `api::train` on both
 devices; it is not committed.
 
-The grid overflow reproduces on a build **without** `--features cuda` with a
+The grid overflow reproduces on a build with **`--features vulkan`** with a
 `device=cuda`, `multi_strategy=multi_output_tree` fit at 60 000 rows, 16
 features, `max_bin=256`, 4 targets, `max_depth=10`, one round. Note that the
 committed vector-leaf tests do *not* reach it: they top out at `max_depth=6`,

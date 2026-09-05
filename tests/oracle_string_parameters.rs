@@ -1041,6 +1041,13 @@ fn device_refusal(cfg: &BTreeMap<String, String>) -> Option<&'static str> {
 #[cfg(feature = "gpu")]
 #[test]
 fn every_string_parameter_fits_the_same_on_cpu_and_on_the_device() {
+    // A backend with no `f64` refuses every device fit (Metal — MSL has no
+    // `double`; see `xgboost_rs::gpu::supports_f64`), so there is no device fit
+    // to compare against. `gpu_training::a_backend_without_f64_refuses_the_fit`
+    // is what holds that refusal to being a named one.
+    if !xgboost_rs::gpu::supports_f64(&xgboost_rs::gpu::default_client(0)) {
+        return;
+    }
     let mut report = Report::default();
     let mut refused = 0usize;
 

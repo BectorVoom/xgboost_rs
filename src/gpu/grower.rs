@@ -23,6 +23,7 @@ use std::collections::{BinaryHeap, VecDeque};
 
 use cubecl::prelude::*;
 use cubecl::server::Handle;
+use rayon::prelude::*;
 
 use super::categorical;
 use super::ellpack::{DeviceEllpack, build_ellpack};
@@ -201,6 +202,12 @@ pub struct GpuHistGrower<R: Runtime> {
     /// Quantiser factors of the tree currently being grown.
     to_float_grad: f64,
     to_float_hess: f64,
+    /// Frontier buffers, with their capacity in `u32` words, kept for reuse
+    /// across levels and rounds. A buffer is free when this is its only
+    /// holder (`Handle::can_mut`): the expand entries that reference a level's
+    /// histograms drop theirs once the level's children are built. See
+    /// `HistogramEngine::prepare_frontier` for why reuse matters.
+    frontiers: Vec<(usize, Handle)>,
 }
 
 impl<R: Runtime> GpuHistGrower<R> {
@@ -278,6 +285,7 @@ impl<R: Runtime> GpuHistGrower<R> {
             n_targets,
             to_float_grad: 1.0,
             to_float_hess: 1.0,
+            frontiers: Vec::new(),
             cuts,
             param,
         })
@@ -321,10 +329,15 @@ impl<R: Runtime> GpuHistGrower<R> {
         // Fixed point, so histogram sums are exact whatever order they commit.
         // The quantiser works in the GPU module's own pair type; it is the
         // same two floats, so this is a view, not a conversion of meaning.
+        //
+        // Both passes are over every row and run on the rayon pool: at
+        // 200 000 rows they were 0.7 ms of a 12 ms round on one thread, and
+        // the device grower shares the machine with nothing else here.
         let k = self.n_targets;
         let columns: Vec<Vec<super::GradientPair>> = (0..k)
             .map(|t| {
                 (0..self.n_rows)
+                    .into_par_iter()
                     .map(|r| {
                         let g = gpair[r * k + t];
                         super::GradientPair { grad: g.grad, hess: g.hess }
@@ -338,11 +351,19 @@ impl<R: Runtime> GpuHistGrower<R> {
         self.to_float_hess = quantiser.to_floating_point.hess;
         let qcolumns: Vec<Vec<GradientPairInt64>> = columns
             .iter()
-            .map(|c| c.iter().map(|g| quantiser.to_fixed_point(*g)).collect())
+            .map(|c| c.par_iter().map(|g| quantiser.to_fixed_point(*g)).collect())
+            .collect();
+        // Exact in fixed point, so — unlike the CPU grower — there is no need
+        // to choose between summing the first feature's bins and summing the
+        // gradients. Both give this. Summed before the buffers move to the
+        // device, which takes them rather than copying them.
+        let target_sums: Vec<GradientPairInt64> = qcolumns
+            .iter()
+            .map(|q| q.iter().fold(GradientPairInt64::default(), |a, b| a + *b))
             .collect();
         let dev_gpairs: Vec<DeviceGpairs> = qcolumns
-            .iter()
-            .map(|q| self.engine.upload_gpairs(q))
+            .into_iter()
+            .map(|q| self.engine.upload_gpairs_owned(q))
             .collect::<Result<Vec<_>>>()?;
 
         let mut partitioner = RowPartitioner::<R>::all_rows(self.client.clone(), self.n_rows);
@@ -350,7 +371,7 @@ impl<R: Runtime> GpuHistGrower<R> {
         let mut leaf_segments: Vec<(usize, u32, u32)> = Vec::new();
 
         let root =
-            self.init_root(&dev_gpairs, &qcolumns, &evaluator, tree, rng, &partitioner)?;
+            self.init_root(&dev_gpairs, &target_sums, &evaluator, tree, rng, &partitioner)?;
 
         let mut queue = ExpandQueue::new(self.param.grow_policy);
         if root.split.loss_chg > RT_EPS {
@@ -430,7 +451,7 @@ impl<R: Runtime> GpuHistGrower<R> {
     fn init_root(
         &mut self,
         dev_gpairs: &[DeviceGpairs],
-        qcolumns: &[Vec<GradientPairInt64>],
+        target_sums: &[GradientPairInt64],
         evaluator: &SplitEvaluator,
         tree: &mut RegTree,
         rng: &mut Mt19937,
@@ -443,13 +464,6 @@ impl<R: Runtime> GpuHistGrower<R> {
             self.engine.build_into(gpairs, &rows, &hist, hist_bins, (t * self.n_bins) as u32);
         }
 
-        // Exact in fixed point, so — unlike the CPU grower — there is no need
-        // to choose between summing the first feature's bins and summing the
-        // gradients. Both give this.
-        let target_sums: Vec<GradientPairInt64> = qcolumns
-            .iter()
-            .map(|q| q.iter().fold(GradientPairInt64::default(), |a, b| a + *b))
-            .collect();
         let sum = target_sums.iter().fold(GradientPairInt64::default(), |a, b| a + *b);
         let stats = self.decode(sum);
         let weight = evaluator.calc_weight(0, &self.param, &stats);
@@ -487,7 +501,7 @@ impl<R: Runtime> GpuHistGrower<R> {
             left_stats: GradStats::default(),
             right_stats: GradStats::default(),
             cat_bits: Vec::new(),
-            target_sums: if self.is_multi() { target_sums } else { Vec::new() },
+            target_sums: if self.is_multi() { target_sums.to_vec() } else { Vec::new() },
             left_target_sums: Vec::new(),
             right_target_sums: Vec::new(),
         };
@@ -723,13 +737,15 @@ impl<R: Runtime> GpuHistGrower<R> {
     fn read_histogram(&self, hist: &Handle, hist_bins: usize) -> Result<Vec<GradientPairInt64>> {
         let bytes = self.client.read_one_unchecked(hist.clone());
         let words: &[u32] = bytemuck::cast_slice(&bytes);
-        if words.len() != hist_bins * 4 {
+        // A pooled frontier can be wider than the level that uses it; the
+        // level's histograms are its first `hist_bins`.
+        if words.len() < hist_bins * 4 {
             return Err(crate::error::Error::HistogramBins {
                 expected: hist_bins,
                 got: words.len() / 4,
             });
         }
-        Ok(words
+        Ok(words[..hist_bins * 4]
             .chunks_exact(4)
             .map(|w| GradientPairInt64 {
                 grad: (w[0] as i64) | ((w[1] as i64) << 32),
@@ -841,6 +857,13 @@ impl<R: Runtime> GpuHistGrower<R> {
         // the same row sets and into the target's own slice of each node's
         // slot — the device counterpart of `HistGrower::build_hists` running
         // its scalar kernel once per column.
+        //
+        // Single target: the multi-chunk nodes' partials are left for the
+        // subtraction below to fold in, which saves the level a launch on a
+        // runtime where a launch is a thread hand-off. The vector-leaf path
+        // keeps the merge launch: its subtraction slots are per (node, target)
+        // and the pending tables are per node.
+        let mut pending = None;
         for (t, gpairs) in dev_gpairs.iter().enumerate() {
             let offset = t as u32 * n_bins;
             let jobs: Vec<NodeHistJob> = if offset == 0 {
@@ -848,14 +871,25 @@ impl<R: Runtime> GpuHistGrower<R> {
             } else {
                 hist_jobs.iter().map(|j| NodeHistJob { slot: j.slot + offset, ..*j }).collect()
             };
-            self.engine.build_into_batch(
-                gpairs,
-                partitioner.ridx(),
-                partitioner.n_rows(),
-                &jobs,
-                &frontier,
-                frontier_bins,
-            );
+            if self.is_multi() {
+                self.engine.build_into_batch(
+                    gpairs,
+                    partitioner.ridx(),
+                    partitioner.n_rows(),
+                    &jobs,
+                    &frontier,
+                    frontier_bins,
+                );
+            } else {
+                pending = self.engine.build_into_batch_deferred(
+                    gpairs,
+                    partitioner.ridx(),
+                    partitioner.n_rows(),
+                    &jobs,
+                    &frontier,
+                    frontier_bins,
+                );
+            }
         }
         // The subtraction is per `(node, target)`: each target's histogram is
         // `parent - built` in its own right.
@@ -870,7 +904,14 @@ impl<R: Runtime> GpuHistGrower<R> {
         } else {
             sub_slots
         };
-        self.engine.subtract_batch(&parent_hist, parent_bins, &frontier, frontier_bins, &slots);
+        self.engine.subtract_batch(
+            &parent_hist,
+            parent_bins,
+            &frontier,
+            frontier_bins,
+            &slots,
+            pending.as_ref(),
+        );
 
         // The depth-wise queue expects ascending node ids, and the smaller
         // child is not always the left one.
@@ -1050,12 +1091,29 @@ impl<R: Runtime> GpuHistGrower<R> {
         GradStats::new(g.grad as f64 * self.to_float_grad, g.hess as f64 * self.to_float_hess)
     }
 
-    /// A zeroed buffer holding `slots` node histograms side by side.
-    fn zeroed_frontier(&self, slots: usize) -> Handle {
+    /// A buffer holding `slots` node histograms side by side, ready for the
+    /// engine to build into — zeroed where its kernel only adds, and left
+    /// untouched where its kernel writes every bin (see
+    /// `HistogramEngine::frontier`).
+    fn zeroed_frontier(&mut self, slots: usize) -> Handle {
         // Four u32 accumulator words per bin, which is also two i64 words.
-        // Zeroed on device: filling it host-side and uploading would move the
-        // whole frontier across the bus once per level.
-        self.engine.zeroed(self.frontier_bins(slots) * 4)
+        let words = self.frontier_bins(slots) * 4;
+        // A buffer nobody else holds, wide enough; a level's histograms are
+        // read only through the handles its entries carry, so the pool's
+        // being the sole holder is exactly "no longer in use".
+        let reused = self.frontiers.iter().find(|(cap, h)| *cap >= words && h.can_mut());
+        match reused {
+            Some((_, h)) => {
+                let h = h.clone();
+                self.engine.prepare_frontier(&h, words);
+                h
+            }
+            None => {
+                let h = self.engine.frontier(words);
+                self.frontiers.push((words, h.clone()));
+                h
+            }
+        }
     }
 }
 

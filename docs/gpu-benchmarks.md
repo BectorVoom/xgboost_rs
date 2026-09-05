@@ -62,10 +62,15 @@ at the per-level host round trips rather than at the kernels.
    drain, and the partitioner reads its left counts for a third. Getting to one
    — or to none, by keeping the segment table on device — is the next thing to
    try, and the flat floor above is the evidence for it.
-2. **The ELLPACK is uncompressed.** Four bytes per entry against XGBoost's
-   bit-packed ~1 byte at 256 bins, so the hottest kernel moves 4× the memory it
-   needs to. This is what should matter most at `rows 1M`, the row that
-   improved least (1.01×).
+2. **The ELLPACK was uncompressed** when this was measured: four bytes per
+   entry against XGBoost's bit-packed ~1 byte at 256 bins, so the hottest
+   kernel moved 4× the memory it needed to, which is what should have mattered
+   most at `rows 1M`, the row that improved least (1.01×). It is now
+   bit-packed on device (`gpu::ellpack::pack_bins`, 8 bits for 256-bin data,
+   9 with a missing sentinel) on every runtime with planes — but that has not
+   been re-measured on a GPU yet, only tested for correctness at forced widths
+   on the CPU runtime, where packing is deliberately off because it costs more
+   instructions than it saves bytes there.
 3. **The batched grid is sized for the widest node**, which costs the shallow
    cases (see `depth 4` above).
 

@@ -79,6 +79,9 @@ fn weights(booster: &xgboost_rs::Booster) -> Vec<f32> {
 
 /// Fit `linear` both ways and require the two models to be identical.
 fn compare_exact(dmat: &DMatrix, linear: LinearBoosterParameters, rounds: u32) {
+    if !has_f64() {
+        return;
+    }
     let (cpu, _) = api::train(&params(Device::Cpu, linear.clone(), rounds), dmat, &[]).unwrap();
     let (gpu, _) = api::train(&params(Device::cuda(0), linear, rounds), dmat, &[]).unwrap();
 
@@ -104,8 +107,20 @@ fn coord(selector: FeatureSelector) -> LinearBoosterParameters {
 ///
 /// Checked separately from a fit because a fit only ever shows the *sum* of
 /// every difference; this says which side of the round is wrong when one is.
+/// The split gain arithmetic, the quantiser and the linear solver are ports of
+/// XGBoost's `double`, so a backend with no `f64` cannot run them and refuses
+/// at construction with `Error::NoF64Support`. Metal is that backend: MSL has
+/// no `double` at all. Nothing to compare there — see
+/// `xgboost_rs::gpu::supports_f64`.
+fn has_f64() -> bool {
+    xgboost_rs::gpu::supports_f64(&xgboost_rs::gpu::default_client(0))
+}
+
 #[test]
 fn the_column_reduction_is_bit_identical() {
+    if !has_f64() {
+        return;
+    }
     use xgboost_rs::data::csc::CscPages;
     use xgboost_rs::gpu::linear::GpuLinear;
     use xgboost_rs::linear::coordinate::column_gradient;
@@ -178,6 +193,9 @@ fn probe_f32_rounding() {
 /// leave every gradient bit-identical to the CPU's, in `f32`.
 #[test]
 fn the_residual_update_is_bit_identical() {
+    if !has_f64() {
+        return;
+    }
     use xgboost_rs::data::csc::CscPages;
     use xgboost_rs::gpu::linear::GpuLinear;
     use xgboost_rs::linear::coordinate::update_residual;
@@ -280,6 +298,9 @@ fn matches_with_regularisation() {
 /// group's descent must read its own stride.
 #[test]
 fn matches_with_several_output_groups() {
+    if !has_f64() {
+        return;
+    }
     let d = {
         let mut d = data(1200, 5, 0.0, 17);
         let y: Vec<f32> = d.info().labels.iter().map(|v| (v.abs() as u32 % 3) as f32).collect();

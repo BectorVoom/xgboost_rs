@@ -169,9 +169,13 @@ refuses to run on.
 
 ## Sanity check without a GPU
 
-The same binary runs on any Vulkan device (including CPU lavapipe) when built
-without `--features cuda`:
+The same binary runs without a GPU at all. The default build puts the kernels
+on the CubeCL CPU runtime, which needs no toolchain:
 
 ```bash
-cargo run --release --bin bench
+cargo run --release --bin bench          # CubeCL CPU runtime
+cargo run --release --features vulkan --bin bench   # any Vulkan device, incl. lavapipe
 ```
+
+It prints which backend it resolved to, so there is never a question of what a
+number was measured on.

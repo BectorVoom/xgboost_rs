@@ -201,7 +201,7 @@ impl GBLinear {
                 LinearUpdater::Shotgun => self.shotgun(ctx, n_rows),
                 #[cfg(feature = "gpu")]
                 LinearUpdater::CoordDescent if ctx.device.is_cuda() => {
-                    self.configure_device(ctx, n_rows);
+                    self.configure_device(ctx, n_rows)?;
                     self.coord_descent_gpu(ctx, n_rows);
                 }
                 LinearUpdater::CoordDescent => self.coord_descent(ctx, n_rows),
@@ -377,17 +377,25 @@ impl GBLinear {
 
     /// Upload the transpose, once per fit. Idempotent.
     #[cfg(feature = "gpu")]
-    fn configure_device(&mut self, ctx: &Context, n_rows: usize) {
+    fn configure_device(&mut self, ctx: &Context, n_rows: usize) -> crate::Result<()> {
         if self.gpu.is_some() {
-            return;
+            return Ok(());
         }
         let ordinal = ctx.device.ordinal().unwrap_or(0).max(0) as usize;
+        let client = crate::gpu::default_client(ordinal);
+        // The device solver sums a column in `f64` so that it reproduces the
+        // host's model bit for bit; a backend without `f64` cannot run it, and
+        // says so rather than quietly returning a different model.
+        if !crate::gpu::supports_f64(&client) {
+            return Err(crate::error::Error::NoF64Support);
+        }
         self.gpu = Some(crate::gpu::linear::GpuLinear::new(
-            crate::gpu::default_client(ordinal),
+            client,
             self.pages.as_ref().expect("configured"),
             n_rows,
             self.model.num_output_group,
         ));
+        Ok(())
     }
 
     /// [`coord_descent`](Self::coord_descent) with both O(nnz) passes on the

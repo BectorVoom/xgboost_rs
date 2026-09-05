@@ -5,10 +5,9 @@
 //! A frontier needs to share one buffer because the split evaluator reads a
 //! level in a single launch, indexing each node by a bin offset.
 
-use cubecl::Runtime;
 use cubecl::prelude::*;
-use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 
+use xgboost_rs::gpu::DefaultRuntime as R;
 use xgboost_rs::DMatrix;
 use xgboost_rs::data::cuts::build_cuts;
 use xgboost_rs::data::gradient_index::build_gradient_index;
@@ -17,10 +16,10 @@ use xgboost_rs::gpu::ellpack::{EllpackLayout, build_ellpack};
 use xgboost_rs::gpu::histogram::{HistogramBuilder, NodeHistJob};
 use xgboost_rs::reference::{Rng, cpu_histogram, random_matrix};
 
-type R = WgpuRuntime;
-
+/// A client on whichever backend this build resolved to: CUDA, wgpu/Vulkan
+/// or the CubeCL CPU runtime. The kernels under test are the same either way.
 fn client() -> ComputeClient<R> {
-    R::client(&WgpuDevice::default())
+    xgboost_rs::gpu::default_client(0)
 }
 
 /// A matrix with `missing_rate` of its entries absent.
@@ -43,6 +42,15 @@ fn matrix(rows: usize, cols: usize, missing_rate: f32, seed: u64) -> DMatrix {
 
 /// The ELLPACK must bin exactly as the CPU gradient index does — same cuts,
 /// same bin per stored value, same notion of "missing".
+/// The split gain arithmetic, the quantiser and the linear solver are ports of
+/// XGBoost's `double`, so a backend with no `f64` cannot run them and refuses
+/// at construction with `Error::NoF64Support`. Metal is that backend: MSL has
+/// no `double` at all. Nothing to compare there — see
+/// `xgboost_rs::gpu::supports_f64`.
+fn has_f64() -> bool {
+    xgboost_rs::gpu::supports_f64(&xgboost_rs::gpu::default_client(0))
+}
+
 #[test]
 fn ellpack_bins_match_the_cpu_gradient_index() {
     for (rows, cols, missing, max_bin) in
@@ -87,6 +95,9 @@ fn ellpack_bins_match_the_cpu_gradient_index() {
 /// slots do not touch each other.
 #[test]
 fn frontier_slots_accumulate_independently() {
+    if !has_f64() {
+        return;
+    }
     let client = client();
     let m = random_matrix(2000, 6, 24, 0.2, EllpackLayout::DenseCompressed, 43);
     let engine = HistogramBuilder::new(&client).build(&m).unwrap();
@@ -145,6 +156,9 @@ fn frontier_slots_accumulate_independently() {
 /// subtracted into another slot of that same second buffer.
 #[test]
 fn builds_one_child_and_subtracts_the_sibling() {
+    if !has_f64() {
+        return;
+    }
     let client = client();
     let m = random_matrix(3000, 5, 32, 0.15, EllpackLayout::DenseCompressed, 61);
     let engine = HistogramBuilder::new(&client).build(&m).unwrap();
@@ -208,6 +222,9 @@ fn builds_one_child_and_subtracts_the_sibling() {
 /// dimension, which is easy to get wrong in a way one node never shows.
 #[test]
 fn a_whole_level_builds_and_subtracts_in_one_launch_each() {
+    if !has_f64() {
+        return;
+    }
     let client = client();
     let m = random_matrix(4000, 5, 32, 0.1, EllpackLayout::DenseCompressed, 71);
     let engine = HistogramBuilder::new(&client).build(&m).unwrap();
@@ -271,6 +288,7 @@ fn a_whole_level_builds_and_subtracts_in_one_launch_each() {
                 ((i * n_bins) as u32, (i * 2 * n_bins) as u32, ((i * 2 + 1) * n_bins) as u32)
             })
             .collect::<Vec<_>>(),
+        None,
     );
 
     let bytes = client.read_one_unchecked(frontier);
@@ -303,6 +321,9 @@ fn a_whole_level_builds_and_subtracts_in_one_launch_each() {
 /// change the existing path.
 #[test]
 fn slot_zero_matches_a_standalone_build() {
+    if !has_f64() {
+        return;
+    }
     let client = client();
     let m = random_matrix(1500, 5, 32, 0.0, EllpackLayout::Dense, 53);
     let engine = HistogramBuilder::new(&client).build(&m).unwrap();

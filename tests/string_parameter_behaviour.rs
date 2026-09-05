@@ -132,6 +132,22 @@ fn run(p: &TrainingParameters, d: &DMatrix) -> Result<String, String> {
 
 /// Every `objective` spelling must train, and the model must record the
 /// objective the caller asked for rather than a fallback.
+/// A backend with no `f64` refuses every device fit by name (Metal — MSL has no
+/// `double`; see `xgboost_rs::gpu::supports_f64`). That is a statement about
+/// the backend, not about the spelling under test, so these tests accept it
+/// wherever they would otherwise require a device fit to run.
+fn refused_for_no_f64(e: &xgboost_rs::Error) -> bool {
+    #[cfg(feature = "gpu")]
+    {
+        matches!(e, xgboost_rs::Error::NoF64Support)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = e;
+        false
+    }
+}
+
 #[test]
 fn every_objective_spelling_reaches_the_fit() {
     let d = universal_data(200);
@@ -502,6 +518,7 @@ fn every_device_spelling_is_honoured_or_rejected_by_name() {
 
         match api::train(&p, &d, &[]) {
             Ok(_) => assert!(trains, "`{spelling}` should not have trained on this build"),
+            Err(e) if refused_for_no_f64(&e) => continue,
             Err(e) => {
                 assert!(!trains, "`{spelling}` should have trained: {e}");
                 assert!(
@@ -677,6 +694,7 @@ fn every_updater_spelling_is_honoured_or_rejected_by_name() {
                 implemented(updater),
                 "`{updater}` trained but has no implementation in this build"
             ),
+            Err(e) if refused_for_no_f64(&e) => continue,
             Err(e) => {
                 assert!(
                     !implemented(updater),

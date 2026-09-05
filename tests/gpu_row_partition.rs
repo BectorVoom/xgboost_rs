@@ -6,18 +6,19 @@
 //! integers — but keeping it lets the two sides be compared element for
 //! element, which is a far sharper test than comparing sets.
 
-use cubecl::Runtime;
 use cubecl::prelude::*;
-use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 
+use xgboost_rs::gpu::DefaultRuntime as R;
 use xgboost_rs::gpu::ellpack::{DeviceEllpack, EllpackLayout, EllpackMatrix};
-use xgboost_rs::gpu::row_partitioner::{RowPartitioner, SegmentSplit};
+use xgboost_rs::gpu::row_partitioner::{
+    RowPartitioner, SegmentSplit, supports_sparse_layout,
+};
 use xgboost_rs::reference::random_matrix;
 
-type R = WgpuRuntime;
-
+/// A client on whichever backend this build resolved to: CUDA, wgpu/Vulkan
+/// or the CubeCL CPU runtime. The kernels under test are the same either way.
 fn client() -> ComputeClient<R> {
-    R::client(&WgpuDevice::default())
+    xgboost_rs::gpu::default_client(0)
 }
 
 /// Port of `HistGrower::goes_left`, reading the ELLPACK the way the kernel does.
@@ -64,11 +65,36 @@ fn cpu_partition(m: &EllpackMatrix, rows: &[u32], split: &SegmentSplit) -> (Vec<
 
 /// Partition `splits` on both sides and assert the whole row index agrees.
 fn check(m: &EllpackMatrix, initial: &[u32], splits: &[SegmentSplit]) {
+    check_with_bits(m, initial, splits, None);
+}
+
+/// [`check`] with the device matrix packed at an explicit width, so the
+/// packed read paths run on a runtime that would not choose them itself.
+fn check_with_bits(m: &EllpackMatrix, initial: &[u32], splits: &[SegmentSplit], bits: Option<u32>) {
     let client = client();
-    let ell = DeviceEllpack::upload(&client, m);
+    let ell = match bits {
+        Some(bits) => DeviceEllpack::upload_with_bits(&client, m, bits),
+        None => DeviceEllpack::upload(&client, m),
+    };
+    let sparse = m.layout == EllpackLayout::Sparse;
+    let supported = supports_sparse_layout(&client);
     let mut part = RowPartitioner::<R>::new(client, initial);
 
-    let got_counts = part.partition(&ell, splits).unwrap();
+    let outcome = part.partition(&ell, splits);
+
+    // The sparse layout's bin search is a kernel shape not every runtime can
+    // compile; one that cannot says so up front rather than failing inside a
+    // launch. See `row_partitioner::supports_sparse_layout`.
+    if sparse && !supported {
+        assert!(
+            matches!(outcome, Err(xgboost_rs::Error::SparseEllpackUnsupported)),
+            "a runtime that cannot lower the sparse search must refuse it, got {}",
+            outcome.err().map_or("Ok(..)".to_owned(), |e| e.to_string())
+        );
+        return;
+    }
+
+    let got_counts = outcome.unwrap();
     let got_rows = part.read();
 
     let mut want_rows = initial.to_vec();
@@ -115,6 +141,27 @@ fn partitions_a_level_of_segments() {
         numeric(17_000, 3_000, 1, 28, true),
     ];
     check(&m, &rows, &splits);
+}
+
+/// The predicate reads the packed feature-major copy; at 9 bits an entry can
+/// straddle a word boundary, at 8 it never does, and at 32 nothing is packed.
+/// A level of segments with missing values has to partition identically at
+/// every width.
+#[test]
+fn packed_index_partitions_the_same_at_every_width() {
+    let m = random_matrix(20_000, 6, 256, 0.2, EllpackLayout::DenseCompressed, 13);
+    let rows: Vec<u32> = (0..20_000).collect();
+    let splits = vec![
+        numeric(0, 5_000, 0, 100, false),
+        numeric(5_000, 3_000, 2, 200, true),
+        numeric(8_000, 9_000, 5, 40, false),
+        numeric(17_000, 3_000, 1, 250, true),
+    ];
+    for bits in [9, 16, 32] {
+        check_with_bits(&m, &rows, &splits, Some(bits));
+    }
+    let dense = random_matrix(20_000, 6, 256, 0.0, EllpackLayout::Dense, 17);
+    check_with_bits(&dense, &rows, &splits, Some(8));
 }
 
 /// Segments not named in the batch must keep their rows untouched.

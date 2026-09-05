@@ -19,6 +19,27 @@ pub enum Error {
     #[error("histogram buffer holds {got} bins, engine expects {expected}")]
     HistogramBins { expected: usize, got: usize },
 
+    #[error(
+        "global-memory histogram accumulation needs atomic adds, which this \
+         runtime does not have; only the privatised shared-memory path can run"
+    )]
+    NoGlobalHistogramPath,
+
+    #[error(
+        "this runtime cannot compile the row partitioner's sparse-layout bin \
+         search; use a Dense or DenseCompressed ELLPACK, which is what \
+         `build_ellpack` produces"
+    )]
+    SparseEllpackUnsupported,
+
+    #[error(
+        "this backend has no f64, which the split gain arithmetic and the \
+         gradient quantiser are ports of XGBoost's `double` and need; Metal \
+         Shading Language has no `double` at all, so build with `vulkan` or \
+         `cuda` for a device fit"
+    )]
+    NoF64Support,
+
     #[error("device synchronisation failed: {0}")]
     Sync(String),
 

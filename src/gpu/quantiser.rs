@@ -124,7 +124,7 @@ impl GradientQuantiser {
 ///
 /// `gpair` holds interleaved `[grad, hess]` `f32` values, `out` interleaved
 /// `[grad, hess]` `i64` values.
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn quantise_gpair_kernel(
     gpair: &Array<f32>,
     out: &mut Array<i64>,
@@ -163,16 +163,20 @@ pub fn quantise_to_device<R: Runtime>(
     let out_handle = client.empty(n * core::mem::size_of::<GradientPairInt64>());
 
     let (cube_count, cube_dim) = super::launch::elementwise(client, n);
-    quantise_gpair_kernel::launch::<R>(
-        client,
-        cube_count,
-        cube_dim,
-        unsafe { ArrayArg::from_raw_parts(in_handle, 2 * n) },
-        unsafe { ArrayArg::from_raw_parts(out_handle.clone(), 2 * n) },
-        quantiser.to_fixed_point.grad,
-        quantiser.to_fixed_point.hess,
-        n as u32,
-    );
+    // SAFETY: the kernel guards every index against the lengths it is
+    // given; see the `gpu` module docs on unchecked launches.
+    unsafe {
+        quantise_gpair_kernel::launch_unchecked::<R>(
+            client,
+            cube_count,
+            cube_dim,
+            ArrayArg::from_raw_parts(in_handle, 2 * n),
+            ArrayArg::from_raw_parts(out_handle.clone(), 2 * n),
+            quantiser.to_fixed_point.grad,
+            quantiser.to_fixed_point.hess,
+            n as u32,
+        );
+    }
 
     super::DeviceGpairs { handle: out_handle, n }
 }

@@ -807,7 +807,20 @@ fn unimplemented_algorithm_choices_are_rejected_not_ignored() {
     let mut gpu = params(TreeBoosterParameters::default(), 1);
     gpu.booster.general.device = xgboost_rs::parameters::Device::cuda(0);
     #[cfg(feature = "gpu")]
-    api::train(&gpu, &d, &[]).unwrap_or_else(|e| panic!("device=cuda must train: {e}"));
+    {
+        let outcome = api::train(&gpu, &d, &[]);
+        // Unless the backend compiled in has no `f64`, in which case the split
+        // arithmetic cannot run and the fit refuses by name — which is still
+        // "rejected, not ignored", the thing this test is about.
+        if xgboost_rs::gpu::supports_f64(&xgboost_rs::gpu::default_client(0)) {
+            outcome.unwrap_or_else(|e| panic!("device=cuda must train: {e}"));
+        } else {
+            assert!(
+                matches!(outcome, Err(xgboost_rs::Error::NoF64Support)),
+                "a backend without f64 must refuse device=cuda by name"
+            );
+        }
+    }
     // Without the GPU kernels compiled in there is nothing to run it on, and
     // the fit says so rather than falling back to the CPU.
     #[cfg(not(feature = "gpu"))]

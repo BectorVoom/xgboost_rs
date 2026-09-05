@@ -6,20 +6,38 @@ edition = "2024"
 [dependencies]
 anyhow = { version = "1.0.104", optional = true }
 bytemuck = { version = "1", optional = true }
-# `vulkan` (wgpu + SPIR-V passthrough) is required: the kernels use i64/f64,
-# which the WGSL compiler cannot express.
-cubecl = { version = "0.10.0", features = ["vulkan"], optional = true }
+# No backend is selected here: the `cpu` / `vulkan` / `cuda` features below turn
+# them on, and `src/gpu/mod.rs` resolves which one a build actually runs.
+cubecl = { version = "0.10.0", optional = true }
 rayon = "1.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.19"
 
 [features]
-default = ["gpu"]
-# The CubeCL kernels and everything that depends on them. Building them needs a
-# CubeCL backend toolchain (on macOS, the Vulkan SDK), so CPU-only consumers can
-# opt out with `--no-default-features` and still get `parameters`.
+# The kernels build against the CubeCL CPU runtime out of the box, so a plain
+# `cargo build`/`cargo test` compiles and runs every kernel on any machine.
+# `vulkan` and `cuda` add the accelerator backends, which need a toolchain
+# (on macOS, the Vulkan SDK).
+default = ["gpu", "cpu"]
+
+# The CubeCL kernels and everything that depends on them. On its own this
+# feature brings in no backend at all: pair it with exactly one of `cpu`,
+# `vulkan` or `cuda`, or take `default`. CPU-only consumers can opt out with
+# `--no-default-features` and still get `parameters`.
 gpu = ["dep:anyhow", "dep:bytemuck", "dep:cubecl"]
+
+# The three backends the kernels run on. They can be enabled together — the
+# ladder in `src/gpu/mod.rs` picks `cuda` over `vulkan` over `cpu`, and
+# `gpu::BACKEND` names the winner — but each one that is on has to build.
+cpu = ["gpu", "cubecl/cpu"]
+# wgpu with SPIR-V passthrough, not WGSL: the kernels use i64/f64, which the
+# WGSL compiler cannot express. Needs the Vulkan SDK on macOS.
+vulkan = ["gpu", "cubecl/vulkan"]
+# wgpu with Metal Shading Language, the native macOS path — no SDK to install.
+# Same `WgpuRuntime` as `vulkan`; the shader compiler is chosen from the
+# adapter, which `AutoGraphicsApi` resolves to Metal on macOS.
+metal = ["gpu", "cubecl/wgpu-msl"]
 cuda = ["gpu", "cubecl/cuda"]
 
 [[bin]]

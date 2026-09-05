@@ -1,7 +1,9 @@
 //! Oracle (correctness) and speed benchmark for the CubeCL histogram kernels.
 //!
-//! Runs on CUDA when built with `--features cuda` (e.g. a Kaggle GPU
-//! notebook), otherwise on the wgpu/Vulkan runtime.
+//! Runs on whichever backend the build resolved to — CUDA with `--features
+//! cuda` (e.g. a Kaggle GPU notebook), wgpu/Vulkan with `--features vulkan`,
+//! and the CubeCL CPU runtime by default. The kernel source is the same in
+//! every case, which is the point of running the oracle here at all.
 //!
 //! Environment overrides:
 //!   BENCH_ROWS      rows in the benchmark matrix   (default 1048576)
@@ -12,30 +14,15 @@
 use std::time::Instant;
 
 use anyhow::{Context, bail};
-use cubecl::Runtime;
 use cubecl::prelude::ComputeClient;
 
 use xgboost_rs::gpu::ellpack::EllpackLayout;
-use xgboost_rs::gpu::histogram::{HistogramBuilder, supports_native_i64_atomics};
+use xgboost_rs::gpu::histogram::{
+    HistogramBuilder, supports_atomic_add_u32, supports_native_i64_atomics,
+};
 use xgboost_rs::gpu::quantiser::{GradientQuantiser, quantise, quantise_to_device};
-use xgboost_rs::gpu::{GradientPair, GradientPairInt64};
+use xgboost_rs::gpu::{BACKEND, DefaultRuntime as R, GradientPair, GradientPairInt64};
 use xgboost_rs::reference::{cpu_histogram, random_gpairs, random_matrix};
-
-#[cfg(feature = "cuda")]
-mod runtime {
-    pub type R = cubecl::cuda::CudaRuntime;
-    pub type Device = cubecl::cuda::CudaDevice;
-    pub const NAME: &str = "cuda";
-}
-
-#[cfg(not(feature = "cuda"))]
-mod runtime {
-    pub type R = cubecl::wgpu::WgpuRuntime;
-    pub type Device = cubecl::wgpu::WgpuDevice;
-    pub const NAME: &str = "wgpu";
-}
-
-use runtime::R;
 
 fn sync(client: &ComputeClient<R>) -> anyhow::Result<()> {
     cubecl::future::block_on(client.sync())
@@ -48,7 +35,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 
 /// GPU vs CPU oracle over every kernel path; exact i64 equality required.
 fn run_oracle(client: &ComputeClient<R>) -> anyhow::Result<()> {
-    println!("== oracle ({} runtime) ==", runtime::NAME);
+    println!("== oracle ({BACKEND} runtime) ==");
 
     // Quantiser.
     let gpairs = random_gpairs(4096, 7);
@@ -77,6 +64,19 @@ fn run_oracle(client: &ComputeClient<R>) -> anyhow::Result<()> {
         cases.push(("hist sparse/global/i64-native", EllpackLayout::Sparse, 0.5, true, Some(true)));
         cases.push(("hist sparse/shared/i64-flush", EllpackLayout::Sparse, 0.5, false, Some(true)));
     }
+    // Global-memory accumulation is a backend capability, not a choice: a
+    // runtime with no atomics has no such path to check. Drop those cases by
+    // name rather than reporting a failure. (Only the *global* ones — the
+    // privatised shared path runs everywhere, sparse layout included.)
+    let atomics_ok = supports_atomic_add_u32(client);
+    cases.retain(|&(name, ..)| {
+        let keep = atomics_ok || !name.contains("global");
+        if !keep {
+            println!("{name:33} .. skipped (no atomics on this backend)");
+        }
+        keep
+    });
+
     for &(name, layout, sparsity, force_global, atomics) in &cases {
         let (n_rows, n_features, bins) = (4096, 8, 24);
         let matrix = random_matrix(n_rows, n_features, bins, sparsity, layout, 42);
@@ -125,7 +125,7 @@ fn run_bench(client: &ComputeClient<R>) -> anyhow::Result<()> {
     let bins = env_usize("BENCH_BINS", 256) as u32;
     let iters = env_usize("BENCH_ITERS", 20);
 
-    println!("== speed ({} runtime) ==", runtime::NAME);
+    println!("== speed ({BACKEND} runtime) ==");
     println!(
         "rows={n_rows} features={n_features} bins/feature={bins} total-bins={} iters={iters}",
         n_features as u32 * bins
@@ -146,6 +146,16 @@ fn run_bench(client: &ComputeClient<R>) -> anyhow::Result<()> {
         cases.insert(2, ("dense/global/i64", EllpackLayout::Dense, 0.0, true, Some(true)));
         cases.push(("sparse0.5/global/i64", EllpackLayout::Sparse, 0.5, true, Some(true)));
     }
+
+    // Same capability filter as the oracle; see there.
+    let atomics_ok = supports_atomic_add_u32(client);
+    cases.retain(|&(name, ..)| {
+        let keep = atomics_ok || !name.contains("global");
+        if !keep {
+            println!("{name:22} .. skipped (no atomics on this backend)");
+        }
+        keep
+    });
 
     for &(name, layout, sparsity, force_global, atomics) in &cases {
         let matrix = random_matrix(n_rows, n_features, bins, sparsity, layout, 42);
@@ -184,9 +194,8 @@ fn run_bench(client: &ComputeClient<R>) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
-    let device = runtime::Device::default();
-    let client = R::client(&device);
-    println!("runtime: {} / device: {:?}\n", runtime::NAME, device);
+    let client = xgboost_rs::gpu::default_client(0);
+    println!("runtime: {BACKEND}\n");
 
     run_oracle(&client).context("oracle failed")?;
     run_bench(&client).context("benchmark failed")?;
