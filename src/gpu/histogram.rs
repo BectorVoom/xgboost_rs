@@ -30,22 +30,51 @@ use cubecl::bytes::Bytes;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 
-use super::ellpack::{EllpackMatrix, device_bits, load_bin, pack_bins};
+use super::ellpack::{EllpackMatrix, EllpackShape, device_bits, load_bin, pack_bins};
 use super::launch;
+use super::tables::TableBuilder;
+use super::tuning;
 use super::{DeviceGpairs, DeviceHistogram, DeviceRows, GradientPairInt64};
 use crate::error::{Error, Result};
 
 /// `kItemsPerThread` in histogram.cu.
 pub const ITEMS_PER_THREAD: u32 = 8;
-/// Block size. The CUDA code tunes this per SM architecture (768–1024);
-/// 256 is a portable choice within every backend's workgroup limits.
-pub const BLOCK_THREADS: u32 = 256;
+/// Units per cube the shared-memory histogram asks for.
+///
+/// The privatised histogram fills the shared memory of a streaming
+/// multiprocessor with one cube, so the cube's width is that SM's whole
+/// occupancy: at 256 units it runs eight warps per SM, which is not enough to
+/// hide the scattered `ridx`/`gpair` gathers the loop is made of. The CUDA
+/// code sizes its block to the architecture (768 on SM 7.x, 1024 from SM 8.0)
+/// for the same reason. `launch::block_1d` clamps this to what the runtime
+/// allows, and the kernel derives every stride from `CUBE_DIM_X`, so any width
+/// is correct — this is a throughput choice, and `hist_block` in
+/// [`tuning`](super::tuning) overrides it for measurement.
+pub const BLOCK_THREADS: u32 = 1024;
 /// Default shared-memory budget per workgroup (the CUDA code queries
 /// `MaxSharedMemoryOptin`; 48 KiB is the portable baseline).
 pub const DEFAULT_SHMEM_BYTES: usize = 48 * 1024;
-/// Default upper bound on the grid size, standing in for the occupancy-based
-/// `n_blocks_per_mp * n_mps` limit computed by `HistKernel::SetCfg`.
-pub const DEFAULT_MAX_BLOCKS_PER_GROUP: u32 = 1024;
+/// Cubes per streaming multiprocessor a *node* of the shared-memory path is
+/// given, standing in for the `cudaOccupancyMaxActiveBlocksPerMultiprocessor`
+/// query behind `HistKernel::SetCfg`'s `n_blocks_per_mp * n_mps` grid cap.
+///
+/// The cap is the point, not the exact factor. Every cube of the privatised
+/// path zeroes its whole shared histogram and flushes every live bin of it to
+/// global memory with atomics, so a node's cost has a term proportional to
+/// its *cube count* that has nothing to do with its rows: a 3 000-bin group
+/// flushed from 1 000 cubes is six million contended atomics for a node that
+/// may hold a few thousand rows. The grid used to be sized by the widest node
+/// alone (`items / tile`, capped at 1 024) and launched for every node of the
+/// level, which made a level cost `nodes × groups × 1 024` flushes whatever
+/// the rows — the flat, size-independent floor `docs/gpu-benchmarks.md`
+/// measured. With a 48 KiB shared buffer one cube is resident per SM, so
+/// anything past `SMs × 1` only queues and pays its own zero and flush:
+/// one per SM measured ~8% faster than two on a T4 in two separate
+/// sessions (0.46 s against 0.50, 0.44 against 0.48, twenty rounds at
+/// 500 000 × 50).
+pub const DEFAULT_BLOCKS_PER_SM: u32 = 1;
+/// Cube cap per node on a runtime that does not report its SM count.
+pub const DEFAULT_MAX_BLOCKS_PER_GROUP: u32 = 64;
 /// Rows per work item on the atomic-free path: the CPU grower's `BLOCK_ROWS`.
 ///
 /// Enough `(row, feature)` visits that a unit is worth its thread dispatch,
@@ -137,11 +166,21 @@ fn add_gpair_global(
 ///   `native_i64` is false; 1-word dummy otherwise).
 /// * `hist_i64` — global histogram as 2 `i64` words per bin (used when
 ///   `native_i64` is true; 1-word dummy otherwise). Same byte layout.
-/// * `node_n_ridx` / `node_ridx_base` / `node_hist_offset` — per node, indexed
-///   by `CUBE_POS_Z`: how many rows it has, where its slice of the shared
-///   `ridx` starts, and the bin offset of its slot in `hist`. A level is one
-///   launch rather than one launch per node, which is where a deep tree's time
-///   used to go.
+/// * `node_n_ridx` / `node_ridx_base` / `node_hist_offset` — per node: how
+///   many rows it has, where its slice of the shared `ridx` starts, and the
+///   bin offset of its slot in `hist`. A level is one launch rather than one
+///   launch per node, which is where a deep tree's time used to go.
+/// * `block_node` / `block_rank` / `node_n_blocks` — the cube table. The X
+///   axis (folded with Z, see below) is a flat list of cubes of *every* node
+///   of the level: cube `b` works node `block_node[b]` as the
+///   `block_rank[b]`-th of that node's `node_n_blocks[node]` cubes, and those
+///   stride the node's `(row, feature)` items between them. Each node's cube
+///   count is sized to its own rows and capped (`DEFAULT_BLOCKS_PER_SM`),
+///   because a cube of the shared path costs a full zero and flush of its
+///   group's bins whether or not it had rows: a grid sized by the widest node
+///   and repeated per node paid that for every node at the widest's width.
+/// * `n_blocks` — the table's length; the grid may overprovision when the
+///   count is folded into Z, and a cube past the end does nothing.
 /// * `dense` / `compressed` — comptime layout flags (`kDense`/`kCompressed`).
 /// * `use_shared` — comptime `kSharedMem`: privatise the group's bins in
 ///   shared memory, then flush to global.
@@ -166,6 +205,10 @@ pub fn hist_kernel(
     node_n_ridx: &Array<u32>,
     node_ridx_base: &Array<u32>,
     node_hist_offset: &Array<u32>,
+    block_node: &Array<u32>,
+    block_rank: &Array<u32>,
+    node_n_blocks: &Array<u32>,
+    n_blocks: u32,
     row_stride: u32,
     base_rowid: u32,
     null_value: u32,
@@ -173,13 +216,85 @@ pub fn hist_kernel(
     #[comptime] compressed: bool,
     #[comptime] use_shared: bool,
     #[comptime] native_i64: bool,
+    #[comptime] shared_i64: bool,
+    #[comptime] contiguous: bool,
+    #[comptime] probe: u32,
     #[comptime] smem_words: usize,
     #[comptime] bits: u32,
 ) {
-    // `CUBE_POS_Z` selects the node, so a whole level of them is one launch —
-    // upstream's `BuildHistBatch`. A node with fewer rows simply leaves its
-    // grid-strided loop early.
-    let node = CUBE_POS_Z;
+    // The cube's place in the level's table: X, with Z as the overflow the X
+    // axis could not hold (`CUBE_POS_Y` is the feature group). Uniform across
+    // the cube's units, so the guard keeps every barrier below matched.
+    let blk = CUBE_POS_Z * CUBE_COUNT_X + CUBE_POS_X;
+    if blk < n_blocks {
+        hist_cube(
+            gidx,
+            cut_ptrs,
+            groups,
+            ridx,
+            gpair,
+            hist,
+            hist_i64,
+            node_n_ridx,
+            node_ridx_base,
+            node_hist_offset,
+            block_node,
+            block_rank,
+            node_n_blocks,
+            blk,
+            row_stride,
+            base_rowid,
+            null_value,
+            dense,
+            compressed,
+            use_shared,
+            native_i64,
+            shared_i64,
+            contiguous,
+            probe,
+            smem_words,
+            bits,
+        );
+    }
+}
+
+/// The body of [`hist_kernel`](fn@hist_kernel) for one cube of the table.
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn hist_cube(
+    gidx: &Array<u32>,
+    cut_ptrs: &Array<u32>,
+    groups: &Array<u32>,
+    ridx: &Array<u32>,
+    gpair: &Array<i64>,
+    hist: &mut Array<Atomic<u32>>,
+    hist_i64: &mut Array<Atomic<i64>>,
+    node_n_ridx: &Array<u32>,
+    node_ridx_base: &Array<u32>,
+    node_hist_offset: &Array<u32>,
+    block_node: &Array<u32>,
+    block_rank: &Array<u32>,
+    node_n_blocks: &Array<u32>,
+    blk: u32,
+    row_stride: u32,
+    base_rowid: u32,
+    null_value: u32,
+    #[comptime] dense: bool,
+    #[comptime] compressed: bool,
+    #[comptime] use_shared: bool,
+    #[comptime] native_i64: bool,
+    #[comptime] shared_i64: bool,
+    #[comptime] contiguous: bool,
+    #[comptime] probe: u32,
+    #[comptime] smem_words: usize,
+    #[comptime] bits: u32,
+) {
+    // The table names the node and this cube's rank among the node's cubes,
+    // so a whole level of nodes is one launch — upstream's `BuildHistBatch` —
+    // and each node's cube count is its own.
+    let node = block_node[blk as usize];
+    let rank = block_rank[blk as usize];
+    let n_cubes = node_n_blocks[node as usize];
     let n_ridx = node_n_ridx[node as usize];
     let ridx_base = node_ridx_base[node as usize];
     let hist_offset = node_hist_offset[node as usize];
@@ -190,14 +305,36 @@ pub fn hist_kernel(
     let start_bin = groups[group_base + 2];
     let num_bins = groups[group_base + 3];
 
-    let smem = SharedMemory::<Atomic<u32>>::new(smem_words);
+    // Two views of the privatised histogram, one of which is a one-word
+    // dummy: `[lo, hi]` word pairs for the u32-carry scheme, or one `i64`
+    // per sum where the device adds 64 bits in shared memory natively. The
+    // carry scheme is upstream's, written when 64-bit shared atomics were
+    // slow; on SM 7.5 the native add is two atomics per entry instead of
+    // four, none of them waiting on a returned value for a carry.
+    // Unsigned, not `i64`: CUDA's 64-bit `atomicExch` and `atomicAdd` are
+    // defined for `unsigned long long`, and the signed form cubecl 0.10
+    // emitted for the zeroing (`atomicExch(int64*, int64)`) compiled to
+    // something that left the sums wrong on a T4. Two's-complement addition
+    // is the same in either signedness, so the pair is cast on the way in
+    // and out.
+    let smem64 =
+        SharedMemory::<Atomic<u64>>::new(comptime![if shared_i64 { smem_words / 2 } else { 1 }]);
+    let smem = SharedMemory::<Atomic<u32>>::new(comptime![if shared_i64 { 1 } else { smem_words }]);
 
     if use_shared {
         // dh::BlockFill of the privatised histogram.
-        let mut i = UNIT_POS_X;
-        while i < num_bins * 4 {
-            smem[i as usize].store(0u32);
-            i += CUBE_DIM_X;
+        if shared_i64 {
+            let mut i = UNIT_POS_X;
+            while i < num_bins * 2 {
+                smem64[i as usize].store(0u64);
+                i += CUBE_DIM_X;
+            }
+        } else {
+            let mut i = UNIT_POS_X;
+            while i < num_bins * 4 {
+                smem[i as usize].store(0u32);
+                i += CUBE_DIM_X;
+            }
         }
         sync_cube();
     }
@@ -208,15 +345,89 @@ pub fn hist_kernel(
     let n_elements = n_ridx * feature_stride;
 
     let tile_size = CUBE_DIM_X * ITEMS_PER_THREAD;
-    // Grid-strided tile loop over (row, feature) pairs.
-    let mut offset = CUBE_POS_X * tile_size;
-    let stride = tile_size * CUBE_COUNT_X;
+    // Tile loop over (row, feature) pairs, strided across the node's cubes.
+    let mut offset = rank * tile_size;
+    let stride = tile_size * n_cubes;
+    // The diagnostic shapes' sink; see the tile loop.
+    let probe_acc = RuntimeCell::<i64>::new(0i64);
 
     while offset < n_elements {
+        if contiguous {
+            // A unit's items are consecutive: `ITEMS_PER_THREAD` cells of
+            // the same row, or the tail of one row and the head of the next,
+            // so the row's index and gradient are loaded once per row and
+            // the `(row, feature)` unravelling is a counter, not a division
+            // per item. The strided form below is upstream's, and coalesces
+            // the bin loads across the warp; this one reads a run per unit.
+            // Measured slower on a T4 (8.6 against 9.7 Gentry/s on the dense
+            // build, 0.52 s against 0.48 on the twenty-round fit): the
+            // warp-wide coalescing is worth more than the loads it saves,
+            // so it is off unless asked for. `hist_contig` in
+            // `tuning` selects it.
+            let first = offset + UNIT_POS_X * ITEMS_PER_THREAD;
+            let r = RuntimeCell::<u32>::new(first / feature_stride);
+            let f = RuntimeCell::<u32>::new(first - (first / feature_stride) * feature_stride);
+            let row_begin = RuntimeCell::<u32>::new(0u32);
+            let g = RuntimeCell::<i64>::new(0i64);
+            let h = RuntimeCell::<i64>::new(0i64);
+            let fresh = RuntimeCell::<bool>::new(true);
+            #[unroll]
+            for j in 0..ITEMS_PER_THREAD {
+                let idx = first + j;
+                if idx < n_elements {
+                    if fresh.read() {
+                        let row = ridx[(ridx_base + r.read()) as usize];
+                        row_begin.store((row - base_rowid) * row_stride);
+                        g.store(gpair[(2 * row) as usize]);
+                        h.store(gpair[(2 * row + 1) as usize]);
+                        fresh.store(false);
+                    }
+                    let fidx = f.read() + start_feature;
+                    let bin = load_bin(gidx, row_begin.read() + fidx, bits);
+                    if dense || bin != null_value {
+                        let mut global_bin = bin;
+                        if compressed {
+                            global_bin += cut_ptrs[fidx as usize];
+                        }
+                        if use_shared {
+                            let local = global_bin - start_bin;
+                            if shared_i64 {
+                                smem64[(local * 2) as usize].fetch_add(u64::cast_from(g.read()));
+                                smem64[(local * 2 + 1) as usize].fetch_add(u64::cast_from(h.read()));
+                            } else {
+                                atomic_add_i64_as_u32_shared(&smem, local * 4, g.read());
+                                atomic_add_i64_as_u32_shared(&smem, local * 4 + 2, h.read());
+                            }
+                        } else {
+                            add_gpair_global(
+                                hist,
+                                hist_i64,
+                                hist_offset + global_bin,
+                                g.read(),
+                                h.read(),
+                                native_i64,
+                            );
+                        }
+                    }
+                }
+                f.store(f.read() + 1u32);
+                if f.read() == feature_stride {
+                    f.store(0u32);
+                    r.store(r.read() + 1u32);
+                    fresh.store(true);
+                }
+            }
+        }
+        // Diagnostic shapes, for `bench` to split the kernel's cost
+        // (`hist_probe` in `tuning`; never a fit's): `1` does everything but
+        // the accumulation, folding the values into one register that a
+        // single store keeps alive; `2` also skips the bin decode, reading
+        // nothing but the row index and gradient. Their histograms are
+        // garbage by design.
         #[unroll]
         for j in 0..ITEMS_PER_THREAD {
             let idx = offset + j * CUBE_DIM_X + UNIT_POS_X;
-            if idx < n_elements {
+            if !contiguous && idx < n_elements {
                 // process_valid_tile: unravel idx -> (row-in-set, feature-in-group).
                 let ridx_in_set = idx / feature_stride;
                 let fidx_in_set = idx - ridx_in_set * feature_stride;
@@ -226,7 +437,7 @@ pub fn hist_kernel(
 
                 // IterIdx: entry for (row, fidx) in the ELLPACK matrix.
                 let entry = (row - base_rowid) * row_stride + fidx;
-                let bin = load_bin(gidx, entry, bits);
+                let bin = if probe == 2 { fidx_in_set } else { load_bin(gidx, entry, bits) };
 
                 if dense || bin != null_value {
                     let grad = gpair[(2 * row) as usize];
@@ -237,10 +448,17 @@ pub fn hist_kernel(
                         global_bin += cut_ptrs[fidx as usize];
                     }
 
-                    if use_shared {
+                    if probe != 0 {
+                        probe_acc.store(probe_acc.read() + grad + hess + i64::cast_from(global_bin));
+                    } else if use_shared {
                         let local = global_bin - start_bin;
-                        atomic_add_i64_as_u32_shared(&smem, local * 4, grad);
-                        atomic_add_i64_as_u32_shared(&smem, local * 4 + 2, hess);
+                        if shared_i64 {
+                            smem64[(local * 2) as usize].fetch_add(u64::cast_from(grad));
+                            smem64[(local * 2 + 1) as usize].fetch_add(u64::cast_from(hess));
+                        } else {
+                            atomic_add_i64_as_u32_shared(&smem, local * 4, grad);
+                            atomic_add_i64_as_u32_shared(&smem, local * 4 + 2, hess);
+                        }
                     } else {
                         add_gpair_global(
                             hist,
@@ -257,6 +475,12 @@ pub fn hist_kernel(
         offset += stride;
     }
 
+    if probe != 0 {
+        if UNIT_POS_X == 0u32 {
+            hist_i64[0usize].fetch_add(probe_acc.read());
+        }
+    }
+
     if use_shared {
         // Flush the privatised histogram back to global memory.
         sync_cube();
@@ -265,11 +489,31 @@ pub fn hist_kernel(
             let src = (bin * 4) as usize;
             // The shared accumulator words already hold a finished i64 pair;
             // re-assemble and push it through the global add.
-            let grad = i64::cast_from(smem[src].load())
-                | (i64::cast_from(smem[src + 1].load()) << 32);
-            let hess = i64::cast_from(smem[src + 2].load())
-                | (i64::cast_from(smem[src + 3].load()) << 32);
-            add_gpair_global(hist, hist_i64, hist_offset + start_bin + bin, grad, hess, native_i64);
+            let grad = if shared_i64 {
+                i64::cast_from(smem64[(bin * 2) as usize].load())
+            } else {
+                i64::cast_from(smem[src].load()) | (i64::cast_from(smem[src + 1].load()) << 32)
+            };
+            let hess = if shared_i64 {
+                i64::cast_from(smem64[(bin * 2 + 1) as usize].load())
+            } else {
+                i64::cast_from(smem[src + 2].load()) | (i64::cast_from(smem[src + 3].load()) << 32)
+            };
+            // A bin no row of this cube touched adds nothing, and below the
+            // top of the tree that is most of them: a node of a few hundred
+            // rows lights a few hundred of a group's thousands of bins. The
+            // test is a register compare; the atomic it skips is a round trip
+            // to L2 contended by every cube of the node.
+            if grad != 0i64 || hess != 0i64 {
+                add_gpair_global(
+                    hist,
+                    hist_i64,
+                    hist_offset + start_bin + bin,
+                    grad,
+                    hess,
+                    native_i64,
+                );
+            }
             bin += CUBE_DIM_X;
         }
         // Pin every unit to this cube before any of them loops on to the next.
@@ -816,6 +1060,14 @@ pub fn supports_atomic_add_u32<R: Runtime>(client: &ComputeClient<R>) -> bool {
     client.properties().atomic_type_usage(Type::new(ty)).contains(AtomicUsage::Add)
 }
 
+/// Where [`HistogramBuilder::build_impl`] finds the bin matrix.
+enum Source<'a> {
+    /// On the host, to be packed and uploaded here.
+    Host(&'a EllpackMatrix),
+    /// Already on the device, shared with the row partitioner.
+    Device(&'a super::ellpack::DeviceEllpack),
+}
+
 /// Configures a [`HistogramEngine`]; the analogue of
 /// `DeviceHistogramBuilder::Reset` + `HistKernel`'s constructor.
 ///
@@ -836,7 +1088,9 @@ pub struct HistogramBuilder<'a, R: Runtime> {
     /// fallback can pick its own budget without overriding an explicit ask.
     shmem_bytes: Option<usize>,
     force_global: bool,
-    max_blocks_per_group: u32,
+    /// `None` until named: the default is sized to the device's SM count.
+    max_blocks_per_group: Option<u32>,
+    block_threads: u32,
     native_i64_atomics: Option<bool>,
 }
 
@@ -846,7 +1100,8 @@ impl<'a, R: Runtime> HistogramBuilder<'a, R> {
             client,
             shmem_bytes: None,
             force_global: false,
-            max_blocks_per_group: DEFAULT_MAX_BLOCKS_PER_GROUP,
+            max_blocks_per_group: None,
+            block_threads: BLOCK_THREADS,
             native_i64_atomics: None,
         }
     }
@@ -871,9 +1126,19 @@ impl<'a, R: Runtime> HistogramBuilder<'a, R> {
         self
     }
 
-    /// Cap on the grid size per feature group.
+    /// Cap on the cubes one node is given per feature group.
+    ///
+    /// Defaults to [`DEFAULT_BLOCKS_PER_SM`] times the device's SM count,
+    /// which is what stands in for the occupancy query upstream makes.
     pub fn max_blocks_per_group(mut self, n: u32) -> Self {
-        self.max_blocks_per_group = n.max(1);
+        self.max_blocks_per_group = Some(n.max(1));
+        self
+    }
+
+    /// Units per cube the histogram kernel is asked for; see
+    /// [`BLOCK_THREADS`]. Clamped to the runtime's limit at launch.
+    pub fn block_threads(mut self, n: u32) -> Self {
+        self.block_threads = n.max(1);
         self
     }
 
@@ -889,7 +1154,11 @@ impl<'a, R: Runtime> HistogramBuilder<'a, R> {
     /// Validate the matrix, decide the shared/global dispatch, and upload the
     /// matrix to the device.
     pub fn build(self, matrix: &EllpackMatrix) -> Result<HistogramEngine<R>> {
-        self.build_impl(matrix, None)
+        let expected = matrix.n_rows * matrix.row_stride;
+        if matrix.gidx.len() != expected {
+            return Err(Error::MatrixShape { expected, got: matrix.gidx.len() });
+        }
+        self.build_impl(&EllpackShape::of(matrix), Source::Host(matrix))
     }
 
     /// [`build`](Self::build) against a matrix already on device.
@@ -901,20 +1170,23 @@ impl<'a, R: Runtime> HistogramBuilder<'a, R> {
         matrix: &EllpackMatrix,
         shared: &super::ellpack::DeviceEllpack,
     ) -> Result<HistogramEngine<R>> {
-        self.build_impl(matrix, Some(shared))
+        self.build_impl(&EllpackShape::of(matrix), Source::Device(shared))
     }
 
-    fn build_impl(
+    /// [`build_shared`](Self::build_shared) for a matrix binned on the device
+    /// ([`DeviceEllpack::bin_on_device`](super::ellpack::DeviceEllpack::bin_on_device)),
+    /// which the host never held.
+    pub fn build_device(
         self,
-        matrix: &EllpackMatrix,
-        shared: Option<&super::ellpack::DeviceEllpack>,
+        ell: &super::ellpack::DeviceEllpack,
+        shape: &EllpackShape,
     ) -> Result<HistogramEngine<R>> {
+        self.build_impl(shape, Source::Device(ell))
+    }
+
+    fn build_impl(self, matrix: &EllpackShape, source: Source<'_>) -> Result<HistogramEngine<R>> {
         if matrix.cut_ptrs.len() < 2 {
             return Err(Error::InvalidCuts { got: matrix.cut_ptrs.len() });
-        }
-        let expected = matrix.n_rows * matrix.row_stride;
-        if matrix.gidx.len() != expected {
-            return Err(Error::MatrixShape { expected, got: matrix.gidx.len() });
         }
 
         // A runtime with no atomics has no global-memory accumulation path at
@@ -923,12 +1195,15 @@ impl<'a, R: Runtime> HistogramBuilder<'a, R> {
         // histogram per work item in global memory, so there is no budget to
         // fit and the matrix is always one all-features group.
         let atomic_free = !supports_atomic_add_u32(self.client);
-        if atomic_free && self.force_global {
+        let shmem_bytes = self
+            .shmem_bytes
+            .unwrap_or_else(|| tuning::get_or("hist_shmem", DEFAULT_SHMEM_BYTES as u32) as usize);
+        let force_global = self.force_global || tuning::get("hist_global").is_some_and(|v| v != 0);
+        if atomic_free && force_global {
             return Err(Error::NoGlobalHistogramPath);
         }
-        let shmem_bytes = self.shmem_bytes.unwrap_or(DEFAULT_SHMEM_BYTES);
 
-        let groups = if self.force_global || atomic_free {
+        let groups = if force_global || atomic_free {
             None
         } else if matrix.is_compressed() {
             // Feature-local bins: a block can walk just its group's features
@@ -983,10 +1258,38 @@ impl<'a, R: Runtime> HistogramBuilder<'a, R> {
         let native_i64 =
             self.native_i64_atomics.unwrap_or_else(|| supports_native_i64_atomics(self.client));
 
+        // Cubes per node: the SM count times a residency factor, the
+        // occupancy-shaped cap `HistKernel::SetCfg` computes; a fixed fallback
+        // where the runtime does not say how many SMs it has.
+        let max_blocks_per_group = self.max_blocks_per_group.unwrap_or_else(|| {
+            tuning::get_or("hist_cap", {
+                let sms = self.client.properties().hardware.num_streaming_multiprocessors;
+                match sms {
+                    Some(n) => n.max(1) * tuning::get_or("hist_bps", DEFAULT_BLOCKS_PER_SM),
+                    None => DEFAULT_MAX_BLOCKS_PER_GROUP,
+                }
+            })
+        });
+        let block_threads = tuning::get_or("hist_block", self.block_threads);
+        // Native 64-bit adds in shared memory are opt-in (`hist_smem64=1`),
+        // not the default: as `Atomic<u64>` they are exact on CUDA and Metal
+        // (the earlier signed form summed wrongly on the T4, see the kernel)
+        // but slower on the T4 — 4.2 against 9.9 Gentry/s in the dense
+        // shared bench, the 500k×50 fit 0.40 s against 0.33 — which is the
+        // reason upstream's `AtomicAdd64As32` carry scheme exists: SM 7.5
+        // has no native 64-bit shared add and emulates it with a CAS loop.
+        // The global-memory `i64` atomic is native and fine
+        // (`hist dense/global/i64-native` passes), and with it the whole
+        // global path matched the shared path's speed on the T4 (0.84 s
+        // against 0.85 s), so the carry scheme costs nothing measurable.
+        let shared_i64 = native_i64 && tuning::get_or("hist_smem64", 0) != 0;
+        let contiguous = tuning::get_or("hist_contig", 0) != 0;
+        let probe = tuning::get_or("hist_probe", 0);
+
         let client = self.client.clone();
-        let (gidx, cut_ptrs, gidx_len, bits) = match shared {
-            Some(ell) => (ell.gidx.clone(), ell.cut_ptrs.clone(), ell.gidx_len, ell.bits),
-            None => {
+        let (gidx, cut_ptrs, gidx_len, bits) = match source {
+            Source::Device(ell) => (ell.gidx.clone(), ell.cut_ptrs.clone(), ell.gidx_len, ell.bits),
+            Source::Host(matrix) => {
                 let bits = device_bits(&client, matrix);
                 let packed = pack_bins(&matrix.gidx, bits);
                 (
@@ -1026,7 +1329,11 @@ impl<'a, R: Runtime> HistogramBuilder<'a, R> {
             atomic_free,
             smem_words,
             max_chunks,
-            max_blocks_per_group: self.max_blocks_per_group,
+            max_blocks_per_group,
+            block_threads,
+            shared_i64,
+            contiguous,
+            probe,
         })
     }
 }
@@ -1061,7 +1368,17 @@ pub struct HistogramEngine<R: Runtime> {
     smem_words: usize,
     /// Cap on the row chunks one node is cut into on the atomic-free path.
     max_chunks: u32,
+    /// Cap on the cubes one node gets per feature group on the atomic path.
     max_blocks_per_group: u32,
+    /// Units per cube the atomic path asks for.
+    block_threads: u32,
+    /// Privatise in shared memory as native `i64` sums rather than `u32`
+    /// pairs with a carry; see `hist_cube`.
+    shared_i64: bool,
+    /// A unit's items consecutive rather than strided; see `hist_cube`.
+    contiguous: bool,
+    /// Diagnostic shape of the tile loop; see `hist_cube`. Zero for a fit.
+    probe: u32,
 }
 
 impl<R: Runtime> HistogramEngine<R> {
@@ -1181,26 +1498,53 @@ impl<R: Runtime> HistogramEngine<R> {
             return;
         }
 
-        // Grid sizing, mirroring the `launch` lambda in DispatchHistShmem:
-        // enough tiles for (rows x features-per-group) items, occupancy-capped.
-        let widest = jobs.iter().map(|j| j.n_ridx).max().unwrap_or(0);
+        // Grid sizing, mirroring the `launch` lambda in DispatchHistShmem —
+        // enough tiles for a node's (rows × features-per-group) items,
+        // occupancy-capped — but per node. The cube table gives each node its
+        // own count, so a level of one wide node and many narrow ones starts
+        // exactly the cubes each needs: see `hist_kernel` for why a cube that
+        // has no rows is not free on the shared path.
         let columns_per_group = self.row_stride.div_ceil(self.n_groups);
-        let items_per_group = widest * columns_per_group;
         // The kernel derives every stride from `CUBE_DIM_X`, so the workgroup
         // can be whatever the runtime wants — but the tile the grid is sized
         // in has to be the same one the kernel walks.
-        let block = launch::block_1d(&self.client, BLOCK_THREADS);
+        let block = launch::block_1d(&self.client, self.block_threads);
         let tile = block * ITEMS_PER_THREAD;
-        let n_blocks = items_per_group.div_ceil(tile).clamp(1, self.max_blocks_per_group);
+        let mut block_node = Vec::new();
+        let mut block_rank = Vec::new();
+        let node_n_blocks: Vec<u32> = jobs
+            .iter()
+            .enumerate()
+            .map(|(j, job)| {
+                let items = job.n_ridx * columns_per_group;
+                let n = items.div_ceil(tile).clamp(1, self.max_blocks_per_group);
+                block_node.extend(std::iter::repeat_n(j as u32, n as usize));
+                block_rank.extend(0..n);
+                n
+            })
+            .collect();
+        let n_blocks = block_node.len() as u32;
 
         let n_ridx: Vec<u32> = jobs.iter().map(|j| j.n_ridx).collect();
         let base: Vec<u32> = jobs.iter().map(|j| j.ridx_base).collect();
         let offset: Vec<u32> = jobs.iter().map(|j| j.slot).collect();
-        let d_n = self.client.create_from_slice(bytemuck::cast_slice(&n_ridx));
-        let d_base = self.client.create_from_slice(bytemuck::cast_slice(&base));
-        let d_off = self.client.create_from_slice(bytemuck::cast_slice(&offset));
+        // One upload for the level's six tables (see `gpu::tables`).
+        let mut tb = TableBuilder::new();
+        let t_n = tb.push(&n_ridx);
+        let t_base = tb.push(&base);
+        let t_off = tb.push(&offset);
+        let t_block_node = tb.push(&block_node);
+        let t_block_rank = tb.push(&block_rank);
+        let t_node_blocks = tb.push(&node_n_blocks);
+        let tables = tb.upload(&self.client);
 
-        let cube_count = CubeCount::Static(n_blocks, self.n_groups, jobs.len() as u32);
+        // The table runs along X, Y is the feature group, and Z takes what X
+        // cannot hold — wgpu caps an axis at 65 535 cubes and a deep level
+        // can ask for more. The kernel folds Z back and guards the overflow.
+        let max_x = self.client.properties().hardware.max_cube_count.0.max(1);
+        let cubes_x = n_blocks.min(max_x);
+        let cubes_z = n_blocks.div_ceil(cubes_x);
+        let cube_count = CubeCount::Static(cubes_x, self.n_groups, cubes_z);
         let cube_dim = CubeDim::new_1d(block);
 
         // Exactly one of the two histogram views is the real buffer; the
@@ -1227,9 +1571,13 @@ impl<R: Runtime> HistogramEngine<R> {
                 ArrayArg::from_raw_parts(gpairs.handle.clone(), gpairs.n * 2),
                 ArrayArg::from_raw_parts(hist32, hist32_len),
                 ArrayArg::from_raw_parts(hist64, hist64_len),
-                ArrayArg::from_raw_parts(d_n, jobs.len()),
-                ArrayArg::from_raw_parts(d_base, jobs.len()),
-                ArrayArg::from_raw_parts(d_off, jobs.len()),
+                tables.arg(t_n, jobs.len()),
+                tables.arg(t_base, jobs.len()),
+                tables.arg(t_off, jobs.len()),
+                tables.arg(t_block_node, n_blocks as usize),
+                tables.arg(t_block_rank, n_blocks as usize),
+                tables.arg(t_node_blocks, jobs.len()),
+                n_blocks,
                 self.row_stride,
                 self.base_rowid,
                 self.null_value,
@@ -1237,6 +1585,9 @@ impl<R: Runtime> HistogramEngine<R> {
                 self.compressed,
                 self.use_shared,
                 self.native_i64,
+                self.shared_i64,
+                self.contiguous,
+                self.probe,
                 self.smem_words,
                 self.bits,
             );
@@ -1608,9 +1959,10 @@ impl<R: Runtime> HistogramEngine<R> {
         extents.extend(p.iter().chain(&b).chain(&o).map(|&x| x as usize));
         let line = launch::line_size_for::<R, i64>(&self.client, &extents);
         let in_lines = |v: &[u32]| -> Vec<u32> { v.iter().map(|&x| x / line as u32).collect() };
-        let dp = self.client.create_from_slice(bytemuck::cast_slice(&in_lines(&p)));
-        let db = self.client.create_from_slice(bytemuck::cast_slice(&in_lines(&b)));
-        let dobuf = self.client.create_from_slice(bytemuck::cast_slice(&in_lines(&o)));
+        let mut tb = TableBuilder::new();
+        let t_p = tb.push(&in_lines(&p));
+        let t_b = tb.push(&in_lines(&b));
+        let t_o = tb.push(&in_lines(&o));
         let n_lines = n_words / line;
 
         // The partials, or a one-word dummy and empty item ranges when there
@@ -1624,8 +1976,9 @@ impl<R: Runtime> HistogramEngine<R> {
         let zeros = vec![0u32; slots.len()];
         let (item_begin, item_end) =
             if pending.is_some() { (item_begin, item_end) } else { (&zeros[..], &zeros[..]) };
-        let d_begin = self.client.create_from_slice(bytemuck::cast_slice(item_begin));
-        let d_end = self.client.create_from_slice(bytemuck::cast_slice(item_end));
+        let t_begin = tb.push(item_begin);
+        let t_end = tb.push(item_end);
+        let tables = tb.upload(&self.client);
 
         // `elementwise` is not usable here: the kernel reads `CUBE_POS_Y` to
         // pick the node, so the cube count's Y axis is spoken for and the X
@@ -1656,11 +2009,11 @@ impl<R: Runtime> HistogramEngine<R> {
                 ArrayArg::from_raw_parts(parent.clone(), parent_bins * 2),
                 ArrayArg::from_raw_parts(frontier.clone(), frontier_bins * 2),
                 ArrayArg::from_raw_parts(partials, partial_words),
-                ArrayArg::from_raw_parts(dp, slots.len()),
-                ArrayArg::from_raw_parts(db, slots.len()),
-                ArrayArg::from_raw_parts(dobuf, slots.len()),
-                ArrayArg::from_raw_parts(d_begin, slots.len()),
-                ArrayArg::from_raw_parts(d_end, slots.len()),
+                tables.arg(t_p, slots.len()),
+                tables.arg(t_b, slots.len()),
+                tables.arg(t_o, slots.len()),
+                tables.arg(t_begin, slots.len()),
+                tables.arg(t_end, slots.len()),
                 n_lines as u32,
                 (n_words / line) as u32,
                 run,

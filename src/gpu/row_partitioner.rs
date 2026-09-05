@@ -63,6 +63,7 @@ use cubecl::server::Handle;
 
 use super::ellpack::{DeviceEllpack, load_bin};
 use super::launch;
+use super::tables::TableBuilder;
 use crate::error::{Error, Result};
 
 /// Threads per partitioning workgroup, and rows per tile, in the cooperative
@@ -216,6 +217,15 @@ fn tile_index(#[comptime] coop: bool) -> u32 {
 /// first row within that segment. `block` is the tile's row count, and in the
 /// cooperative shape also the cube width; see the module docs for the two
 /// shapes `coop` selects between.
+/// `buf[i] = i`: the row index every tree starts from.
+#[cube(launch_unchecked)]
+pub fn iota_kernel(buf: &mut Array<u32>, n: u32) {
+    let i = ABSOLUTE_POS as u32;
+    if i < n {
+        buf[i as usize] = i;
+    }
+}
+
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub fn count_tile_kernel(
@@ -411,21 +421,50 @@ pub fn scatter_tile_kernel(
         // The tile's base — left rows in the segment's earlier tiles — and the
         // segment's total, summed from the counts here rather than by a scan
         // launch (see the module docs). Uniform across a cube's units.
+        //
+        // Summed *across* the cube's units, each taking a strided share of
+        // the segment's tiles and a tree reduction joining them: a root
+        // segment of 500 000 rows is ~2 000 tiles, and one unit walking them
+        // all, in every one of the ~2 000 cubes, made this pass quadratic in
+        // the row count — measured 1.5 ms per level on a T4 at 500 000 rows
+        // and 5 ms at a million, against 70 µs for the count pass over the
+        // same rows. The serial shape has one unit per tile and keeps the
+        // plain loop.
         let first = seg_tile_begin[s as usize];
         let end = seg_tile_begin[(s + 1u32) as usize];
         let base_acc = RuntimeCell::<u32>::new(0u32);
         let total_acc = RuntimeCell::<u32>::new(0u32);
-        let k = RuntimeCell::<u32>::new(first);
+        let step = if coop { CUBE_DIM_X } else { 1u32.into() };
+        let k = RuntimeCell::<u32>::new(first + (if coop { UNIT_POS_X } else { 0u32.into() }));
         while k.read() < end {
             let cnt = tile_left[k.read() as usize];
             if k.read() < tile {
                 base_acc.store(base_acc.read() + cnt);
             }
             total_acc.store(total_acc.read() + cnt);
-            k.store(k.read() + 1u32);
+            k.store(k.read() + step);
         }
-        let base = base_acc.read();
-        let n_left = total_acc.read();
+        let mut s_base = SharedMemory::<u32>::new(block);
+        let mut s_total = SharedMemory::<u32>::new(block);
+        if coop {
+            let t = UNIT_POS_X as usize;
+            s_base[t] = base_acc.read();
+            s_total[t] = total_acc.read();
+            let half = RuntimeCell::<u32>::new((block / 2usize) as u32);
+            while half.read() > 0u32 {
+                let d = half.read();
+                sync_cube();
+                if UNIT_POS_X < d {
+                    let b = (UNIT_POS_X + d) as usize;
+                    s_base[t] += s_base[b];
+                    s_total[t] += s_total[b];
+                }
+                half.store(d / 2u32);
+            }
+            sync_cube();
+        }
+        let base = if coop { s_base[0usize] } else { base_acc.read() };
+        let n_left = if coop { s_total[0usize] } else { total_acc.read() };
         // One writer per segment: its first tile, and in the cooperative
         // shape that tile's first unit.
         let reports = if coop { tile == first && UNIT_POS_X == 0u32 } else { tile == first };
@@ -562,6 +601,19 @@ pub fn commit_tile_kernel(
 
 // ------------------------------------------------------------- host API ----
 
+/// A `u32` buffer of at least `n` words, reused from `slot` when it is wide
+/// enough and reallocated (and remembered) otherwise.
+fn grown<R: Runtime>(client: &ComputeClient<R>, slot: &mut Option<(usize, Handle)>, n: usize) -> Handle {
+    match slot {
+        Some((cap, h)) if *cap >= n => h.clone(),
+        _ => {
+            let h = client.empty(n.max(1) * size_of::<u32>());
+            *slot = Some((n.max(1), h.clone()));
+            h
+        }
+    }
+}
+
 /// One node's split, as the partitioner needs it.
 #[derive(Clone, Debug)]
 pub struct SegmentSplit {
@@ -590,6 +642,10 @@ pub struct RowPartitioner<R: Runtime> {
     /// written whole, so one row of a segment speaks for all of it.
     side: Vec<u8>,
     n_rows: usize,
+    /// The tile-count and segment-count buffers, kept across levels and
+    /// grown on demand rather than allocated per partition.
+    tile_left: Option<(usize, Handle)>,
+    seg_left: Option<(usize, Handle)>,
 }
 
 impl<R: Runtime> RowPartitioner<R> {
@@ -598,13 +654,47 @@ impl<R: Runtime> RowPartitioner<R> {
         let ridx = client.create_from_slice(bytemuck::cast_slice(rows));
         let scratch = client.empty(rows.len().max(1) * size_of::<u32>());
         let side = vec![0; rows.len()];
-        Self { client, bufs: [ridx, scratch], cur: 0, side, n_rows: rows.len() }
+        Self {
+            client,
+            bufs: [ridx, scratch],
+            cur: 0,
+            side,
+            n_rows: rows.len(),
+            tile_left: None,
+            seg_left: None,
+        }
     }
 
     /// All rows, in the root segment.
+    ///
+    /// Written by a kernel: building the index on the host and uploading it
+    /// was 2 MB a tree at 500 000 rows, and the largest single item of the
+    /// root step on a T4 (`docs/gpu-benchmarks.md`).
     pub fn all_rows(client: ComputeClient<R>, n_rows: usize) -> Self {
-        let rows: Vec<u32> = (0..n_rows as u32).collect();
-        Self::new(client, &rows)
+        let ridx = client.empty(n_rows.max(1) * size_of::<u32>());
+        if n_rows > 0 {
+            let (count, dim) = launch::elementwise(&client, n_rows);
+            // SAFETY: the kernel guards its index against `n`.
+            unsafe {
+                iota_kernel::launch_unchecked::<R>(
+                    &client,
+                    count,
+                    dim,
+                    ArrayArg::from_raw_parts(ridx.clone(), n_rows),
+                    n_rows as u32,
+                );
+            }
+        }
+        let scratch = client.empty(n_rows.max(1) * size_of::<u32>());
+        Self {
+            client,
+            bufs: [ridx, scratch],
+            cur: 0,
+            side: vec![0; n_rows],
+            n_rows,
+            tile_left: None,
+            seg_left: None,
+        }
     }
 
     pub fn n_rows(&self) -> usize {
@@ -618,6 +708,16 @@ impl<R: Runtime> RowPartitioner<R> {
     /// it just applied. The handle changes from one partition to the next.
     pub fn ridx(&self) -> &Handle {
         &self.bufs[self.cur]
+    }
+
+    /// The two row buffers, and which of them holds the segment starting at
+    /// `pos`: a segment is written whole, so its first row speaks for it.
+    pub fn buffers(&self) -> [&Handle; 2] {
+        [&self.bufs[0], &self.bufs[1]]
+    }
+
+    pub fn side_of(&self, pos: u32) -> u32 {
+        self.side.get(pos as usize).copied().unwrap_or(self.cur as u8) as u32
     }
 
     /// Read the whole row index back, for tests and for the final leaf pass.
@@ -708,23 +808,44 @@ impl<R: Runtime> RowPartitioner<R> {
             .map(|s| u32::from(s.default_left) | (u32::from(!s.cat_bits.is_empty()) << 1))
             .collect();
 
-        let d_tile_seg = c.create_from_slice(bytemuck::cast_slice(&tile_seg));
-        let d_tile_off = c.create_from_slice(bytemuck::cast_slice(&tile_off));
-        let d_seg_tile_begin = c.create_from_slice(bytemuck::cast_slice(&seg_tile_begin));
-        let d_seg_begin = c.create_from_slice(bytemuck::cast_slice(&seg_begin));
-        let d_seg_len = c.create_from_slice(bytemuck::cast_slice(&seg_len));
-        let d_seg_fidx = c.create_from_slice(bytemuck::cast_slice(&seg_fidx));
-        let d_seg_cond = c.create_from_slice(bytemuck::cast_slice(&seg_cond));
-        let d_seg_flags = c.create_from_slice(bytemuck::cast_slice(&seg_flags));
-        let d_seg_cat_base = c.create_from_slice(bytemuck::cast_slice(&seg_cat_base));
-        let d_cat_bits = c.create_from_slice(bytemuck::cast_slice(&cat_bits));
+        // One upload for the level's ten tables (see `gpu::tables`).
+        let mut tb = TableBuilder::new();
+        let t_tile_seg = tb.push(&tile_seg);
+        let t_tile_off = tb.push(&tile_off);
+        let t_seg_tile_begin = tb.push(&seg_tile_begin);
+        let t_seg_begin = tb.push(&seg_begin);
+        let t_seg_len = tb.push(&seg_len);
+        let t_seg_fidx = tb.push(&seg_fidx);
+        let t_seg_cond = tb.push(&seg_cond);
+        let t_seg_flags = tb.push(&seg_flags);
+        let t_seg_cat_base = tb.push(&seg_cat_base);
+        let t_cat_bits = tb.push(&cat_bits);
+        let tables = tb.upload(c);
 
-        let d_tile_left = c.empty(n_tiles * size_of::<u32>());
-        let d_seg_left = c.empty(n_seg * size_of::<u32>());
+        let d_tile_left = grown(c, &mut self.tile_left, n_tiles);
+        let d_seg_left = grown(c, &mut self.seg_left, n_seg);
 
-        let cur = self.cur;
+        // The split segments are read from the buffer that holds them. On
+        // the depth-wise path that is the front buffer; on the loss-guided
+        // one it is whichever the partition that made the segment wrote,
+        // and a batch is one segment, so it is read from there rather than
+        // copied to the front first (a launch per batch, half of them).
+        // Segments on both sides in one batch — no caller does this today —
+        // are brought together first.
+        let first_side = splits
+            .iter()
+            .find(|sp| sp.len > 0)
+            .map_or(self.cur, |sp| self.side[sp.begin as usize] as usize);
+        let uniform = splits
+            .iter()
+            .all(|sp| sp.len == 0 || self.side[sp.begin as usize] as usize == first_side);
+        let cur = if uniform {
+            first_side
+        } else {
+            self.catch_up(splits, block, tile_dim);
+            self.cur
+        };
         let other = 1 - cur;
-        self.catch_up(splits, block, tile_dim);
         let src = self.bufs[cur].clone();
         let dst = self.bufs[other].clone();
 
@@ -739,15 +860,15 @@ impl<R: Runtime> RowPartitioner<R> {
                 ArrayArg::from_raw_parts(ell.gidx.clone(), ell.gidx_len),
                 ArrayArg::from_raw_parts(ell.gidx_t.clone(), ell.gidx_t_len),
                 ArrayArg::from_raw_parts(ell.cut_ptrs.clone(), ell.n_cuts),
-                ArrayArg::from_raw_parts(d_cat_bits.clone(), cat_bits.len()),
-                ArrayArg::from_raw_parts(d_tile_seg.clone(), n_tiles),
-                ArrayArg::from_raw_parts(d_tile_off.clone(), n_tiles),
-                ArrayArg::from_raw_parts(d_seg_begin.clone(), n_seg),
-                ArrayArg::from_raw_parts(d_seg_len.clone(), n_seg),
-                ArrayArg::from_raw_parts(d_seg_fidx.clone(), n_seg),
-                ArrayArg::from_raw_parts(d_seg_cond.clone(), n_seg),
-                ArrayArg::from_raw_parts(d_seg_flags.clone(), n_seg),
-                ArrayArg::from_raw_parts(d_seg_cat_base.clone(), n_seg),
+                tables.arg(t_cat_bits, cat_bits.len()),
+                tables.arg(t_tile_seg, n_tiles),
+                tables.arg(t_tile_off, n_tiles),
+                tables.arg(t_seg_begin, n_seg),
+                tables.arg(t_seg_len, n_seg),
+                tables.arg(t_seg_fidx, n_seg),
+                tables.arg(t_seg_cond, n_seg),
+                tables.arg(t_seg_flags, n_seg),
+                tables.arg(t_seg_cat_base, n_seg),
                 ArrayArg::from_raw_parts(d_tile_left.clone(), n_tiles),
                 ell.row_stride,
                 ell.n_rows as u32,
@@ -773,17 +894,17 @@ impl<R: Runtime> RowPartitioner<R> {
                 ArrayArg::from_raw_parts(ell.gidx.clone(), ell.gidx_len),
                 ArrayArg::from_raw_parts(ell.gidx_t.clone(), ell.gidx_t_len),
                 ArrayArg::from_raw_parts(ell.cut_ptrs.clone(), ell.n_cuts),
-                ArrayArg::from_raw_parts(d_cat_bits, cat_bits.len()),
-                ArrayArg::from_raw_parts(d_tile_seg.clone(), n_tiles),
-                ArrayArg::from_raw_parts(d_tile_off.clone(), n_tiles),
+                tables.arg(t_cat_bits, cat_bits.len()),
+                tables.arg(t_tile_seg, n_tiles),
+                tables.arg(t_tile_off, n_tiles),
                 ArrayArg::from_raw_parts(d_tile_left, n_tiles),
-                ArrayArg::from_raw_parts(d_seg_begin.clone(), n_seg),
-                ArrayArg::from_raw_parts(d_seg_len.clone(), n_seg),
-                ArrayArg::from_raw_parts(d_seg_fidx, n_seg),
-                ArrayArg::from_raw_parts(d_seg_cond, n_seg),
-                ArrayArg::from_raw_parts(d_seg_flags, n_seg),
-                ArrayArg::from_raw_parts(d_seg_cat_base, n_seg),
-                ArrayArg::from_raw_parts(d_seg_tile_begin, n_seg + 1),
+                tables.arg(t_seg_begin, n_seg),
+                tables.arg(t_seg_len, n_seg),
+                tables.arg(t_seg_fidx, n_seg),
+                tables.arg(t_seg_cond, n_seg),
+                tables.arg(t_seg_flags, n_seg),
+                tables.arg(t_seg_cat_base, n_seg),
+                tables.arg(t_seg_tile_begin, n_seg + 1),
                 ArrayArg::from_raw_parts(d_seg_left.clone(), n_seg),
                 ell.row_stride,
                 ell.n_rows as u32,

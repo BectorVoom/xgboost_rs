@@ -31,10 +31,12 @@ use super::evaluate_splits::{
     DeviceSplitCandidate, MultiNodeInput, NodeInput, SplitConfig, SplitEvaluatorGpu,
 };
 use super::histogram::{HistogramBuilder, HistogramEngine, NodeHistJob};
-use super::quantiser::GradientQuantiser;
+use super::quantiser::{
+    DeviceGpairsF32, GradientQuantiser, quantise_device_column, sum_device_column,
+};
 use super::row_partitioner::{RowPartitioner, SegmentSplit};
-use super::{DeviceGpairs, DeviceRows, GradientPairInt64};
-use crate::data::DMatrix;
+use super::{DeviceGpairs, DeviceRows, GradientPairInt64, PhaseLog};
+use crate::data::{DMatrix, MetaInfo as DMatrixInfo};
 use crate::objective::GradientPair;
 use crate::data::cuts::HistogramCuts;
 use crate::error::Result;
@@ -143,15 +145,32 @@ impl ExpandQueue {
     }
 
     /// The next batch: one entry for loss-guide, a whole level for depth-wise.
-    fn pop_batch(&mut self, param: &TrainParam, num_leaves: &mut i32) -> Vec<ExpandEntry> {
+    ///
+    /// An entry that fails `is_valid` here — its gain under `min_split_loss`,
+    /// the leaf budget spent — stays the leaf it already is, and `leaves`
+    /// records its rows: the prediction update adds every leaf's value by
+    /// these segments, where the CPU grower walks the tree's leaves, so a
+    /// leaf left off the list is a leaf whose value never reaches the
+    /// predictions.
+    fn pop_batch(
+        &mut self,
+        param: &TrainParam,
+        num_leaves: &mut i32,
+        leaves: &mut Vec<(usize, u32, u32)>,
+    ) -> Vec<ExpandEntry> {
         let mut out = Vec::new();
+        let mut take = |entry: ExpandEntry, out: &mut Vec<ExpandEntry>| {
+            if entry.is_valid(param, *num_leaves) {
+                *num_leaves += 1;
+                out.push(entry);
+            } else {
+                leaves.push((entry.nid, entry.seg_begin, entry.seg_len));
+            }
+        };
         match self {
             Self::LossGuide(q) => {
-                if let Some(LossGuideEntry(entry)) = q.pop()
-                    && entry.is_valid(param, *num_leaves)
-                {
-                    *num_leaves += 1;
-                    out.push(entry);
+                if let Some(LossGuideEntry(entry)) = q.pop() {
+                    take(entry, &mut out);
                 }
             }
             Self::DepthWise(q) => {
@@ -160,10 +179,7 @@ impl ExpandQueue {
                 };
                 while q.front().is_some_and(|e| e.depth == level) {
                     let entry = q.pop_front().expect("front was present");
-                    if entry.is_valid(param, *num_leaves) {
-                        *num_leaves += 1;
-                        out.push(entry);
-                    }
+                    take(entry, &mut out);
                 }
             }
         }
@@ -172,6 +188,22 @@ impl ExpandQueue {
 }
 
 /// One expandable candidate: its position in the batch, and its two children.
+/// A zeroed frontier buffer that batches take their slots from in turn.
+///
+/// A loss-guided tree builds two histograms a batch, sixty-three batches a
+/// tree; zeroing a two-slot buffer for each was a launch per batch. Slots
+/// are handed out from a buffer of [`ARENA_SLOTS`] zeroed once, and the
+/// parent and children of a batch may share it — `subtract_batch` reads the
+/// parent's slot and writes the sibling's, which never overlap.
+struct Arena {
+    handle: Handle,
+    slots: usize,
+    next: usize,
+}
+
+/// Slots zeroed at a time. Every level of a depth-6 tree fits in one.
+const ARENA_SLOTS: usize = 64;
+
 struct Expandable {
     batch_pos: usize,
     left: usize,
@@ -208,6 +240,11 @@ pub struct GpuHistGrower<R: Runtime> {
     /// histograms drop theirs once the level's children are built. See
     /// `HistogramEngine::prepare_frontier` for why reuse matters.
     frontiers: Vec<(usize, Handle)>,
+    /// The frontier slots are handed out from; see [`Self::take_slots`].
+    arena: Option<Arena>,
+    /// The device-resident round — predictions, labels, weights — once a
+    /// round has been done that way; see `gpu::objective`.
+    round: Option<super::objective::DeviceRound>,
 }
 
 impl<R: Runtime> GpuHistGrower<R> {
@@ -218,7 +255,7 @@ impl<R: Runtime> GpuHistGrower<R> {
         cuts: HistogramCuts,
         param: TrainParam,
     ) -> Result<Self> {
-        Self::new_multi(client, dmat, cuts, param, 1)
+        Self::new_multi(client, dmat, None, cuts, param, 1)
     }
 
     /// A grower for vector-leaf trees: one tree covering `n_targets` outputs.
@@ -230,9 +267,14 @@ impl<R: Runtime> GpuHistGrower<R> {
     /// decision a vector leaf makes. `multi_strategy=multi_output_tree` has no
     /// categorical split on the CPU either, and [`crate::api::train`] rejects
     /// the combination before it ever reaches here; this is the backstop.
+    ///
+    /// `values` is the matrix already on the device when the sketch put it
+    /// there (`gbm` hands it over): a second upload of the same 100 MB was
+    /// 25 ms of a 260 ms fit on a T4, 53 ms with a CSR matrix.
     pub fn new_multi(
         client: ComputeClient<R>,
         dmat: &DMatrix,
+        values: Option<super::sketch::DeviceValues>,
         cuts: HistogramCuts,
         param: TrainParam,
         n_targets: usize,
@@ -245,9 +287,36 @@ impl<R: Runtime> GpuHistGrower<R> {
                  categories, or use `one_output_per_tree`",
             ));
         }
-        let matrix = build_ellpack(dmat, &cuts);
-        let ell = DeviceEllpack::upload(&client, &matrix);
-        let engine = HistogramBuilder::new(&client).build_shared(&matrix, &ell)?;
+        let mut phases = PhaseLog::new(client.clone());
+        // Binned on the device where there is one: the host route is three
+        // passes over every entry and two uploads, and it cost more than a
+        // whole upstream fit at the sizes `docs/gpu-benchmarks.md` measures.
+        // A categorical feature bins by category code rather than by cut
+        // search, which only the host route does; the CPU runtime's cores
+        // are the host's, so it keeps the host route too.
+        let on_device = super::launch::has_planes(&client)
+            && !cuts.has_categorical()
+            && super::sketch::DeviceValues::readable(dmat);
+        let (ell, engine) = if on_device {
+            let values = match values {
+                Some(v) if v.n_rows == dmat.num_row() && v.n_cols == dmat.num_col() => v,
+                _ => super::sketch::DeviceValues::upload(&client, dmat),
+            };
+            phases.mark("upload values");
+            let (ell, shape) = DeviceEllpack::bin_on_device(&client, &values, &cuts);
+            phases.mark("bin+pack on device");
+            let engine = HistogramBuilder::new(&client).build_device(&ell, &shape)?;
+            (ell, engine)
+        } else {
+            let matrix = build_ellpack(dmat, &cuts);
+            phases.mark("bin");
+            let ell = DeviceEllpack::upload(&client, &matrix);
+            phases.mark("pack+upload");
+            let engine = HistogramBuilder::new(&client).build_shared(&matrix, &ell)?;
+            (ell, engine)
+        };
+        phases.mark("engine");
+        phases.report_as("setup");
         let n_features = dmat.num_col();
 
         let split_eval = SplitEvaluatorGpu::<R>::new(
@@ -286,6 +355,8 @@ impl<R: Runtime> GpuHistGrower<R> {
             to_float_grad: 1.0,
             to_float_hess: 1.0,
             frontiers: Vec::new(),
+            arena: None,
+            round: None,
             cuts,
             param,
         })
@@ -315,8 +386,98 @@ impl<R: Runtime> GpuHistGrower<R> {
         tree: &mut RegTree,
         rng: &mut Mt19937,
     ) -> Result<GrownTree> {
+        let k = self.n_targets;
+        let columns: Vec<DeviceGpairsF32> = if k == 1 {
+            vec![DeviceGpairsF32::upload_objective(&self.client, gpair)]
+        } else {
+            (0..k)
+                .map(|t| {
+                    let column: Vec<GradientPair> =
+                        (0..self.n_rows).into_par_iter().map(|r| gpair[r * k + t]).collect();
+                    DeviceGpairsF32::upload_objective(&self.client, &column)
+                })
+                .collect()
+        };
+        let (partitioner, leaf_segments) = self.grow_columns(columns, tree, rng)?;
+        let ridx = partitioner.read();
+        Ok(GrownTree { ridx, leaf_segments })
+    }
+
+    /// A whole round on the device: the gradients of `kind` at the
+    /// device-resident predictions, one tree, and the tree's leaf values
+    /// added back into those predictions — nothing crosses to the host but
+    /// the split decisions.
+    ///
+    /// The predictions must be on the device already ([`Self::device_round`]
+    /// makes them so from the host's copy); afterwards the host's copy is
+    /// stale until [`Self::sync_preds`].
+    pub fn grow_device(
+        &mut self,
+        kind: crate::objective::DeviceObjective,
+        tree: &mut RegTree,
+        rng: &mut Mt19937,
+        weight: f32,
+    ) -> Result<()> {
+        let round = self.round.as_ref().expect("device predictions are set up first");
+        let gpairs = round.gradients(&self.client, kind);
+        let (partitioner, leaf_segments) = self.grow_columns(vec![gpairs], tree, rng)?;
+        let segments: Vec<(u32, u32, u32, f32)> = leaf_segments
+            .iter()
+            .map(|&(nid, begin, len)| {
+                (partitioner.side_of(begin), begin, len, tree.leaf_value(nid)[0])
+            })
+            .collect();
+        let round = self.round.as_mut().expect("set above");
+        round.update_predictions(&self.client, partitioner.buffers(), &segments, weight);
+        Ok(())
+    }
+
+    /// Put the host's predictions on the device, for [`Self::grow_device`].
+    /// Uploads only when the device does not already hold the current ones.
+    pub fn device_round(&mut self, info: &DMatrixInfo, preds: &[f32]) {
+        match &mut self.round {
+            Some(round) if !round.host_stale => round.upload_preds(&self.client, preds),
+            Some(_) => {}
+            None => self.round = Some(super::objective::DeviceRound::new(&self.client, info, preds)),
+        }
+    }
+
+    /// Whether the device holds predictions the host copy is behind.
+    pub fn preds_on_device(&self) -> bool {
+        self.round.as_ref().is_some_and(|r| r.host_stale)
+    }
+
+    /// Bring the host's predictions up to date with the device's.
+    pub fn sync_preds(&mut self, preds: &mut [f32]) {
+        if let Some(round) = &mut self.round
+            && round.host_stale
+        {
+            round.download(&self.client, preds);
+        }
+    }
+
+    /// The training `rmse` over the device's predictions, when they are the
+    /// current ones.
+    pub fn device_rmse(&self) -> Option<f64> {
+        let round = self.round.as_ref()?;
+        round.host_stale.then(|| round.rmse(&self.client))
+    }
+
+    /// Grow one tree from device-resident gradient columns, returning the
+    /// partitioner (its row index says which leaf every row reached) and the
+    /// leaf segments.
+    fn grow_columns(
+        &mut self,
+        columns: Vec<DeviceGpairsF32>,
+        tree: &mut RegTree,
+        rng: &mut Mt19937,
+    ) -> Result<(RowPartitioner<R>, Vec<(usize, u32, u32)>)> {
         // Drawn once per tree, before any split is considered, as
         // `ColumnSampler::Init` is.
+        let mut phases = PhaseLog::new(self.client.clone());
+        // The last tree's arena goes back to the pool: nothing holds its
+        // slots once the tree's entries are gone.
+        self.arena = None;
         self.column_sampler.reset(self.n_features, rng);
         self.constraints.reset();
         let mut evaluator = SplitEvaluator::new(&self.param.monotone_constraints, self.n_features);
@@ -330,48 +491,32 @@ impl<R: Runtime> GpuHistGrower<R> {
         // The quantiser works in the GPU module's own pair type; it is the
         // same two floats, so this is a view, not a conversion of meaning.
         //
-        // Both passes are over every row and run on the rayon pool: at
-        // 200 000 rows they were 0.7 ms of a 12 ms round on one thread, and
-        // the device grower shares the machine with nothing else here.
-        let k = self.n_targets;
-        let columns: Vec<Vec<super::GradientPair>> = (0..k)
-            .map(|t| {
-                (0..self.n_rows)
-                    .into_par_iter()
-                    .map(|r| {
-                        let g = gpair[r * k + t];
-                        super::GradientPair { grad: g.grad, hess: g.hess }
-                    })
-                    .collect()
-            })
-            .collect();
-        let views: Vec<&[super::GradientPair]> = columns.iter().map(Vec::as_slice).collect();
-        let quantiser = GradientQuantiser::new_multi(&views, self.n_rows as u64);
+        // All three passes — the bound, the conversion, the sum — run on the
+        // device, and the upload is the `f32` pairs: the host quantiser's
+        // passes plus its `i64` upload were 9 ms of a 30 ms round on a cloud
+        // VM at 500 000 rows, 44 ms at a million.
+        let quantiser = GradientQuantiser::new_on_device(&self.client, &columns, self.n_rows as u64);
         self.to_float_grad = quantiser.to_floating_point.grad;
         self.to_float_hess = quantiser.to_floating_point.hess;
-        let qcolumns: Vec<Vec<GradientPairInt64>> = columns
+        let dev_gpairs: Vec<DeviceGpairs> = columns
             .iter()
-            .map(|c| c.par_iter().map(|g| quantiser.to_fixed_point(*g)).collect())
+            .map(|c| quantise_device_column(&self.client, c, &quantiser))
             .collect();
         // Exact in fixed point, so — unlike the CPU grower — there is no need
         // to choose between summing the first feature's bins and summing the
-        // gradients. Both give this. Summed before the buffers move to the
-        // device, which takes them rather than copying them.
-        let target_sums: Vec<GradientPairInt64> = qcolumns
-            .iter()
-            .map(|q| q.iter().fold(GradientPairInt64::default(), |a, b| a + *b))
-            .collect();
-        let dev_gpairs: Vec<DeviceGpairs> = qcolumns
-            .into_iter()
-            .map(|q| self.engine.upload_gpairs_owned(q))
-            .collect::<Result<Vec<_>>>()?;
+        // gradients. Both give this.
+        let target_sums: Vec<GradientPairInt64> =
+            dev_gpairs.iter().map(|d| sum_device_column(&self.client, d)).collect();
+        phases.mark("quantise+upload");
 
         let mut partitioner = RowPartitioner::<R>::all_rows(self.client.clone(), self.n_rows);
+        phases.mark("ridx");
         let mut num_leaves: i32 = 1;
         let mut leaf_segments: Vec<(usize, u32, u32)> = Vec::new();
 
         let root =
             self.init_root(&dev_gpairs, &target_sums, &evaluator, tree, rng, &partitioner)?;
+        phases.mark("root");
 
         let mut queue = ExpandQueue::new(self.param.grow_policy);
         if root.split.loss_chg > RT_EPS {
@@ -380,7 +525,7 @@ impl<R: Runtime> GpuHistGrower<R> {
             leaf_segments.push((0, root.seg_begin, root.seg_len));
         }
 
-        let mut batch = queue.pop_batch(&self.param, &mut num_leaves);
+        let mut batch = queue.pop_batch(&self.param, &mut num_leaves, &mut leaf_segments);
         while !batch.is_empty() {
             // Apply every split first, so node ids exist before anything reads
             // them — the CPU grower's order.
@@ -394,7 +539,9 @@ impl<R: Runtime> GpuHistGrower<R> {
                 }
             }
 
+            phases.mark("host");
             let left_counts = partitioner.partition(&self.ell, &splits)?;
+            phases.mark("partition");
 
             // Children that cannot expand are leaves already; record their
             // segments now, because nothing will look at them again.
@@ -417,7 +564,9 @@ impl<R: Runtime> GpuHistGrower<R> {
                 &partitioner,
                 &evaluator,
             );
+            phases.mark("histogram");
             let evaluated = self.evaluate(&children, &evaluator, rng)?;
+            phases.mark("evaluate");
 
             for child in evaluated {
                 if child.split.loss_chg > RT_EPS {
@@ -427,7 +576,7 @@ impl<R: Runtime> GpuHistGrower<R> {
                 }
             }
 
-            batch = queue.pop_batch(&self.param, &mut num_leaves);
+            batch = queue.pop_batch(&self.param, &mut num_leaves, &mut leaf_segments);
         }
 
         // Anything still queued when the loop ended failed `is_valid` and stays
@@ -443,7 +592,8 @@ impl<R: Runtime> GpuHistGrower<R> {
             }
         }
 
-        Ok(GrownTree { ridx: partitioner.read(), leaf_segments })
+        phases.report();
+        Ok((partitioner, leaf_segments))
     }
 
     /// Build the root histogram, set the root leaf, and evaluate its split.
@@ -457,11 +607,12 @@ impl<R: Runtime> GpuHistGrower<R> {
         rng: &mut Mt19937,
         partitioner: &RowPartitioner<R>,
     ) -> Result<ExpandEntry> {
-        let hist = self.zeroed_frontier(1);
-        let hist_bins = self.frontier_bins(1);
+        let (hist, base, slots) = self.take_slots(1);
+        let hist_bins = self.frontier_bins(slots);
+        let slot = (base * self.n_bins * self.n_targets) as u32;
         let rows = DeviceRows::slice(partitioner.ridx().clone(), 0, self.n_rows);
         for (t, gpairs) in dev_gpairs.iter().enumerate() {
-            self.engine.build_into(gpairs, &rows, &hist, hist_bins, (t * self.n_bins) as u32);
+            self.engine.build_into(gpairs, &rows, &hist, hist_bins, slot + (t * self.n_bins) as u32);
         }
 
         let sum = target_sums.iter().fold(GradientPairInt64::default(), |a, b| a + *b);
@@ -494,7 +645,7 @@ impl<R: Runtime> GpuHistGrower<R> {
             seg_len: self.n_rows as u32,
             hist,
             hist_bins,
-            slot: 0,
+            slot,
             sum,
             root_gain,
             split: DeviceSplitCandidate::default(),
@@ -582,12 +733,17 @@ impl<R: Runtime> GpuHistGrower<R> {
 
         let mut cat_bits = vec![Vec::new(); nodes.len()];
         if cat_features.iter().any(|f| !f.is_empty()) {
-            let all_bins = self.read_histogram(&hist, hist_bins)?;
+            // The batch's slots only: the buffer is an arena the batch
+            // shares with others (`take_slots`).
+            let lo = nodes.iter().map(|n| n.slot as usize).min().unwrap_or(0);
+            let hi = nodes.iter().map(|n| n.slot as usize + self.n_bins).max().unwrap_or(0);
+            let all_bins = self.read_histogram(&hist, hist_bins, lo, hi - lo)?;
             for (i, node) in nodes.iter().enumerate() {
                 if cat_features[i].is_empty() {
                     continue;
                 }
-                let node_bins = &all_bins[node.slot as usize..node.slot as usize + self.n_bins];
+                let at = node.slot as usize - lo;
+                let node_bins = &all_bins[at..at + self.n_bins];
                 let mut best = candidates[i];
                 for &f in &cat_features[i] {
                     let (ib, ie) = (
@@ -734,18 +890,35 @@ impl<R: Runtime> GpuHistGrower<R> {
     /// Mirrors [`HistogramEngine::read`](super::histogram::HistogramEngine::read),
     /// checked rather than debug-asserted for the same reason it is: a wrong
     /// bin count here would otherwise index the per-node slice out of bounds.
-    fn read_histogram(&self, hist: &Handle, hist_bins: usize) -> Result<Vec<GradientPairInt64>> {
-        let bytes = self.client.read_one_unchecked(hist.clone());
-        let words: &[u32] = bytemuck::cast_slice(&bytes);
-        // A pooled frontier can be wider than the level that uses it; the
-        // level's histograms are its first `hist_bins`.
-        if words.len() < hist_bins * 4 {
+    fn read_histogram(
+        &self,
+        hist: &Handle,
+        hist_bins: usize,
+        first_bin: usize,
+        n_bins: usize,
+    ) -> Result<Vec<GradientPairInt64>> {
+        // Four accumulator words a bin.
+        let word = size_of::<u32>() as u64;
+        if first_bin + n_bins > hist_bins {
             return Err(crate::error::Error::HistogramBins {
-                expected: hist_bins,
+                expected: first_bin + n_bins,
+                got: hist_bins,
+            });
+        }
+        let range = hist
+            .clone()
+            .offset_start(first_bin as u64 * 4 * word)
+            .offset_end((hist_bins - first_bin - n_bins) as u64 * 4 * word);
+        let bytes = self.client.read_one_unchecked(range);
+        let words: &[u32] = bytemuck::cast_slice(&bytes);
+        // A pooled buffer can be wider than the bins it was asked for.
+        if words.len() < n_bins * 4 {
+            return Err(crate::error::Error::HistogramBins {
+                expected: n_bins,
                 got: words.len() / 4,
             });
         }
-        Ok(words[..hist_bins * 4]
+        Ok(words[..n_bins * 4]
             .chunks_exact(4)
             .map(|w| GradientPairInt64 {
                 grad: (w[0] as i64) | ((w[1] as i64) << 32),
@@ -768,8 +941,8 @@ impl<R: Runtime> GpuHistGrower<R> {
         if expandable.is_empty() {
             return Vec::new();
         }
-        let frontier = self.zeroed_frontier(expandable.len() * 2);
-        let frontier_bins = self.frontier_bins(expandable.len() * 2);
+        let (frontier, base, slots) = self.take_slots(expandable.len() * 2);
+        let frontier_bins = self.frontier_bins(slots);
         let n_bins = self.n_bins as u32;
         // Bins between one node's slot and the next: a node holds one histogram
         // per target, side by side.
@@ -791,7 +964,8 @@ impl<R: Runtime> GpuHistGrower<R> {
 
             // Build the child with the smaller hessian sum; subtract the other.
             let fewer_right = parent.right_stats.sum_hess < parent.left_stats.sum_hess;
-            let (build_slot, sub_slot) = ((i * 2) as u32 * stride, (i * 2 + 1) as u32 * stride);
+            let (build_slot, sub_slot) =
+                ((base + i * 2) as u32 * stride, (base + i * 2 + 1) as u32 * stride);
             let left_side =
                 (e.left, left_seg, left_sum, parent.left_stats, &parent.left_target_sums);
             let right_side =
@@ -1095,6 +1269,23 @@ impl<R: Runtime> GpuHistGrower<R> {
     /// engine to build into — zeroed where its kernel only adds, and left
     /// untouched where its kernel writes every bin (see
     /// `HistogramEngine::frontier`).
+    /// `n` zeroed histogram slots: the buffer, the first slot's index, and
+    /// the buffer's slot count. From the current arena while it has room,
+    /// else from a fresh one.
+    fn take_slots(&mut self, n: usize) -> (Handle, usize, usize) {
+        if let Some(a) = &mut self.arena
+            && a.next + n <= a.slots
+        {
+            let base = a.next;
+            a.next += n;
+            return (a.handle.clone(), base, a.slots);
+        }
+        let slots = n.max(ARENA_SLOTS);
+        let handle = self.zeroed_frontier(slots);
+        self.arena = Some(Arena { handle: handle.clone(), slots, next: n });
+        (handle, 0, slots)
+    }
+
     fn zeroed_frontier(&mut self, slots: usize) -> Handle {
         // Four u32 accumulator words per bin, which is also two i64 words.
         let words = self.frontier_bins(slots) * 4;

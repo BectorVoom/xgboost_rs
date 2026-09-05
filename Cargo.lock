@@ -3879,6 +3879,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "cubecl",
+ "cudarc",
  "rayon",
  "serde",
  "serde_json",

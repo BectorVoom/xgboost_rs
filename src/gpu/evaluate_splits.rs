@@ -39,6 +39,7 @@ use cubecl::server::Handle;
 
 use super::GradientPairInt64;
 use super::launch;
+use super::tables::TableBuilder;
 use crate::error::Result;
 
 /// Threads per split-evaluation workgroup a device with planes is *asked* for.
@@ -1533,6 +1534,25 @@ pub struct SplitEvaluatorGpu<R: Runtime> {
     n_bins: usize,
     has_constraint: bool,
     cfg: SplitConfig,
+    /// Candidate and winner buffers, kept across batches and grown on
+    /// demand: five allocations a level through the runtime's pool were
+    /// measurable host time for buffers whose size only ever reaches the
+    /// widest level's.
+    scratch: std::cell::RefCell<Scratch>,
+}
+
+/// The evaluator's per-batch buffers; see `SplitEvaluatorGpu::scratch`.
+#[derive(Default)]
+struct Scratch {
+    /// Candidates the buffers hold; zero before the first batch.
+    n_cand: usize,
+    chg: Option<Handle>,
+    sindex: Option<Handle>,
+    value: Option<Handle>,
+    left: Option<Handle>,
+    /// Nodes the winner buffer holds.
+    n_nodes: usize,
+    best: Option<Handle>,
 }
 
 impl<R: Runtime> SplitEvaluatorGpu<R> {
@@ -1567,11 +1587,41 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
             n_bins: cut_values.len(),
             has_constraint,
             cfg,
+            scratch: Default::default(),
         })
     }
 
     pub fn n_features(&self) -> usize {
         self.n_features
+    }
+
+    /// The candidate buffers for `n_cand` `(node, feature)` pairs.
+    fn candidate_buffers(&self, n_cand: usize) -> (Handle, Handle, Handle, Handle) {
+        let mut sc = self.scratch.borrow_mut();
+        if sc.n_cand < n_cand || sc.chg.is_none() {
+            let c = &self.client;
+            sc.chg = Some(c.empty(n_cand * size_of::<f32>()));
+            sc.sindex = Some(c.empty(n_cand * size_of::<u32>()));
+            sc.value = Some(c.empty(n_cand * size_of::<f32>()));
+            sc.left = Some(c.empty(n_cand * 2 * size_of::<i64>()));
+            sc.n_cand = n_cand;
+        }
+        (
+            sc.chg.clone().expect("set above"),
+            sc.sindex.clone().expect("set above"),
+            sc.value.clone().expect("set above"),
+            sc.left.clone().expect("set above"),
+        )
+    }
+
+    /// The packed-winner buffer for `n_nodes` nodes.
+    fn best_buffer(&self, n_nodes: usize) -> Handle {
+        let mut sc = self.scratch.borrow_mut();
+        if sc.n_nodes < n_nodes || sc.best.is_none() {
+            sc.best = Some(self.client.empty(n_nodes * SPLIT_WORDS * size_of::<i64>()));
+            sc.n_nodes = n_nodes;
+        }
+        sc.best.clone().expect("set above")
     }
 
     /// Evaluate one batch of nodes against `hist`, returning the best split per
@@ -1629,18 +1679,18 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
         let lower: Vec<f32> = nodes.iter().map(|n| n.lower).collect();
         let upper: Vec<f32> = nodes.iter().map(|n| n.upper).collect();
 
-        let base_d = c.create_from_slice(bytemuck::cast_slice(&base));
-        let parent_d = c.create_from_slice(bytemuck::cast_slice(&parent));
-        let gain_d = c.create_from_slice(bytemuck::cast_slice(&gain));
-        let lower_d = c.create_from_slice(bytemuck::cast_slice(&lower));
-        let upper_d = c.create_from_slice(bytemuck::cast_slice(&upper));
-        let mask_d = c.create_from_slice(bytemuck::cast_slice(feature_mask));
+        // One upload for the batch's six tables (see `gpu::tables`).
+        let mut tb = TableBuilder::new();
+        let t_base = tb.push(&base);
+        let t_parent = tb.push(&parent);
+        let t_gain = tb.push(&gain);
+        let t_lower = tb.push(&lower);
+        let t_upper = tb.push(&upper);
+        let t_mask = tb.push(feature_mask);
+        let tables = tb.upload(c);
 
         let n_cand = n_nodes * self.n_features;
-        let cand_chg = c.empty(n_cand * size_of::<f32>());
-        let cand_sindex = c.empty(n_cand * size_of::<u32>());
-        let cand_value = c.empty(n_cand * size_of::<f32>());
-        let cand_left = c.empty(n_cand * 2 * size_of::<i64>());
+        let (cand_chg, cand_sindex, cand_value, cand_left) = self.candidate_buffers(n_cand);
 
         let has_mds = self.cfg.max_delta_step != 0.0;
 
@@ -1655,12 +1705,12 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
                 ArrayArg::from_raw_parts(self.cut_ptrs.clone(), self.n_features + 1),
                 ArrayArg::from_raw_parts(self.cut_values.clone(), self.n_bins),
                 ArrayArg::from_raw_parts(self.min_values.clone(), self.n_features),
-                ArrayArg::from_raw_parts(base_d, n_nodes),
-                ArrayArg::from_raw_parts(parent_d, n_nodes * 2),
-                ArrayArg::from_raw_parts(gain_d, n_nodes),
-                ArrayArg::from_raw_parts(lower_d, n_nodes),
-                ArrayArg::from_raw_parts(upper_d, n_nodes),
-                ArrayArg::from_raw_parts(mask_d, n_cand),
+                tables.arg(t_base, n_nodes),
+                tables.arg(t_parent, n_nodes * 2),
+                tables.arg(t_gain, n_nodes),
+                tables.arg(t_lower, n_nodes),
+                tables.arg(t_upper, n_nodes),
+                tables.arg(t_mask, n_cand),
                 ArrayArg::from_raw_parts(self.monotone.clone(), self.n_features),
                 ArrayArg::from_raw_parts(cand_chg.clone(), n_cand),
                 ArrayArg::from_raw_parts(cand_sindex.clone(), n_cand),
@@ -1696,7 +1746,7 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
     ) -> Vec<DeviceSplitCandidate> {
         let c = &self.client;
         let n_cand = n_nodes * self.n_features;
-        let best = c.empty(n_nodes * SPLIT_WORDS * size_of::<i64>());
+        let best = self.best_buffer(n_nodes);
 
         // A cube per node where a barrier is cheap, a unit per node where it
         // is not; `block` is only the cooperative cube width, and pinned to a
@@ -1730,9 +1780,12 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
             );
         }
 
+        // The pooled buffer can be wider than this batch: only its first
+        // `n_nodes` winners are this batch's.
         let words: Vec<i64> = read_vec(c, best);
         words
             .chunks_exact(SPLIT_WORDS)
+            .take(n_nodes)
             .map(|w| DeviceSplitCandidate {
                 sindex: w[0] as u32,
                 left_grad: w[1],
@@ -1781,12 +1834,15 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
         let lower: Vec<f32> = nodes.iter().map(|n| n.lower).collect();
         let upper: Vec<f32> = nodes.iter().map(|n| n.upper).collect();
 
-        let base_d = c.create_from_slice(bytemuck::cast_slice(&base));
-        let parent_d = c.create_from_slice(bytemuck::cast_slice(&parent));
-        let gain_d = c.create_from_slice(bytemuck::cast_slice(&gain));
-        let lower_d = c.create_from_slice(bytemuck::cast_slice(&lower));
-        let upper_d = c.create_from_slice(bytemuck::cast_slice(&upper));
-        let mask_d = c.create_from_slice(bytemuck::cast_slice(feature_mask));
+        // One upload for the batch's six tables (see `gpu::tables`).
+        let mut tb = TableBuilder::new();
+        let t_base = tb.push(&base);
+        let t_parent = tb.push(&parent);
+        let t_gain = tb.push(&gain);
+        let t_lower = tb.push(&lower);
+        let t_upper = tb.push(&upper);
+        let t_mask = tb.push(feature_mask);
+        let tables = tb.upload(c);
 
         // Same shape as the histogram it scans: one inclusive prefix per bin.
         let prefix = c.empty(hist_bins * 2 * size_of::<i64>());
@@ -1811,7 +1867,7 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
                 scan_dim,
                 ArrayArg::from_raw_parts(hist.clone(), hist_bins * 2),
                 ArrayArg::from_raw_parts(self.cut_ptrs.clone(), self.n_features + 1),
-                ArrayArg::from_raw_parts(base_d.clone(), n_nodes),
+                tables.arg(t_base, n_nodes),
                 ArrayArg::from_raw_parts(prefix.clone(), hist_bins * 2),
                 node_bins as u32,
                 self.n_features as u32,
@@ -1822,10 +1878,7 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
             );
         }
 
-        let cand_chg = c.empty(n_cand * size_of::<f32>());
-        let cand_sindex = c.empty(n_cand * size_of::<u32>());
-        let cand_value = c.empty(n_cand * size_of::<f32>());
-        let cand_left = c.empty(n_cand * 2 * size_of::<i64>());
+        let (cand_chg, cand_sindex, cand_value, cand_left) = self.candidate_buffers(n_cand);
 
         let has_mds = self.cfg.max_delta_step != 0.0;
 
@@ -1858,12 +1911,12 @@ impl<R: Runtime> SplitEvaluatorGpu<R> {
                 ArrayArg::from_raw_parts(self.cut_ptrs.clone(), self.n_features + 1),
                 ArrayArg::from_raw_parts(self.cut_values.clone(), self.n_bins),
                 ArrayArg::from_raw_parts(self.min_values.clone(), self.n_features),
-                ArrayArg::from_raw_parts(base_d, n_nodes),
-                ArrayArg::from_raw_parts(parent_d, n_nodes * n_targets * 2),
-                ArrayArg::from_raw_parts(gain_d, n_nodes),
-                ArrayArg::from_raw_parts(lower_d, n_nodes),
-                ArrayArg::from_raw_parts(upper_d, n_nodes),
-                ArrayArg::from_raw_parts(mask_d, n_cand),
+                tables.arg(t_base, n_nodes),
+                tables.arg(t_parent, n_nodes * n_targets * 2),
+                tables.arg(t_gain, n_nodes),
+                tables.arg(t_lower, n_nodes),
+                tables.arg(t_upper, n_nodes),
+                tables.arg(t_mask, n_cand),
                 ArrayArg::from_raw_parts(cand_chg.clone(), n_cand),
                 ArrayArg::from_raw_parts(cand_sindex.clone(), n_cand),
                 ArrayArg::from_raw_parts(cand_value.clone(), n_cand),

@@ -38,6 +38,12 @@ def main() -> None:
         default="cpu",
         help="cpu, or cuda[:ordinal] to time gpu_hist against the Rust GPU path",
     )
+    ap.add_argument(
+        "--warmup",
+        action="store_true",
+        help="fit once before timing, so the process's CUDA context and kernel "
+        "modules are paid outside the clock (what a long-lived process sees)",
+    )
     args = ap.parse_args()
 
     raw = np.fromfile(args.path, dtype=np.float32)
@@ -67,6 +73,10 @@ def main() -> None:
     t = time.perf_counter()
     dtrain = xgb.DMatrix(x, label=y)
     build = time.perf_counter() - t
+
+    if args.warmup:
+        small = {**params}
+        xgb.train(small, xgb.DMatrix(x[:1000], label=y[:1000]), num_boost_round=1)
 
     best = float("inf")
     rmse = None

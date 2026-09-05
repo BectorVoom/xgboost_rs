@@ -193,11 +193,89 @@ fn run_bench(client: &ComputeClient<R>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn main() -> anyhow::Result<()> {
-    let client = xgboost_rs::gpu::default_client(0);
-    println!("runtime: {BACKEND}\n");
+/// What a transfer costs on this runtime, by route: the client's slice
+/// upload, its owned-buffer upload, a bare allocation, and a readback, at a
+/// per-round size and a whole-matrix size. On a cloud VM the slice route
+/// measured 0.35 GB/s at 100 MB — two host copies and pageable staging — so
+/// the choice of route is worth knowing before reading any other number.
+fn run_transfers(client: &ComputeClient<R>) -> anyhow::Result<()> {
+    println!("\n== transfers ({BACKEND} runtime) ==");
+    for &mb in &[4usize, 100] {
+        let n = mb << 20;
+        let data = vec![1u8; n];
+        let time = |label: &str, f: &dyn Fn() -> cubecl::server::Handle| -> anyhow::Result<()> {
+            // Twice: the second sees whatever the pools kept from the first.
+            for round in 0..2 {
+                let start = Instant::now();
+                let h = f();
+                sync(client)?;
+                let ms = start.elapsed().as_secs_f64() * 1e3;
+                println!("{label:28} {mb:>4} MB  round {round}  {ms:8.2} ms  {:6.2} GB/s", n as f64 / ms / 1e6);
+                drop(h);
+            }
+            Ok(())
+        };
+        time("create_from_slice", &|| client.create_from_slice(&data))?;
+        time("create(owned)", &|| client.create(cubecl::bytes::Bytes::from_elems(data.clone())))?;
+        time("upload_vec", &|| xgboost_rs::gpu::tables::upload_vec(client, data.clone()))?;
+        time("empty", &|| client.empty(n))?;
+        let h = client.create_from_slice(&data);
+        sync(client)?;
+        let start = Instant::now();
+        let back = client.read_one_unchecked(h);
+        let ms = start.elapsed().as_secs_f64() * 1e3;
+        println!("{:28} {mb:>4} MB           {ms:8.2} ms  {:6.2} GB/s", "read_one", back.len() as f64 / ms / 1e6);
+    }
+    Ok(())
+}
 
-    run_oracle(&client).context("oracle failed")?;
+/// What a process pays before its first kernel runs: the client (context,
+/// pools, kernel-cache load) and a kernel's first launch against its
+/// second — the module load, which is the driver's PTX-to-SASS compilation
+/// unless its own cache holds it.
+fn run_startup(client: &ComputeClient<R>, client_ms: f64) -> anyhow::Result<()> {
+    println!("== startup ({BACKEND} runtime) ==");
+    println!("client creation            {client_ms:8.2} ms");
+    let engine = HistogramBuilder::new(client).build(&random_matrix(64, 4, 16, 0.0, EllpackLayout::Dense, 1))?;
+    for round in 0..2 {
+        let start = Instant::now();
+        let h = engine.zeroed(1024);
+        sync(client)?;
+        println!("zero kernel launch {round}       {:8.2} ms", start.elapsed().as_secs_f64() * 1e3);
+        drop(h);
+    }
+    Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
+    // The bare context first, so the client's own cost stands apart from
+    // the driver's: the primary context is unique per device, so the client
+    // then retains the one made here.
+    #[cfg(feature = "cuda")]
+    {
+        let start = Instant::now();
+        // SAFETY: device 0 exists on a machine this runs on; retaining the
+        // primary context is what the runtime does next anyway.
+        unsafe {
+            cudarc::driver::result::init()?;
+            let dev = cudarc::driver::result::device::get(0)?;
+            let ctx = cudarc::driver::result::primary_ctx::retain(dev)?;
+            cudarc::driver::result::ctx::set_current(ctx)?;
+        }
+        println!("primary context            {:8.2} ms", start.elapsed().as_secs_f64() * 1e3);
+    }
+    let start = Instant::now();
+    let client = xgboost_rs::gpu::default_client(0);
+    let client_ms = start.elapsed().as_secs_f64() * 1e3;
+    println!("runtime: {BACKEND}\n");
+    run_startup(&client, client_ms).context("startup probe failed")?;
+
+    // `BENCH_SKIP_ORACLE` is for the diagnostic histogram shapes
+    // (`hist_probe`), which are wrong by design and only have a speed.
+    if env_usize("BENCH_SKIP_ORACLE", 0) == 0 {
+        run_oracle(&client).context("oracle failed")?;
+    }
+    run_transfers(&client).context("transfer benchmark failed")?;
     run_bench(&client).context("benchmark failed")?;
     Ok(())
 }

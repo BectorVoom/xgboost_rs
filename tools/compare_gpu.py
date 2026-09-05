@@ -66,6 +66,18 @@ def main() -> None:
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--cpu", action="store_true", help="also time both on device=cpu")
     ap.add_argument("--only", default=None, help="substring filter over case names")
+    ap.add_argument(
+        "--warm",
+        action="store_true",
+        help="both sides fit once before the clock, so a process's one-time costs "
+        "(the CUDA context, kernel modules) are outside the timing",
+    )
+    ap.add_argument(
+        "--prewarm",
+        action="store_true",
+        help="the Rust side starts the device's initialisation before its data "
+        "build (`train_bench --prewarm`), which is when a Python process pays it",
+    )
     args = ap.parse_args()
 
     tmp = tempfile.mkdtemp()
@@ -91,6 +103,10 @@ def main() -> None:
         rs = [args.binary, *common]
         if policy == "lossguide":
             rs.append("--lossguide")
+        if args.warm:
+            rs.append("--warmup")
+        if args.prewarm:
+            rs.append("--prewarm")
 
         # The Rust GPU run also writes the dataset the Python side reads.
         rs_gpu_t, rs_rmse = parse(run([*rs, "--device", "cuda", "--dump", data]))
@@ -101,6 +117,8 @@ def main() -> None:
             "--depth", str(depth), "--max-leaves", str(leaves), "--grow-policy", policy,
             "--max-bin", str(mbin), "--threads", str(args.threads), "--repeats", "1",
         ]
+        if args.warm:
+            xgb.append("--warmup")
         xgb_gpu_t, xgb_rmse = parse(run([*xgb, "--device", "cuda"]))
 
         row = f"{name:<16} {rows:>9} {feats:>5} {rounds:>4} "

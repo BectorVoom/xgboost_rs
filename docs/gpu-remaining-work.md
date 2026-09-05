@@ -364,13 +364,16 @@ fit beyond (`multi_output_tree_matches_with_regularisation_and_constraints`).
 The `Array<f32>` round-trip that fixed the same problem in `src/gpu/linear.rs`
 would probably fix this too.
 
-**Speed.** `docs/gpu-benchmarks.md` records that the device path is 5–14×
-slower than XGBoost's `gpu_hist`, with the measured evidence for where the time
-goes. That is the gap against a *good* GPU implementation; against this crate's
-own CPU path the device does win — `docs/parameter-performance.md` measures a
-T4 at 1.27× its host on a baseline fit and 3.58× at `max_depth = 10`, which is
-the shape to expect, since depth is what gives a level-at-a-time launcher more
-independent work.
+**Speed.** `docs/gpu-benchmarks.md` records the device path against
+XGBoost's `gpu_hist` on a Kaggle T4: with both processes warm it is faster
+on all 12 benchmark cases (1.5–2.8×; sparse input 1.6×, loss-guided growth
+1.5×), and with each fit in a fresh process 1.0–1.7× when the driver's
+context creation (`gpu::warm_up`) overlaps the data load, 0.6–1.25× when
+it does not. A round at 500 000 × 50 is 7 ms, with the gradients, the
+prediction update and the metric on the device (`gpu::objective`) for the
+objectives it covers — `reg:squarederror` so far. Every other objective, a
+vector-leaf fit, row sampling and DART take the host round, which is 6 ms a
+round slower on that VM's cores.
 
 The two places it loses are worth knowing before reaching for `device=cuda`:
 `gblinear` (0.61×, because coordinate descent needs the previous feature's

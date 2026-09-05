@@ -198,6 +198,7 @@
 pub mod api;
 pub mod context;
 pub mod data;
+pub mod phases;
 pub mod error;
 pub mod gbm;
 #[cfg(feature = "gpu")]

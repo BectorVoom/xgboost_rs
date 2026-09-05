@@ -43,24 +43,52 @@ pub trait Metric {
 pub(crate) fn elementwise_reduce(
     preds: &[f32],
     info: &MetaInfo,
-    row: impl Fn(f32, f32) -> f64,
+    row: impl Fn(f32, f32) -> f64 + Sync,
 ) -> (f64, f64) {
+    use rayon::prelude::*;
     if info.num_row == 0 {
         return (0.0, 0.0);
     }
     let n_groups = (preds.len() / info.num_row).max(1);
     let n_targets = info.n_targets();
-    let (mut esum, mut wsum) = (0.0f64, 0.0f64);
-    for i in 0..info.num_row {
-        let w = info.weight(i) as f64;
-        for t in 0..n_groups {
-            let label = info.label(i, t.min(n_targets - 1));
-            esum += row(label, preds[i * n_groups + t]) * w;
-            wsum += w;
-        }
-    }
-    (esum, wsum)
+    // Blocks of rows summed in parallel, the block sums added in row order:
+    // the same number whatever the thread count, and a pass that was 3 ms of
+    // a 22 ms round at 500 000 rows on one core is a fraction of that.
+    // Within a block, `REDUCE_LANES` interleaved lanes each summed in row
+    // order and then added in lane order: the shape a device reduction takes
+    // (`gpu::objective::rmse_lanes_kernel`), so the two give one number.
+    let blocks: Vec<(f64, f64)> = crate::threading::install(|| {
+        (0..info.num_row.div_ceil(REDUCE_ROWS))
+            .into_par_iter()
+            .map(|b| {
+                let (mut esum, mut wsum) = (0.0f64, 0.0f64);
+                let end = ((b + 1) * REDUCE_ROWS).min(info.num_row);
+                for lane in 0..REDUCE_LANES {
+                    let (mut le, mut lw) = (0.0f64, 0.0f64);
+                    let mut i = b * REDUCE_ROWS + lane;
+                    while i < end {
+                        let w = info.weight(i) as f64;
+                        for t in 0..n_groups {
+                            let label = info.label(i, t.min(n_targets - 1));
+                            le += row(label, preds[i * n_groups + t]) * w;
+                            lw += w;
+                        }
+                        i += REDUCE_LANES;
+                    }
+                    esum += le;
+                    wsum += lw;
+                }
+                (esum, wsum)
+            })
+            .collect()
+    });
+    blocks.iter().fold((0.0, 0.0), |(e, w), (be, bw)| (e + be, w + bw))
 }
+
+/// Rows per block of [`elementwise_reduce`]'s parallel sum.
+pub(crate) const REDUCE_ROWS: usize = 4096;
+/// Interleaved partial sums within a block; see [`elementwise_reduce`].
+pub(crate) const REDUCE_LANES: usize = 64;
 
 /// `wsum == 0 ? esum : esum / wsum`, the ending most metrics share.
 #[inline]

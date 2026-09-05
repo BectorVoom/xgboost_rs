@@ -2,9 +2,55 @@
 
 ## Scripted (preferred)
 
-`tools/kaggle/push.sh [--wait]` packages the crate, uploads it as a dataset,
-waits for ingest, and pushes `tools/kaggle/run.py` as a kernel. It needs an
-authenticated `kaggle` CLI.
+`tools/kaggle/push.sh [--wait] [metadata.json]` packages the crate, uploads
+it as a dataset, waits for ingest, and pushes a kernel. It needs an
+authenticated `kaggle` CLI. Three kernels exist, named by their metadata file:
+
+| metadata | script | what it measures |
+|---|---|---|
+| `kernel-metadata.json` (default) | `run.py` | the kernel oracle, the GPU-gated fixtures, XGBoost CPU vs GPU |
+| `param-bench-metadata.json` | `run_param_bench.py` | the parameter sweep on both devices |
+| `gpu-compare-metadata.json` | `run_gpu_compare.py` | **`device=cuda` against XGBoost `gpu_hist`** (`docs/gpu-benchmarks.md`), with the CUDA test suites, per-phase timers, CubeCL's per-kernel profile, a transfer micro-benchmark and a launch-shape sweep |
+
+### Skip the build: cross-compile here
+
+A Kaggle session rebuilds the crate from source in about three and a half
+minutes, plus rustup. `tools/kaggle/cross-build.sh` builds the same binaries —
+`train_bench`, `bench`, and the `kernels` / `gpu_training` test binaries —
+for Linux x86_64 on this machine in about ninety seconds and puts them in
+`prebuilt/`, which `push.sh` ships and `run_gpu_compare.py` uses instead of
+building. A change-measure loop on the T4 is then ~12 minutes end to end.
+
+It needs `rustup target add x86_64-unknown-linux-gnu`, `cargo install
+cargo-zigbuild`, and a `zig` on PATH (`pip install ziglang` provides one;
+pass `ZIG=/path/to/zig`). No CUDA toolkit: `cudarc` loads the driver at run
+time, and is told the version to bind (`CUDARC_CUDA_VERSION=13000`, Kaggle's
+driver) rather than asked to find one.
+
+Two things the first runs taught, both of which look like something else:
+
+* `cubecl-cuda` 0.10 does not register `f64` as a supported scalar type (a
+  matmul workaround of its own), so a type-table check refuses every CUDA
+  fit with `NoF64Support` — and the training tests then pass by skipping.
+  `gpu::supports_f64` answers CUDA by name for that reason.
+* Kaggle VMs differ by up to ~1.7x on host-side work from one session to
+  the next. `run_gpu_compare.py` prints a host canary; compare within a run.
+* `kernels status` right after a push still reports the *previous* run's
+  COMPLETE, and `datasets status` says ready for the previous version while
+  the new one ingests; `push.sh` waits for both to move. A session that ran
+  the wrong binaries prints an older `built` stamp.
+* The head-to-head is measured three ways: cold (one fit per fresh process),
+  cold with `--prewarm` (the crate's binary starts the driver's context
+  creation on a thread before it generates its data) and warm
+  (`compare_gpu.py --warm`, both sides fit once before the clock). The CUDA
+  primary context alone is ~350 ms on these VMs, and XGBoost's Python
+  process has paid it at import, before its timer, which `--prewarm` is the
+  counterpart of.
+* Read the phase log (`XGB_PHASES=1`, `phases_*.txt`) next to the per-kernel
+  profile (`cubecl_profile_*.log`): where the two disagree is host work,
+  an upload or a sync, never a kernel. The tree fit cannot be profiled on
+  Metal (no `f64`), so per-phase work goes through the T4; both kernel
+  slugs (`gpu-compare-metadata.json`, `-b`) can run at once.
 
 **Ask for a T4, not the default.** Kaggle hands out a **P100 (SM 6.0)** unless
 told otherwise, and XGBoost's own 3.x wheels are built for SM70+ — on a P100

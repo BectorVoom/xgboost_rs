@@ -46,6 +46,14 @@ pub const DEFAULT_BASE_SCORE: f32 = 0.5;
 
 /// First and second derivative of the loss at one `(row, output)`.
 ///
+/// An objective the device computes gradients for; see `gpu::objective`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DeviceObjective {
+    /// `reg:squarederror`, with `scale_pos_weight` applied to rows labelled
+    /// exactly one as `RegLossObj::weight` applies it.
+    SquaredError { scale_pos_weight: f32 },
+}
+
 /// Mirrors `xgboost::GradientPair`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GradientPair {
@@ -78,6 +86,12 @@ pub trait Objective {
         iter: i32,
         out: &mut Vec<GradientPair>,
     );
+
+    /// The objective's device form, for a fit whose trees grow on the device
+    /// to compute its gradients there too; `None` keeps the host path.
+    fn device_kind(&self) -> Option<DeviceObjective> {
+        None
+    }
 
     /// Whether this objective draws from the *session* random engine before
     /// each gradient computation.

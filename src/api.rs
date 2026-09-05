@@ -651,9 +651,16 @@ pub fn train_from(
     };
 
     let mut history: EvalHistory = Vec::new();
+    let mut startup = crate::phases::RoundLog::start();
     for iter in 0..params.num_boost_round {
+        if iter == 1 {
+            // Everything the first round paid that the others do not.
+            startup.mark("first round, inclusive of setup");
+            startup.report("startup");
+        }
         learner.update_one_iter(iter as i32, dtrain)?;
 
+        let mut phases = crate::phases::RoundLog::start();
         let mut round = Vec::new();
         for (dmat, name) in evals {
             let scores = if std::ptr::eq(*dmat, dtrain) {
@@ -665,6 +672,8 @@ pub fn train_from(
                 round.push((format!("{name}-{metric}"), value));
             }
         }
+        phases.mark("metrics");
+        phases.report("eval");
         report(params.verbose_eval, iter, params.num_boost_round, &round);
         history.push(round);
 
@@ -674,6 +683,9 @@ pub fn train_from(
             break;
         }
     }
+    // Device rounds leave the host's prediction cache behind; anything
+    // that reads it after training must see the final one.
+    learner.sync_train_cache();
 
     let (best_iteration, best_score) = match &stopper {
         Some(s) => (Some(s.best_iteration), Some(s.best_score)),

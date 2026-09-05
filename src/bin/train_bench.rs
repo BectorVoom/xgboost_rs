@@ -63,6 +63,12 @@ struct Args {
     max_leaves: u32,
     /// `cpu` or `cuda[:ordinal]`.
     device: String,
+    /// Fit once before the clock starts, so the process's one-time costs —
+    /// the CUDA context, the kernel modules, the runtime's pools — are paid
+    /// outside the timing. What a long-lived process sees.
+    warmup: bool,
+    /// `--prewarm`: start the device's initialisation before the data build.
+    prewarm: bool,
 }
 
 impl Default for Args {
@@ -84,6 +90,8 @@ impl Default for Args {
             lossguide: false,
             device: "cpu".to_owned(),
             max_leaves: 0,
+            warmup: false,
+            prewarm: false,
         }
     }
 }
@@ -120,6 +128,14 @@ fn parse_args() -> Args {
             "--device" => args.device = value(),
             "--lossguide" => {
                 args.lossguide = true;
+                i -= 1;
+            }
+            "--warmup" => {
+                args.warmup = true;
+                i -= 1;
+            }
+            "--prewarm" => {
+                args.prewarm = true;
                 i -= 1;
             }
             other => panic!("unknown argument `{other}`"),
@@ -166,6 +182,11 @@ fn main() {
         xgboost_rs::set_num_threads(args.threads);
     }
 
+    // Device initialisation overlaps the data build, as `import xgboost`
+    // overlaps everything a Python script does before it fits.
+    if args.prewarm {
+        xgboost_rs::gpu::warm_up(0);
+    }
     let t = Instant::now();
     let dtrain = make_data(&args);
     let build = t.elapsed();
@@ -219,14 +240,25 @@ fn main() {
     );
     println!("data build: {:.3}s", build.as_secs_f64());
 
+    if args.warmup {
+        let mut small = params.clone();
+        small.num_boost_round = 1;
+        api::train(&small, &dtrain, &[]).unwrap();
+    }
+
     let mut best = f64::INFINITY;
     let mut last_rmse = 0.0;
-    for _ in 0..args.repeats {
+    for r in 0..args.repeats {
         let t = Instant::now();
         let (_booster, history) = api::train(&params, &dtrain, &[(&dtrain, "train")]).unwrap();
         let elapsed = t.elapsed().as_secs_f64();
         best = best.min(elapsed);
         last_rmse = history.last().unwrap()[0].1;
+        if args.repeats > 1 {
+            // One line per repeat: the same fit in the same process must give
+            // the same number, and a drift here is a device race to find.
+            println!("repeat {r}: {elapsed:.3}s  train-rmse: {last_rmse:.6}");
+        }
     }
     println!("train: {best:.3}s  final train-rmse: {last_rmse:.6}");
 

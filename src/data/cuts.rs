@@ -384,6 +384,28 @@ fn query_cut_values(data: &[Entry], max_bin: usize) -> Vec<f32> {
     cut_values
 }
 
+/// The cut values an *exact* summary of `sorted` would give: every distinct
+/// value with its true rank range, as [`query_cut_values`] reads them.
+///
+/// The sketch proper keeps an approximate summary, so its cuts differ from
+/// these; this is the reference for a route that has the whole column sorted
+/// — the device sketch (`gpu::sketch`), which is checked against it. `sorted`
+/// is ascending with no NaN.
+pub fn exact_cuts_from_sorted(sorted: &[f32], max_bin: usize) -> Vec<f32> {
+    let mut data: Vec<Entry> = Vec::new();
+    let mut i = 0usize;
+    while i < sorted.len() {
+        let v = sorted[i];
+        let mut j = i + 1;
+        while j < sorted.len() && sorted[j] == v {
+            j += 1;
+        }
+        data.push(Entry { rmin: i as f32, rmax: j as f32, wmin: (j - i) as f32, value: v });
+        i = j;
+    }
+    query_cut_values(&data, max_bin)
+}
+
 /// A single feature's sketch: `WQuantileSketch<float, float>`.
 #[derive(Debug, Default)]
 struct QuantileSketch {

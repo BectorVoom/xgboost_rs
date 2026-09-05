@@ -46,9 +46,13 @@ mkdir -p "$STAGE/data" "$STAGE/kernel"
 
 # The crate, minus build output and the committed fixtures (the generator
 # rebuilds its datasets from scratch, so they are dead weight in the upload).
+# `prebuilt/` — `cross-build.sh`'s Linux binaries — rides along when present,
+# and the run scripts that know about it skip the build.
+PREBUILT=""
+[ -d prebuilt ] && PREBUILT="prebuilt"
 tar czf "$STAGE/data/xgboost_rs_kaggle.tar.gz" \
   --exclude=target --exclude=.git --exclude='tests/fixtures' \
-  src tests tools Cargo.toml Cargo.lock KAGGLE.md
+  src tests tools Cargo.toml Cargo.lock KAGGLE.md $PREBUILT
 cat > "$STAGE/data/dataset-metadata.json" <<EOF
 {"title": "xgboost-rs gpu src", "id": "$DATASET", "licenses": [{"name": "Apache 2.0"}]}
 EOF
@@ -57,6 +61,17 @@ EOF
 cp "tools/kaggle/$CODE" "$STAGE/kernel/"
 sed "s|KAGGLE_OWNER|$OWNER|g" "$META_PATH" > "$STAGE/kernel/kernel-metadata.json"
 
+# The dataset's last-updated stamp, as the listing reports it. Ingest of a
+# new version is asynchronous and `datasets status` says "ready" for the
+# *previous* version the whole time, so a kernel pushed on that signal runs
+# the binaries of the push before — which is exactly what happened for three
+# runs on 2026-09-05. The stamp moving is the signal that the new version is
+# the one a kernel will get.
+stamp() {
+  kaggle datasets list --mine -s "${DATASET#*/}" --csv 2>/dev/null | awk -F, -v s="$DATASET" '$1 == s {print $4}'
+}
+BEFORE="$(stamp)"
+
 echo "==> uploading source dataset"
 if kaggle datasets status "$DATASET" >/dev/null 2>&1; then
   kaggle datasets version -p "$STAGE/data" -m "$(git rev-parse --short HEAD)" -q -d
@@ -64,11 +79,15 @@ else
   kaggle datasets create -p "$STAGE/data" -q
 fi
 
-# Dataset ingest is asynchronous. Pushing the kernel before it finishes gives a
-# session whose /kaggle/input is empty, which is a confusing way to fail.
-echo "==> waiting for the dataset to be ready"
-for _ in $(seq 1 60); do
-  [ "$(kaggle datasets status "$DATASET" 2>&1)" = "ready" ] && break
+echo "==> waiting for the new dataset version (was: ${BEFORE:-none})"
+for _ in $(seq 1 90); do
+  NOW="$(stamp)"
+  if [ -n "$NOW" ] && [ "$NOW" != "$BEFORE" ] && [ "$(kaggle datasets status "$DATASET" 2>&1)" = "ready" ]; then
+    echo "    version stamp now $NOW"
+    # A short settle: the listing moves a moment before the files do.
+    sleep 20
+    break
+  fi
   sleep 10
 done
 
@@ -77,6 +96,14 @@ kaggle kernels push -p "$STAGE/kernel"
 
 [ -n "$WAIT" ] || exit 0
 
+# The status right after a push is still the *previous* run's, and that one
+# says COMPLETE — so wait for it to move (QUEUED/RUNNING) before waiting for
+# it to finish, or the wait returns at once with the old output.
+echo "==> waiting for the run to start"
+for _ in $(seq 1 120); do
+  kaggle kernels status "$SLUG" 2>&1 | grep -qE "QUEUED|RUNNING" && break
+  sleep 10
+done
 echo "==> waiting for the run"
 until kaggle kernels status "$SLUG" 2>&1 | grep -qE "COMPLETE|ERROR|CANCEL"; do
   sleep 60

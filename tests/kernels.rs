@@ -417,3 +417,178 @@ fn zeroed_handles_lengths_no_vector_width_divides() {
         assert!(got.iter().all(|w| *w == 0), "words={words} not fully cleared");
     }
 }
+
+/// The device binning route — `bin_csr_kernel` and `pack_bins_kernel` — has
+/// to produce the words `build_ellpack` + `pack_bins` produce, both layouts,
+/// with and without holes, and at a width the runtime would not pick on its
+/// own. Word equality rather than histogram equality: a bin that lands in the
+/// wrong cell could still sum right by luck, a word cannot.
+#[test]
+fn device_binning_matches_the_host_ellpack() {
+    use xgboost_rs::DMatrix;
+    use xgboost_rs::data::cuts::build_cuts;
+    use xgboost_rs::gpu::ellpack::{build_ellpack, pack_bins};
+
+    let client = client();
+    let (n_rows, n_cols) = (2011usize, 7usize);
+    for sparsity in [0.0f32, 0.3] {
+        // Values over a wide range so several features hit every bin,
+        // including ties on a cut, which is where `search_bin` has to agree.
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let x: Vec<f32> = (0..n_rows * n_cols)
+            .map(|i| {
+                let r = next();
+                if sparsity > 0.0 && (r % 1000) as f32 / 1000.0 < sparsity {
+                    f32::NAN
+                } else {
+                    // Quantised to a coarse grid so ties are common.
+                    ((r >> 20) % 97) as f32 * 0.25 - 12.0 + (i % 3) as f32 * 1e-3
+                }
+            })
+            .collect();
+        let dmat = DMatrix::from_dense(&x, n_rows, n_cols, f32::NAN).unwrap();
+        let cuts = build_cuts(&dmat, 32).unwrap();
+
+        let host = build_ellpack(&dmat, &cuts);
+        let values = xgboost_rs::gpu::sketch::DeviceValues::upload(&client, &dmat);
+        let (dev, shape) = DeviceEllpack::bin_on_device(&client, &values, &cuts);
+        assert_eq!(shape.layout, host.layout, "sparsity {sparsity}");
+        assert_eq!(shape.null_value, host.null_value);
+        assert_eq!(dev.dense, host.is_dense());
+
+        let expect = pack_bins(&host.gidx, dev.bits);
+        let got: Vec<u32> = bytemuck::cast_slice(&client.read_one_unchecked(dev.gidx.clone())).to_vec();
+        // Whole chunks on the device, entries plus a pad on the host: the
+        // data words are the comparison, not the tails.
+        let n = expect.len() - 1;
+        assert!(got.len() > n);
+        assert_eq!(&got[..n], &expect[..n], "row-major words at {} bits, sparsity {sparsity}", dev.bits);
+
+        let mut transposed = vec![0u32; host.gidx.len()];
+        for r in 0..n_rows {
+            for f in 0..n_cols {
+                transposed[f * n_rows + r] = host.gidx[r * n_cols + f];
+            }
+        }
+        let expect_t = pack_bins(&transposed, dev.bits);
+        let got_t: Vec<u32> = bytemuck::cast_slice(&client.read_one_unchecked(dev.gidx_t.clone())).to_vec();
+        assert_eq!(&got_t[..n], &expect_t[..n], "feature-major words at {} bits, sparsity {sparsity}", dev.bits);
+    }
+}
+
+/// The device sketch against the exact reference: every column sorted on the
+/// host and read off by `exact_cuts_from_sorted`, which is `query_cut_values`
+/// over an exact summary. Continuous columns, a column with heavy ties so the
+/// rank queries repeat, a low-cardinality column under the distinct-value
+/// branch, an all-missing column, and holes throughout.
+#[test]
+fn device_sketch_matches_the_exact_cuts() {
+    let client = client();
+    // Under one sort tile, several tiles, and enough rows that the
+    // `(digit, tile)` table spans many chunks of the scan.
+    for (n_rows, n_cols) in [(200usize, 4usize), (5003, 6), (70_001, 3)] {
+        device_sketch_case(&client, n_rows, n_cols);
+    }
+}
+
+fn device_sketch_case(client: &cubecl::prelude::ComputeClient<R>, n_rows: usize, n_cols: usize) {
+    use xgboost_rs::DMatrix;
+    use xgboost_rs::data::cuts::exact_cuts_from_sorted;
+    use xgboost_rs::gpu::sketch::{DeviceValues, applies, device_cuts};
+
+    let mut seed = 0x2545_F491_4F6C_DD1Du64 ^ (n_rows as u64);
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let x: Vec<f32> = (0..n_rows * n_cols)
+        .map(|i| {
+            let r = next();
+            let f = i % n_cols;
+            match f {
+                // Continuous, both signs, with a few holes.
+                0 => if r % 50 == 0 { f32::NAN } else { ((r >> 16) % 100_000) as f32 / 977.0 - 51.0 },
+                // Continuous, positive.
+                1 => ((r >> 8) % 1_000_003) as f32 * 1e-4,
+                // Heavy ties: a few dozen distinct values, more than max_bin.
+                2 => ((r >> 12) % 40) as f32 * 0.5,
+                // Low cardinality: three values, under max_bin.
+                3 => ((r >> 20) % 3) as f32,
+                // All missing.
+                4 => f32::NAN,
+                // Mostly one value, so the rank grid repeats and the chain
+                // has to step to the next distinct value.
+                _ => if r % 1000 < 3 { ((r >> 24) % 5) as f32 + 1.0 } else { 0.0 },
+            }
+        })
+        .collect();
+    let dmat = DMatrix::from_dense(&x, n_rows, n_cols, f32::NAN).unwrap();
+    let max_bin = 16u32;
+    if !applies(client, &dmat, max_bin) {
+        return;
+    }
+    let values = DeviceValues::upload(client, &dmat);
+    let got = device_cuts(client, &values, max_bin);
+
+    for f in 0..n_cols {
+        let mut column: Vec<f32> =
+            (0..n_rows).map(|r| x[r * n_cols + f]).filter(|v| !v.is_nan()).collect();
+        column.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let expect = exact_cuts_from_sorted(&column, max_bin as usize);
+        let (b, e) = (got.cut_ptrs[f] as usize, got.cut_ptrs[f + 1] as usize);
+        assert_eq!(&got.cut_values[b..e], &expect[..], "{n_rows}x{n_cols} feature {f}");
+        assert_eq!(got.min_values[f], f32::NEG_INFINITY);
+    }
+}
+
+/// The device prediction update against the host's: rows spread over the
+/// partitioner's two buffers, segments in arbitrary order, leaf values
+/// added with a tree weight. Exact, as the host arithmetic is the same.
+#[test]
+fn device_prediction_update_matches_the_host() {
+    use xgboost_rs::gpu::objective::DeviceRound;
+    use xgboost_rs::gpu::tables::upload_vec;
+
+    let client = client();
+    let n = 5000usize;
+    let info = xgboost_rs::data::MetaInfo {
+        num_row: n,
+        num_col: 1,
+        labels: (0..n).map(|i| (i % 7) as f32).collect(),
+        ..Default::default()
+    };
+    let mut preds: Vec<f32> = (0..n).map(|i| (i as f32) * 0.001).collect();
+    let mut round = DeviceRound::new(&client, &info, &preds);
+
+    // Two row buffers, as the partitioner's: the segments taken from each
+    // together cover every row exactly once — positions `0..1000` are read
+    // from the first (rows 4999 down to 4000) and `1000..5000` from the
+    // second (a permutation of rows 0..4000).
+    let perm0: Vec<u32> = (0..n as u32).rev().collect();
+    let perm1: Vec<u32> = (0..n as u32)
+        .map(|i| if i < 1000 { 4000 + i } else { ((i - 1000) * 7919) % 4000 })
+        .collect();
+    let b0 = upload_vec(&client, perm0.clone());
+    let b1 = upload_vec(&client, perm1.clone());
+    let segments = [(1u32, 3000u32, 2000u32, 0.5f32), (0, 0, 1000, -1.25), (1, 1000, 2000, 0.125)];
+    let weight = 0.3f32;
+    round.update_predictions(&client, [&b0, &b1], &segments, weight);
+
+    for &(side, begin, len, value) in &segments {
+        let buf = if side == 0 { &perm0 } else { &perm1 };
+        for &row in &buf[begin as usize..(begin + len) as usize] {
+            preds[row as usize] += value * weight;
+        }
+    }
+    let mut got = vec![0f32; n];
+    round.download(&client, &mut got);
+    assert_eq!(got, preds);
+}

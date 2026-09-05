@@ -35,3 +35,6 @@ xgboost_rs_kaggle.tar.gz
 # Artefacts pulled back from a Kaggle GPU run (tools/kaggle/)
 kaggle-output/
 kaggle-await.log
+prebuilt/
+__pycache__/
+.DS_Store

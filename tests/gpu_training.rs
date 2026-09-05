@@ -65,6 +65,10 @@ fn fit_both(
     tree: TreeBoosterParameters,
     rounds: u32,
 ) -> ((Vec<usize>, Vec<f32>), (Vec<usize>, Vec<f32>)) {
+    // These tests hold the device fit to the CPU fit bit for bit, which needs
+    // the two to bin against the same cuts: the device sketch is exact where
+    // the host's is a pruned summary, so it is kept off here.
+    xgboost_rs::gpu::sketch::force_host_sketch(true);
     let (cpu, _) = api::train(&params(Device::Cpu, tree.clone(), rounds), dmat, &[]).unwrap();
     let (gpu, _) = api::train(&params(Device::cuda(0), tree, rounds), dmat, &[]).unwrap();
 

@@ -146,6 +146,37 @@ impl Booster {
         }
     }
 
+    /// [`GBTree::device_round`]; `false` for every other booster.
+    pub fn device_round(
+        &mut self,
+        ctx: &mut Context,
+        dtrain: &DMatrix,
+        obj: &dyn crate::objective::Objective,
+        preds: &mut [f32],
+    ) -> crate::Result<bool> {
+        #[cfg(feature = "gpu")]
+        if let Self::Tree(t) = self {
+            return t.device_round(ctx, dtrain, obj, preds);
+        }
+        let _ = (ctx, dtrain, obj, preds);
+        Ok(false)
+    }
+
+    /// [`GBTree::sync_preds`].
+    pub fn sync_preds(&mut self, preds: &mut [f32]) {
+        if let Self::Tree(t) = self {
+            t.sync_preds(preds);
+        }
+    }
+
+    /// [`GBTree::device_rmse`].
+    pub fn device_rmse(&self) -> Option<f64> {
+        match self {
+            Self::Tree(t) => t.device_rmse(),
+            _ => None,
+        }
+    }
+
     /// Run one boosting round, folding its output into `preds`.
     pub fn do_boost(
         &mut self,
@@ -346,8 +377,26 @@ impl GBTree {
             #[cfg(feature = "gpu")]
             Some(TreeUpdaterName::GrowGpuHist) => {
                 if self.gpu_grower.is_none() {
-                    let cuts = crate::data::cuts::build_cuts(dtrain, self.param.max_bin)?;
+                    let mut phases = crate::phases::RoundLog::start();
                     let client = crate::gpu::default_client(self.param.device.ordinal().unwrap_or(0).max(0) as usize);
+                    phases.mark("client");
+                    // Sketched on the device where the device can: exact
+                    // quantiles off a sorted column rather than the host's
+                    // pruned summary, so the bins differ slightly from a CPU
+                    // fit's — as upstream's `device=cuda` bins differ from its
+                    // CPU fit's. `gpu::sketch::applies` names what stays on
+                    // the host, and `force_host_sketch` pins a fit to it.
+                    let mut values = None;
+                    let cuts = if crate::gpu::sketch::applies(&client, dtrain, self.param.max_bin) {
+                        let v = crate::gpu::sketch::DeviceValues::upload(&client, dtrain);
+                        let cuts = crate::gpu::sketch::device_cuts(&client, &v, self.param.max_bin);
+                        // Kept for the grower's binning: one upload per fit.
+                        values = Some(v);
+                        cuts
+                    } else {
+                        crate::data::cuts::build_cuts(dtrain, self.param.max_bin)?
+                    };
+                    phases.mark("cuts");
                     // A vector-leaf fit grows one tree covering every output,
                     // so the device grower needs the target count up front:
                     // it sizes the per-`(node, target)` histograms.
@@ -359,10 +408,13 @@ impl GBTree {
                     self.gpu_grower = Some(crate::gpu::grower::GpuHistGrower::new_multi(
                         client,
                         dtrain,
+                        values,
                         cuts,
                         self.param.clone(),
                         n_targets,
                     )?);
+                    phases.mark("grower");
+                    phases.report("configure");
                 }
             }
             Some(_) if self.gindex.is_none() => {
@@ -533,6 +585,76 @@ impl GBTree {
         Ok(())
     }
 
+    /// Do the whole round on the device — gradients, the tree, the
+    /// prediction update — when the fit's shape allows it; `Ok(false)` says
+    /// to take the host round instead. `preds` is the host's prediction
+    /// cache, which the device takes over: it is uploaded once and comes back
+    /// through [`Self::sync_preds`] when something host-side needs it.
+    ///
+    /// The shape: a device grower, one output, one tree a round, no DART, no
+    /// row sampling, no tree-modifying updater, and an objective the device
+    /// has (`Objective::device_kind`). Everything else is a host round, as
+    /// before.
+    #[cfg(feature = "gpu")]
+    pub fn device_round(
+        &mut self,
+        ctx: &mut Context,
+        dtrain: &DMatrix,
+        obj: &dyn crate::objective::Objective,
+        preds: &mut [f32],
+    ) -> crate::Result<bool> {
+        let Some(kind) = obj.device_kind() else { return Ok(false) };
+        let n_groups = self.model.num_output_group.max(1);
+        let n_rows = dtrain.num_row();
+        let sampler = RowSampler::new(self.param.sampling_method, self.param.subsample);
+        let plain = self.grower_kind() == Some(TreeUpdaterName::GrowGpuHist)
+            && n_groups == 1
+            && dtrain.info().n_targets() == 1
+            && self.param.num_parallel_tree <= 1
+            && self.dart.is_none()
+            && !sampler.is_sampling(n_rows)
+            && self.param.updaters.iter().all(|u| !u.can_modify_tree())
+            && preds.len() == n_rows;
+        if !plain {
+            return Ok(false);
+        }
+        self.configure(dtrain)?;
+        let Some(grower) = self.gpu_grower.as_mut() else { return Ok(false) };
+        grower.device_round(dtrain.info(), preds);
+        let mut tree = RegTree::new(self.model.num_feature);
+        let mut phases = crate::phases::RoundLog::start();
+        grower.grow_device(kind, &mut tree, ctx.rng(), 1.0)?;
+        phases.mark("grow+update on device");
+        phases.report("boost");
+        self.model.trees.push(tree);
+        self.model.tree_info.push(0);
+        self.model.tree_weight.push(1.0);
+        Ok(true)
+    }
+
+    /// Bring the host's predictions up to date after device rounds.
+    pub fn sync_preds(&mut self, preds: &mut [f32]) {
+        #[cfg(feature = "gpu")]
+        if let Some(grower) = self.gpu_grower.as_mut() {
+            grower.sync_preds(preds);
+        }
+        #[cfg(not(feature = "gpu"))]
+        let _ = preds;
+    }
+
+    /// The training `rmse`, from the device, when the device holds the
+    /// current predictions.
+    pub fn device_rmse(&self) -> Option<f64> {
+        #[cfg(feature = "gpu")]
+        {
+            self.gpu_grower.as_ref().and_then(|g| g.device_rmse())
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            None
+        }
+    }
+
     /// A `process_type=default` round: grow this round's trees.
     #[allow(clippy::too_many_arguments)]
     fn grow_round(
@@ -620,7 +742,9 @@ impl GBTree {
                 };
 
                 let mut tree = RegTree::new(self.model.num_feature);
+                let mut phases = crate::phases::RoundLog::start();
                 grower.grow(ctx, tree_gpair, &mut tree);
+                phases.mark("grow");
 
                 // The tree-modifying stages run after the grower, in the order
                 // the pipeline names them. They can move leaf values and
@@ -635,6 +759,8 @@ impl GBTree {
                     // no tree traversal is needed.
                     grower.update_predictions(&tree, preds, n_groups, gid, new_weight);
                 }
+                phases.mark("update predictions");
+                phases.report("boost");
                 self.model.trees.push(tree);
                 self.model.tree_info.push(gid as u32);
                 self.model.tree_weight.push(new_weight);

@@ -67,10 +67,15 @@ pub mod evaluate_splits;
 pub mod grower;
 pub mod histogram;
 pub mod launch;
+pub mod objective;
 pub mod linear;
 pub mod quantiser;
 pub mod row_partitioner;
+pub mod sketch;
+pub mod tables;
+pub mod tuning;
 
+use cubecl::prelude::{ComputeClient, Runtime};
 use cubecl::server::Handle;
 
 /// The CubeCL runtime this build's kernels run on.
@@ -137,21 +142,86 @@ pub const BACKEND: &str = if cfg!(feature = "cuda") {
 /// arithmetic, and it is what makes the device fit agree with the CPU fit to
 /// the 1e-5 the oracle tests demand. Demoting them to `f32` would be a
 /// different model, not the same one computed differently.
+///
+/// CUDA is answered by name rather than by the type table. Every CUDA device
+/// has `double`, and every `f64` kernel here compiles and runs through NVRTC
+/// (the CUDA oracle and the T4 training runs are the proof), but
+/// `cubecl-cuda` 0.10 leaves `F64` out of `register_supported_types` over a
+/// matmul problem of its own ("Causes CUDA_ERROR_INVALID_VALUE for matmul,
+/// disabling until that can be investigated"). Trusting that table on CUDA
+/// refused every device fit with `NoF64Support` on a card that fits fine.
 pub fn supports_f64<R: cubecl::prelude::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
 ) -> bool {
     use cubecl::ir::{ElemType, FloatKind, StorageType};
-    client.properties().supports_type(StorageType::Scalar(ElemType::Float(FloatKind::F64)))
+    R::name(client) == "cuda"
+        || client.properties().supports_type(StorageType::Scalar(ElemType::Float(FloatKind::F64)))
+}
+
+/// Turn on CubeCL's on-disk kernel cache, once per process, unless a
+/// `cubecl.toml` already says where it goes or `XGB_NO_KERNEL_CACHE` is set.
+///
+/// The CUDA runtime compiles every kernel through NVRTC the first time a
+/// process launches it, and only caches the result on disk when its
+/// configuration names a cache — which it does not by default. Measured on a
+/// T4: 40–250 ms per kernel variant, some twenty of them in a fit, about
+/// 1.5 s of a 3.6 s twenty-round fit at 500 000 × 50 — more than the fit's
+/// own device work, and a cost upstream never pays because its kernels ship
+/// precompiled. The cache key is the kernel's type, comptime arguments and
+/// cube dimensions, so it is stable across processes; `Global` puts it in
+/// the user's configuration directory, where it survives the working
+/// directory changing.
+fn enable_kernel_cache() {
+    use cubecl::config::{CubeClRuntimeConfig, RuntimeConfig, cache::CacheConfig};
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("XGB_NO_KERNEL_CACHE").is_some() {
+            return;
+        }
+        // `set` refuses a configuration that has been read or set already,
+        // so this looks at the slot rather than reading through it, and
+        // builds the configuration the way `get` would have — the files and
+        // the environment — before adding the cache.
+        if CubeClRuntimeConfig::storage().lock().is_some() {
+            return;
+        }
+        let mut config = CubeClRuntimeConfig::from_current_dir().override_from_env();
+        if config.compilation.cache.is_none() {
+            config.compilation.cache = Some(CacheConfig::Global);
+        }
+        CubeClRuntimeConfig::set(config);
+    });
 }
 
 /// A compute client for the requested device ordinal.
 ///
 /// The ordinal selects a CUDA device; neither the wgpu runtime nor the CPU
 /// runtime has an equivalent notion here, and both take their default device.
+/// Begin the device's initialisation on a background thread.
+///
+/// The CUDA driver builds a device's primary context on first use, ≈350 ms
+/// on a cloud VM, and the runtime asks for it at the first kernel launch —
+/// inside the first fit. Called at program start, this pays it while the
+/// host is still loading data, which is where a Python process pays it
+/// (`import` loads the driver). Later use finds the context built; the
+/// thread is not joined. A no-op on every other backend.
+pub fn warm_up(ordinal: usize) {
+    #[cfg(feature = "cuda")]
+    std::thread::spawn(move || {
+        if let Err(e) = tables::cuda_direct::retain_primary(ordinal) {
+            eprintln!("xgboost_rs: device warm-up skipped ({e})");
+        }
+    });
+    #[cfg(not(feature = "cuda"))]
+    let _ = ordinal;
+}
+
 pub fn default_client(ordinal: usize) -> cubecl::prelude::ComputeClient<DefaultRuntime> {
     use cubecl::prelude::Runtime;
+    enable_kernel_cache();
     #[cfg(feature = "cuda")]
     {
+        tables::cuda_direct::ORDINAL.store(ordinal, std::sync::atomic::Ordering::Relaxed);
         DefaultRuntime::client(&cubecl::cuda::CudaDevice::new(ordinal))
     }
     #[cfg(all(any(feature = "vulkan", feature = "metal"), not(feature = "cuda")))]
@@ -265,5 +335,61 @@ pub struct DeviceHistogram {
 impl DeviceHistogram {
     pub fn n_bins(&self) -> usize {
         self.n_bins
+    }
+}
+
+/// Wall clock per phase of a device fit, printed when `XGB_PHASES` is set.
+///
+/// Off, it costs a clock read per phase. On, every mark first drains the
+/// device, so a phase's time is the device work it queued plus the host work
+/// that queued it — the split a profiler of either side alone cannot give —
+/// at the price of the overlap between phases, which is why it is not on by
+/// default. A level's marks accumulate into one line per tree.
+pub(crate) struct PhaseLog<R: Runtime> {
+    client: Option<ComputeClient<R>>,
+    last: std::time::Instant,
+    start: std::time::Instant,
+    acc: Vec<(&'static str, std::time::Duration, u32)>,
+}
+
+impl<R: Runtime> PhaseLog<R> {
+    pub(crate) fn new(client: ComputeClient<R>) -> Self {
+        let now = std::time::Instant::now();
+        let enabled = std::env::var_os("XGB_PHASES").is_some();
+        Self { client: enabled.then_some(client), last: now, start: now, acc: Vec::new() }
+    }
+
+    /// Close the phase that began at the previous mark under `name`.
+    pub(crate) fn mark(&mut self, name: &'static str) {
+        let Some(client) = &self.client else { return };
+        if let Err(e) = cubecl::future::block_on(client.sync()) {
+            eprintln!("PHASES: device sync failed: {e:?}");
+        }
+        let now = std::time::Instant::now();
+        let d = now - self.last;
+        self.last = now;
+        match self.acc.iter_mut().find(|(n, ..)| *n == name) {
+            Some((_, total, count)) => {
+                *total += d;
+                *count += 1;
+            }
+            None => self.acc.push((name, d, 1)),
+        }
+    }
+
+    pub(crate) fn report(&self) {
+        self.report_as("tree");
+    }
+
+    pub(crate) fn report_as(&self, what: &str) {
+        if self.client.is_none() {
+            return;
+        }
+        let total = self.start.elapsed();
+        let mut line = format!("PHASES {what} {:.2}ms:", total.as_secs_f64() * 1e3);
+        for (name, d, n) in &self.acc {
+            line.push_str(&format!(" {name}={:.2}ms/{n}", d.as_secs_f64() * 1e3));
+        }
+        eprintln!("{line}");
     }
 }

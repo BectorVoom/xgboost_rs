@@ -272,8 +272,25 @@ impl Learner {
             let seed = self.ctx.rng().next_u32();
             self.obj.set_pair_seed(seed);
         }
+        // The whole round on the device where its shape allows; the host
+        // round otherwise, with the host's predictions brought up to date
+        // first in case device rounds preceded it.
+        if self.booster.device_round(&mut self.ctx, dtrain, &*self.obj, &mut self.train_cache)? {
+            return Ok(());
+        }
+        self.booster.sync_preds(&mut self.train_cache);
+        let mut phases = crate::phases::RoundLog::start();
         self.obj.get_gradient(&self.train_cache, dtrain.info(), iter, &mut gpair);
-        self.booster.do_boost(&mut self.ctx, dtrain, &gpair, &mut self.train_cache)
+        phases.mark("gradients");
+        let result = self.booster.do_boost(&mut self.ctx, dtrain, &gpair, &mut self.train_cache);
+        phases.mark("boost");
+        phases.report("round");
+        result
+    }
+
+    /// Bring the host prediction cache up to date after device rounds.
+    pub fn sync_train_cache(&mut self) {
+        self.booster.sync_preds(&mut self.train_cache);
     }
 
     /// Every metric evaluated on `dmat`, as `(metric name, value)`.
@@ -284,7 +301,16 @@ impl Learner {
     }
 
     /// Every metric on the training matrix, reusing the margin cache.
-    pub fn eval_train(&self, dtrain: &DMatrix) -> Vec<(String, f64)> {
+    pub fn eval_train(&mut self, dtrain: &DMatrix) -> Vec<(String, f64)> {
+        // The device scores its own predictions when the only metric is the
+        // one it has; anything else needs them on the host.
+        if self.metrics.len() == 1
+            && self.metrics[0].name() == "rmse"
+            && let Some(value) = self.booster.device_rmse()
+        {
+            return vec![("rmse".to_owned(), value)];
+        }
+        self.booster.sync_preds(&mut self.train_cache);
         let mut preds = self.train_cache.clone();
         self.obj.eval_transform(&mut preds);
         self.eval_preds(&preds, dtrain)

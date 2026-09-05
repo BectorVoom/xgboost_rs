@@ -354,3 +354,374 @@ mod tests {
         assert_eq!(bits_for(u32::MAX), 32);
     }
 }
+
+// ------------------------------------------------------ binning on device ----
+//
+// `build_ellpack` + `DeviceEllpack::upload` is three passes over every entry
+// on the host — a binary search per value, a bit-pack, a transpose and a
+// second pack — and two uploads of the packed result. At 500 000 × 50 that
+// was 190 ms on a laptop and 950 ms on a cloud VM's slower cores, against a
+// whole 20-round `gpu_hist` fit of 470 ms upstream: the setup alone lost the
+// race before a tree was grown. Upstream bins on the device
+// (`EllpackPageImpl`'s `CompressBinEllpackKernel`), and so does this: the raw
+// values go up once (`sketch::DeviceValues`, shared with the device sketch),
+// and one kernel per layout bins and packs straight into the packed buffer.
+//
+// One kernel, not a bin pass into a word matrix and a pack pass over it: at
+// 500 000 × 50 the two word matrices were 200 MB of device memory allocated
+// and streamed for nothing — 180 ms on a T4, most of it the allocations.
+
+/// The bits of the value of cell `(r, f)`: the cell's own entry on a full
+/// matrix, else the entry of row `r` whose column is `f`, found by binary
+/// search over the row's entries, which are in ascending column order; the
+/// sentinel `0xFFFF_FFFF` — a NaN pattern — when the row has none.
+///
+/// Bits rather than the float, and [`is_nan_bits`] rather than `v != v`: the
+/// CPU runtime's compiler folds `v != v` to false, which turned every missing
+/// value into bin zero.
+#[cube]
+fn cell_bits(
+    row_ptr: &Array<u32>,
+    index: &Array<u32>,
+    value: &Array<f32>,
+    r: u32,
+    f: u32,
+    row_stride: u32,
+    #[comptime] dense_input: bool,
+) -> u32 {
+    if dense_input {
+        u32::reinterpret(value[(r * row_stride + f) as usize])
+    } else {
+        let begin = row_ptr[r as usize];
+        let end = row_ptr[(r + 1u32) as usize];
+        let lo = RuntimeCell::<u32>::new(begin);
+        let n = RuntimeCell::<u32>::new(end - begin);
+        while n.read() > 0u32 {
+            let half = n.read() / 2u32;
+            if index[(lo.read() + half) as usize] < f {
+                lo.store(lo.read() + half + 1u32);
+                n.store(n.read() - half - 1u32);
+            } else {
+                n.store(half);
+            }
+        }
+        let i = lo.read();
+        // Nested, not `&&`: CubeCL evaluates both operands, and `index[end]`
+        // is one past the buffer on the last row.
+        if i < end {
+            if index[i as usize] == f {
+                u32::reinterpret(value[i as usize])
+            } else {
+                0xFFFF_FFFFu32.into()
+            }
+        } else {
+            0xFFFF_FFFFu32.into()
+        }
+    }
+}
+
+/// Whether `bits` is a NaN pattern: exponent all ones and a non-zero
+/// mantissa, sign ignored.
+#[cube]
+pub fn is_nan_bits(bits: u32) -> bool {
+    (bits & 0x7FFF_FFFFu32) > 0x7F80_0000u32
+}
+
+/// `HistogramCuts::search_bin`, feature-local: the first cut of `f` strictly
+/// above `v`, and the last bin for a value above every cut.
+#[cube]
+fn local_bin(cut_ptrs: &Array<u32>, cut_values: &Array<f32>, f: u32, v: f32) -> u32 {
+    let beg = cut_ptrs[f as usize];
+    let end = cut_ptrs[(f + 1u32) as usize];
+    let base = RuntimeCell::<u32>::new(0u32);
+    let n = RuntimeCell::<u32>::new(end - beg);
+    while n.read() > 1u32 {
+        let half = n.read() / 2u32;
+        if cut_values[(beg + base.read() + half) as usize] <= v {
+            base.store(base.read() + half);
+        }
+        n.store(n.read() - half);
+    }
+    let mut lo = base.read();
+    if cut_values[(beg + lo) as usize] <= v {
+        lo += 1u32;
+    }
+    if lo == end - beg {
+        lo -= 1u32;
+    }
+    lo
+}
+
+/// Bin and pack 32 consecutive row-major cells per unit, straight into the
+/// packed buffer: [`pack_bins`]'s chunk, so the words are the host's. Cell
+/// `c` is `(c / stride, c % stride)`; the feature-major matrix is
+/// [`transpose_packed_kernel`] over this one. A missing value — NaN, or a
+/// hole in a CSR row — packs as `null_value`; cells past `n` pack as zero.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+pub fn bin_pack_kernel(
+    row_ptr: &Array<u32>,
+    index: &Array<u32>,
+    value: &Array<f32>,
+    cut_ptrs: &Array<u32>,
+    cut_values: &Array<f32>,
+    out: &mut Array<u32>,
+    n_cells: u32,
+    n_chunks: u32,
+    row_stride: u32,
+    null_value: u32,
+    #[comptime] bits: u32,
+    #[comptime] dense_input: bool,
+) {
+    let chunk = ABSOLUTE_POS as u32;
+    if chunk < n_chunks {
+        let width = comptime![bits as u64].runtime();
+        let first = chunk * 32u32;
+        let out_base = chunk * comptime![bits].runtime();
+        let acc = RuntimeCell::<u64>::new(0u64);
+        let w = RuntimeCell::<u32>::new(0u32);
+        let i = RuntimeCell::<u32>::new(0u32);
+        while i.read() < 32u32 {
+            let c = first + i.read();
+            let bin = if c < n_cells {
+                let r = c / row_stride;
+                let f = c - r * row_stride;
+                let bits = cell_bits(row_ptr, index, value, r, f, row_stride, dense_input);
+                if is_nan_bits(bits) {
+                    null_value
+                } else {
+                    local_bin(cut_ptrs, cut_values, f, f32::reinterpret(bits))
+                }
+            } else {
+                0u32.into()
+            };
+            let bit = u64::cast_from(i.read()) * width;
+            let off = bit - u64::cast_from(w.read()) * 32u64;
+            acc.store(acc.read() | (u64::cast_from(bin) << off));
+            if off + width >= 32u64 {
+                out[(out_base + w.read()) as usize] = u32::cast_from(acc.read() & 0xFFFF_FFFFu64);
+                acc.store(acc.read() >> 32u64);
+                w.store(w.read() + 1u32);
+            }
+            i.store(i.read() + 1u32);
+        }
+    }
+}
+
+/// The feature-major packed matrix from the row-major one: a unit packs 32
+/// consecutive feature-major cells, each read back out of `gidx` with
+/// [`load_bin`], into [`pack_bins`]'s chunk.
+///
+/// Binning feature-major directly reads a CSR row per cell with the rows a
+/// warp apart, and was 48 ms of a 66 ms device binning on a T4 with 30% of
+/// the cells missing (15 of 23 ms dense); this reads bins, not values, and
+/// its units are numbered so that a warp reads the same rows for consecutive
+/// features — `chunks_per_feature` is the row-block count a unit index is
+/// decomposed by — which keeps the rows it touches within the cache.
+#[cube(launch_unchecked)]
+pub fn transpose_packed_kernel(
+    gidx: &Array<u32>,
+    out: &mut Array<u32>,
+    n_cells: u32,
+    n_chunks: u32,
+    n_rows: u32,
+    row_stride: u32,
+    chunks_per_feature: u32,
+    #[comptime] bits: u32,
+) {
+    let u = ABSOLUTE_POS as u32;
+    let chunk = (u % row_stride) * chunks_per_feature + u / row_stride;
+    if chunk < n_chunks {
+        let width = comptime![bits as u64].runtime();
+        let first = chunk * 32u32;
+        let out_base = chunk * comptime![bits].runtime();
+        let acc = RuntimeCell::<u64>::new(0u64);
+        let w = RuntimeCell::<u32>::new(0u32);
+        let i = RuntimeCell::<u32>::new(0u32);
+        while i.read() < 32u32 {
+            let c = first + i.read();
+            let bin = if c < n_cells {
+                let f = c / n_rows;
+                let r = c - f * n_rows;
+                load_bin(gidx, r * row_stride + f, bits)
+            } else {
+                0u32.into()
+            };
+            let bit = u64::cast_from(i.read()) * width;
+            let off = bit - u64::cast_from(w.read()) * 32u64;
+            acc.store(acc.read() | (u64::cast_from(bin) << off));
+            if off + width >= 32u64 {
+                out[(out_base + w.read()) as usize] = u32::cast_from(acc.read() & 0xFFFF_FFFFu64);
+                acc.store(acc.read() >> 32u64);
+                w.store(w.read() + 1u32);
+            }
+            i.store(i.read() + 1u32);
+        }
+    }
+}
+
+/// What the device path knows about the matrix it binned, in place of the
+/// host [`EllpackMatrix`] it never builds.
+#[derive(Clone, Debug)]
+pub struct EllpackShape {
+    pub n_rows: usize,
+    pub row_stride: usize,
+    pub base_rowid: u32,
+    pub cut_ptrs: Vec<u32>,
+    pub null_value: u32,
+    pub layout: EllpackLayout,
+}
+
+impl EllpackShape {
+    pub fn of(matrix: &EllpackMatrix) -> Self {
+        Self {
+            n_rows: matrix.n_rows,
+            row_stride: matrix.row_stride,
+            base_rowid: matrix.base_rowid,
+            cut_ptrs: matrix.cut_ptrs.clone(),
+            null_value: matrix.null_value,
+            layout: matrix.layout,
+        }
+    }
+
+    pub fn n_features(&self) -> usize {
+        self.cut_ptrs.len() - 1
+    }
+
+    pub fn n_bins(&self) -> u32 {
+        *self.cut_ptrs.last().unwrap()
+    }
+
+    pub fn is_dense(&self) -> bool {
+        self.layout == EllpackLayout::Dense
+    }
+
+    pub fn is_compressed(&self) -> bool {
+        self.layout != EllpackLayout::Sparse
+    }
+}
+
+impl DeviceEllpack {
+    /// Bin `values` against `cuts` on the device: [`build_ellpack`] followed
+    /// by [`Self::upload`], without the host ever holding the bin matrix.
+    ///
+    /// The same bins, the same packing: the kernel is `search_bin` and
+    /// `pack_bins`, chunk for chunk, so the buffers are word-identical to the
+    /// host route's (`tests/kernels.rs` asserts it). What is not the same is
+    /// the width when the matrix has no hole: the host measures the largest
+    /// bin actually stored, this takes the largest bin the cuts allow — one
+    /// bit at most, and the kernels read either.
+    ///
+    /// Categorical features are left to the host route by the caller: their
+    /// bin is a category-code check, not a cut search. So is the CPU runtime,
+    /// whose cores are the host's anyway.
+    pub fn bin_on_device<R: Runtime>(
+        client: &ComputeClient<R>,
+        values: &super::sketch::DeviceValues,
+        cuts: &HistogramCuts,
+    ) -> (Self, EllpackShape) {
+        let n_rows = values.n_rows;
+        let n_features = values.n_cols;
+        let n_cells = n_rows * n_features;
+        let dense_input = values.dense_input;
+        let null_value = (0..n_features).map(|f| cuts.feature_bins(f)).max().unwrap_or(0) as u32;
+        let layout = if dense_input { EllpackLayout::Dense } else { EllpackLayout::DenseCompressed };
+        let shape = EllpackShape {
+            n_rows,
+            row_stride: n_features,
+            base_rowid: 0,
+            cut_ptrs: cuts.cut_ptrs.clone(),
+            null_value,
+            layout,
+        };
+        let mut phases = super::PhaseLog::new(client.clone());
+        let d_cut_ptrs = client.create_from_slice(bytemuck::cast_slice(&cuts.cut_ptrs));
+        let d_cut_values = client.create_from_slice(bytemuck::cast_slice(&cuts.cut_values));
+
+        // Width: `natural_bits` over what the cuts can produce rather than
+        // what was stored (see above).
+        let data_max = null_value.saturating_sub(1);
+        let bits = if super::launch::has_planes(client) {
+            bits_for(if dense_input { data_max } else { null_value })
+        } else {
+            32
+        };
+        // Whole 32-entry chunks plus the padding word, at every width: at 32
+        // bits the chunk is the identity and the buffer simply rounds up to
+        // it, which the kernels reading the first `n_cells` entries never see.
+        let n_chunks = n_cells.div_ceil(32);
+        let packed_len = n_chunks * bits as usize + 1;
+        let packed = {
+            let out = client.empty(packed_len * size_of::<u32>());
+            let (count, dim) = super::launch::elementwise(client, n_chunks);
+            // SAFETY: the chunk index is guarded against `n_chunks`, cells
+            // against `n_cells`; a chunk writes exactly `bits` words inside
+            // the `n_chunks * bits` the buffer holds.
+            unsafe {
+                bin_pack_kernel::launch_unchecked::<R>(
+                    client,
+                    count,
+                    dim,
+                    ArrayArg::from_raw_parts(values.row_ptr.clone(), values.row_ptr_len),
+                    ArrayArg::from_raw_parts(values.index.clone(), values.index_len),
+                    ArrayArg::from_raw_parts(values.value.clone(), values.n_entries.max(1)),
+                    ArrayArg::from_raw_parts(d_cut_ptrs.clone(), cuts.cut_ptrs.len()),
+                    ArrayArg::from_raw_parts(d_cut_values.clone(), cuts.cut_values.len()),
+                    ArrayArg::from_raw_parts(out.clone(), packed_len),
+                    n_cells as u32,
+                    n_chunks as u32,
+                                        n_features as u32,
+                    null_value,
+                    bits,
+                    dense_input,
+                );
+            }
+            out
+        };
+        phases.mark("bin+pack row-major");
+        let packed_t = client.empty(packed_len * size_of::<u32>());
+        let chunks_per_feature = n_chunks.div_ceil(n_features.max(1));
+        {
+            let (count, dim) =
+                super::launch::elementwise(client, n_features.max(1) * chunks_per_feature);
+            // SAFETY: the chunk a unit decodes to is guarded against
+            // `n_chunks`, cells against `n_cells`, and every row-major entry
+            // read is below `n_cells` (its two-word read has the pad).
+            unsafe {
+                transpose_packed_kernel::launch_unchecked::<R>(
+                    client,
+                    count,
+                    dim,
+                    ArrayArg::from_raw_parts(packed.clone(), packed_len),
+                    ArrayArg::from_raw_parts(packed_t.clone(), packed_len),
+                    n_cells as u32,
+                    n_chunks as u32,
+                    n_rows as u32,
+                    n_features as u32,
+                    chunks_per_feature as u32,
+                    bits,
+                );
+            }
+        }
+        phases.mark("transpose");
+        phases.report_as("device binning");
+
+        let ell = Self {
+            gidx: packed,
+            gidx_t: packed_t,
+            cut_ptrs: d_cut_ptrs,
+            gidx_len: packed_len,
+            gidx_t_len: packed_len,
+            bits,
+            n_cuts: cuts.cut_ptrs.len(),
+            n_rows,
+            row_stride: n_features as u32,
+            base_rowid: 0,
+            null_value,
+            n_bins: shape.n_bins(),
+            dense: dense_input,
+            compressed: true,
+        };
+        (ell, shape)
+    }
+}
