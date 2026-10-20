@@ -38,3 +38,6 @@ kaggle-await.log
 prebuilt/
 __pycache__/
 .DS_Store
+
+# Local credentials
+.env

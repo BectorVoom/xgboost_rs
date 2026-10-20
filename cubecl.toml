@@ -1,0 +1,22 @@
+# CubeCL runtime configuration. Read by `cubecl-common`'s `from_current_dir()`,
+# which walks up from the *process working directory* — so `cargo test` and
+# `cargo run` from the repo root find it, and a binary launched from elsewhere
+# may not. A missing or misspelt file is silently ignored: if the timings look
+# unchanged, check that `target/vulkan/` (or `target/cuda/`) appeared.
+
+[compilation]
+# Off by default — only the autotune cache is on out of the box, which makes it
+# easy to believe kernels are already cached when every process is re-JITting
+# them. This crate specialises hard on `#[comptime]` flags (dense/compressed/
+# use_shared/native_i64/has_constraint/...), so one test run compiles dozens of
+# distinct kernels, each one a separate SPIR-V or PTX compile.
+#
+# The cache key is `KernelId::stable_hash()`, the same identity that already
+# separates two `#[comptime]` specialisations, and the directory is versioned
+# per CubeCL release — so this cannot serve a stale binary across an upgrade.
+# It does *not* key on compiler environment variables: `rm -rf target/vulkan`
+# (or `target/cuda`) after changing anything that affects codegen.
+#
+# Requires the wgpu backend's `spirv` feature, which `cubecl/vulkan` enables;
+# the plain WGSL path writes no cache.
+cache = "target"
